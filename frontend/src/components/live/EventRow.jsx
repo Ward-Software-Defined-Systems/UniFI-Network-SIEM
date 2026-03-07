@@ -1,0 +1,41 @@
+import React from 'react';
+import EventTypeBadge from '../shared/EventTypeBadge';
+import ActionBadge from '../shared/ActionBadge';
+import { formatTimestamp, truncate } from '../../lib/format';
+
+export default function EventRow({ event, onClick }) {
+  return (
+    <tr
+      onClick={() => onClick(event)}
+      className="border-b border-gray-800/50 hover:bg-gray-800/50 cursor-pointer transition-colors"
+    >
+      <td className="px-3 py-1.5 text-xs text-gray-500 whitespace-nowrap font-mono">
+        {formatTimestamp(event.received_at)}
+      </td>
+      <td className="px-3 py-1.5">
+        <EventTypeBadge type={event.event_type} />
+      </td>
+      <td className="px-3 py-1.5">
+        <ActionBadge action={event.action} />
+      </td>
+      <td className="px-3 py-1.5 text-xs text-gray-400 whitespace-nowrap font-mono">
+        {event.src_ip || event.dns_client_ip || event.dhcp_ip || event.client_ip || '-'}
+      </td>
+      <td className="px-3 py-1.5 text-xs text-gray-400 whitespace-nowrap font-mono">
+        {event.dst_ip || '-'}
+      </td>
+      <td className="px-3 py-1.5 text-xs text-gray-400 whitespace-nowrap font-mono">
+        {event.dst_port || '-'}
+      </td>
+      <td className="px-3 py-1.5 text-xs text-gray-400 whitespace-nowrap">
+        {event.protocol || '-'}
+      </td>
+      <td className="px-3 py-1.5 text-xs text-gray-300 max-w-xs truncate">
+        {truncate(event.message, 80)}
+      </td>
+      <td className="px-3 py-1.5 text-xs text-gray-500 whitespace-nowrap">
+        {event.hostname || '-'}
+      </td>
+    </tr>
+  );
+}

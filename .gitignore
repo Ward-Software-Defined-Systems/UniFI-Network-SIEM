@@ -1,0 +1,37 @@
+# Dependencies
+node_modules/
+
+# Database & runtime data
+data/*.db
+data/*.db-wal
+data/*.db-shm
+data/*.mmdb
+data/*.log
+
+# TLS certificates
+data/server.key
+data/server.cert
+
+# Environment / secrets
+.env
+
+# Frontend build output
+frontend/dist/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Claude Code
+.claude/
+CLAUDE.md
+PRE-FLIGHT-CHECK.md
+UNIFI-API-RESEARCH.md
+UniFi-SIEM-Research.md
+
+# Editor
+*.swp
+*.swo
+*~
+.idea/
+.vscode/

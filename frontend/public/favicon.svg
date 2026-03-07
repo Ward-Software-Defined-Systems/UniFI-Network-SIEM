@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="none">
+  <!-- Shield shape -->
+  <path d="M16 2L4 7v9c0 7.73 5.12 14.27 12 16 6.88-1.73 12-8.27 12-16V7L16 2z" fill="#1e3a5f" stroke="#3b82f6" stroke-width="1.5"/>
+  <!-- Inner shield highlight -->
+  <path d="M16 4.5L6 8.5v7.5c0 6.5 4.3 12 10 13.5 5.7-1.5 10-7 10-13.5V8.5L16 4.5z" fill="#0f172a"/>
+  <!-- Network node center -->
+  <circle cx="16" cy="14" r="3" fill="#3b82f6"/>
+  <!-- Network lines radiating out -->
+  <line x1="16" y1="11" x2="16" y2="7" stroke="#3b82f6" stroke-width="1.2" stroke-linecap="round"/>
+  <line x1="13.5" y1="12.5" x2="10" y2="10" stroke="#3b82f6" stroke-width="1.2" stroke-linecap="round"/>
+  <line x1="18.5" y1="12.5" x2="22" y2="10" stroke="#3b82f6" stroke-width="1.2" stroke-linecap="round"/>
+  <line x1="14" y1="16" x2="11" y2="19" stroke="#3b82f6" stroke-width="1.2" stroke-linecap="round"/>
+  <line x1="18" y1="16" x2="21" y2="19" stroke="#3b82f6" stroke-width="1.2" stroke-linecap="round"/>
+  <!-- Outer nodes -->
+  <circle cx="16" cy="6.5" r="1.5" fill="#60a5fa"/>
+  <circle cx="9.5" cy="9.5" r="1.5" fill="#60a5fa"/>
+  <circle cx="22.5" cy="9.5" r="1.5" fill="#60a5fa"/>
+  <circle cx="10.5" cy="19.5" r="1.5" fill="#60a5fa"/>
+  <circle cx="21.5" cy="19.5" r="1.5" fill="#60a5fa"/>
+  <!-- SIEM text -->
+  <text x="16" y="25.5" text-anchor="middle" font-family="Arial,sans-serif" font-size="4.5" font-weight="bold" fill="#94a3b8">SIEM</text>
+</svg>
