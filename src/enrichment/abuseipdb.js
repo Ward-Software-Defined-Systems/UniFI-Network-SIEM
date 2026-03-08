@@ -45,7 +45,7 @@ async function checkIp(ip) {
     if (!d) return null;
 
     return {
-      abuseScore: d.abuseConfidencePercentage ?? null,
+      abuseScore: d.abuseConfidenceScore ?? null,
       totalReports: d.totalReports ?? 0,
       countryCode: d.countryCode || null,
       isp: d.isp || null,

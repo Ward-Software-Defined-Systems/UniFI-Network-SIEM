@@ -29,6 +29,11 @@ function enqueueIp(ip) {
         hostname: cached.hostname,
       });
     }
+    // Re-queue if missing abuse score and AbuseIPDB is available
+    if (cached.abuse_score == null && isAbuseIpDbAvailable()) {
+      ipQueue.add(ip);
+      processQueue();
+    }
     return;
   }
 
@@ -70,17 +75,19 @@ async function enrichIp(ip) {
       return;
     }
 
+    // Start with existing cached data (if any) to avoid overwriting
+    const existing = getCachedEnrichment(ip);
     const enrichment = {
-      geo_country: null,
-      geo_city: null,
-      geo_lat: null,
-      geo_lon: null,
-      abuse_score: null,
-      hostname: null,
+      geo_country: existing?.geo_country || null,
+      geo_city: existing?.geo_city || null,
+      geo_lat: existing?.geo_lat || null,
+      geo_lon: existing?.geo_lon || null,
+      abuse_score: existing?.abuse_score ?? null,
+      hostname: existing?.hostname || null,
     };
 
-    // GeoIP lookup (sync, fast)
-    if (isGeoIpAvailable()) {
+    // GeoIP lookup (sync, fast) — only if not already cached
+    if (!enrichment.geo_country && isGeoIpAvailable()) {
       const geo = lookupGeoIp(ip);
       if (geo) {
         enrichment.geo_country = geo.country;

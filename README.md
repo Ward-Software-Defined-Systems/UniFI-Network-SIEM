@@ -257,10 +257,17 @@ The app runs HTTPS by default with an auto-generated self-signed certificate. Be
 - **Parser crashes** — all parsers wrapped in try/catch with fallback to system parser
 - **AbuseIPDB rate limits** — automatic 1-hour backoff when daily limit is reached
 
+## Known Issues
+
+| Issue | Status | Description |
+|---|---|---|
+| AbuseIPDB scores not populating | **Investigating** | IPs enriched with GeoIP are cached before AbuseIPDB lookup completes or when the API is rate-limited. Once cached, IPs are not re-queued for abuse scoring — resulting in all cache entries having `abuse_score: null`. Fix in progress to re-queue cached IPs that are missing abuse scores when the API becomes available again. |
+
 ## Roadmap
 
 - [x] Abuse score badges on IPs in tables
 - [x] Country flags on external IPs
+- [ ] Threat Hunting view — investigation workspace for profiling threat actors (IP timeline, associated events, geo history, abuse reports, related IPs)
 - [ ] CSV export
 - [ ] Dark/light mode toggle
 - [ ] launchd plist for macOS auto-start
