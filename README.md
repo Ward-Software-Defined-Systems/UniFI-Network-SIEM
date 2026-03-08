@@ -261,7 +261,8 @@ The app runs HTTPS by default with an auto-generated self-signed certificate. Be
 
 | Issue | Status | Description |
 |---|---|---|
-| AbuseIPDB scores not populating | **Investigating** | IPs enriched with GeoIP are cached before AbuseIPDB lookup completes or when the API is rate-limited. Once cached, IPs are not re-queued for abuse scoring — resulting in all cache entries having `abuse_score: null`. Fix in progress to re-queue cached IPs that are missing abuse scores when the API becomes available again. |
+| AbuseIPDB scores not populating | **Fixed** | AbuseIPDB API field name was `abuseConfidenceScore` but code referenced `abuseConfidencePercentage` — scores were always `null`. Fixed in commit `11607e4`. Also added re-queue logic for cached IPs missing abuse scores. |
+| Database reset pegs CPU on large datasets | **Fixed** | Using "Initialize Database" previously ran `DELETE` + `VACUUM` on millions of rows, pegging CPU at 100% for 10+ minutes. Fixed by switching to `DROP TABLE` + schema recreate, which is instant regardless of database size. Fixed in commit `11607e4`. |
 
 ## Roadmap
 

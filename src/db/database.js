@@ -144,10 +144,10 @@ function initSchema(db) {
 
 function resetDb() {
   if (db) {
-    db.exec('DELETE FROM events');
-    db.exec('DELETE FROM ip_enrichment_cache');
-    db.exec('VACUUM');
-    logger.info('Database cleared');
+    db.exec('DROP TABLE IF EXISTS events');
+    db.exec('DROP TABLE IF EXISTS ip_enrichment_cache');
+    initSchema(db);
+    logger.info('Database reset (tables recreated)');
   }
 }
 
