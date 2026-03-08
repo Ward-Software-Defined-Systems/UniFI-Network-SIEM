@@ -9,6 +9,7 @@ const eventsRouter = require('./routes/events');
 const statsRouter = require('./routes/stats');
 const healthRouter = require('./routes/health');
 const settingsRouter = require('./routes/settings');
+const threatHuntRouter = require('./routes/threat-hunt');
 const { createWebSocketServer } = require('./websocket');
 
 function ensureCerts() {
@@ -44,6 +45,7 @@ function createServer() {
   app.use('/api/stats', statsRouter);
   app.use('/api/health', healthRouter);
   app.use('/api/settings', settingsRouter);
+  app.use('/api/threat-hunt', threatHuntRouter);
 
   // Serve frontend static files
   const frontendDist = path.join(__dirname, '../../frontend/dist');

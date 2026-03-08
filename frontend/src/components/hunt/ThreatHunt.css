@@ -1,0 +1,589 @@
+.threat-hunt {
+  padding: 1.5rem;
+  max-width: 1200px;
+  margin: 0 auto;
+}
+
+.hunt-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  margin-bottom: 1.5rem;
+}
+
+.hunt-title h2 {
+  margin: 0;
+  font-size: 1.5rem;
+}
+
+.beta-badge {
+  font-size: 0.6rem;
+  font-weight: 600;
+  background: #f59e0b;
+  color: #000;
+  padding: 2px 8px;
+  border-radius: 10px;
+  vertical-align: super;
+  letter-spacing: 0.05em;
+}
+
+.hunt-subtitle {
+  color: #94a3b8;
+  font-size: 0.85rem;
+  margin: 0.3rem 0 0;
+}
+
+.settings-toggle {
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  color: #e2e8f0;
+  padding: 0.5rem 1rem;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 0.85rem;
+  transition: all 0.15s;
+}
+
+.settings-toggle:hover,
+.settings-toggle.active {
+  background: rgba(255, 255, 255, 0.1);
+  border-color: rgba(255, 255, 255, 0.2);
+}
+
+/* Settings Panel */
+.hunt-settings {
+  background: rgba(0, 0, 0, 0.3);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 12px;
+  padding: 1.5rem;
+  margin-bottom: 1.5rem;
+}
+
+.hunt-settings h3 {
+  margin: 0 0 1rem;
+  font-size: 1rem;
+  color: #cbd5e1;
+}
+
+.provider-selector {
+  display: flex;
+  gap: 0.5rem;
+  margin-bottom: 1.5rem;
+}
+
+.provider-btn {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.75rem 1rem;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  color: #94a3b8;
+  cursor: pointer;
+  transition: all 0.15s;
+  font-size: 0.85rem;
+}
+
+.provider-btn:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.provider-btn.active {
+  background: rgba(99, 102, 241, 0.15);
+  border-color: #6366f1;
+  color: #e2e8f0;
+}
+
+.provider-icon {
+  font-size: 1.1rem;
+}
+
+.key-status {
+  margin-left: auto;
+  color: #22c55e;
+  font-weight: bold;
+}
+
+.key-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  margin-bottom: 1rem;
+}
+
+.key-field label {
+  display: block;
+  font-size: 0.8rem;
+  color: #94a3b8;
+  margin-bottom: 0.3rem;
+}
+
+.key-input-row {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.key-input-row input {
+  flex: 1;
+  background: rgba(0, 0, 0, 0.3);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 6px;
+  color: #e2e8f0;
+  padding: 0.5rem 0.75rem;
+  font-size: 0.85rem;
+  font-family: monospace;
+}
+
+.key-input-row input::placeholder {
+  color: #475569;
+}
+
+.key-toggle {
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 6px;
+  padding: 0.5rem;
+  cursor: pointer;
+  font-size: 1rem;
+  line-height: 1;
+}
+
+.settings-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.save-btn {
+  background: #6366f1;
+  color: white;
+  border: none;
+  padding: 0.5rem 1.5rem;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 0.85rem;
+  font-weight: 500;
+  transition: background 0.15s;
+}
+
+.save-btn:hover {
+  background: #4f46e5;
+}
+
+/* Investigation Input */
+.hunt-input {
+  margin-bottom: 1.5rem;
+}
+
+.input-row {
+  display: flex;
+  gap: 0.75rem;
+}
+
+.target-input-wrap {
+  flex: 1;
+  position: relative;
+}
+
+.input-icon {
+  position: absolute;
+  left: 0.75rem;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 1.1rem;
+  pointer-events: none;
+}
+
+.target-input {
+  width: 100%;
+  background: rgba(0, 0, 0, 0.3);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 10px;
+  color: #e2e8f0;
+  padding: 0.75rem 1rem 0.75rem 2.5rem;
+  font-size: 1rem;
+  font-family: 'JetBrains Mono', monospace;
+  transition: border-color 0.15s;
+  box-sizing: border-box;
+}
+
+.target-input:focus {
+  outline: none;
+  border-color: #6366f1;
+}
+
+.investigate-btn {
+  background: linear-gradient(135deg, #6366f1, #8b5cf6);
+  color: white;
+  border: none;
+  padding: 0.75rem 1.5rem;
+  border-radius: 10px;
+  cursor: pointer;
+  font-size: 0.9rem;
+  font-weight: 600;
+  white-space: nowrap;
+  transition: all 0.15s;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.investigate-btn:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 15px rgba(99, 102, 241, 0.3);
+}
+
+.investigate-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.spinner {
+  display: inline-block;
+  width: 16px;
+  height: 16px;
+  border: 2px solid rgba(255, 255, 255, 0.3);
+  border-top-color: white;
+  border-radius: 50%;
+  animation: spin 0.6s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+.input-hint {
+  font-size: 0.75rem;
+  color: #64748b;
+  margin: 0.4rem 0 0 0.5rem;
+}
+
+.input-hint.warning {
+  color: #f59e0b;
+}
+
+/* Error */
+.hunt-error {
+  background: rgba(239, 68, 68, 0.1);
+  border: 1px solid rgba(239, 68, 68, 0.3);
+  border-radius: 8px;
+  padding: 0.75rem 1rem;
+  color: #fca5a5;
+  margin-bottom: 1.5rem;
+  font-size: 0.9rem;
+}
+
+/* Results */
+.hunt-results {
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+}
+
+.intel-summary {
+  background: rgba(0, 0, 0, 0.3);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 12px;
+  padding: 1.5rem;
+}
+
+.intel-summary h3 {
+  margin: 0 0 1rem;
+  font-size: 1rem;
+}
+
+.intel-cards {
+  display: flex;
+  gap: 1rem;
+  margin-bottom: 1.5rem;
+  flex-wrap: wrap;
+}
+
+.intel-card {
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 8px;
+  padding: 1rem;
+  min-width: 120px;
+  text-align: center;
+}
+
+.intel-card.wide {
+  min-width: 200px;
+}
+
+.intel-value {
+  font-size: 1.5rem;
+  font-weight: 700;
+  color: #e2e8f0;
+}
+
+.intel-value.small {
+  font-size: 0.95rem;
+  font-weight: 500;
+}
+
+.intel-label {
+  font-size: 0.7rem;
+  color: #64748b;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-top: 0.25rem;
+}
+
+.abuse-pill {
+  display: inline-block;
+  padding: 2px 10px;
+  border-radius: 12px;
+  color: white;
+  font-weight: 600;
+  font-size: 1.1rem;
+}
+
+.abuse-pill.small {
+  font-size: 0.7rem;
+  padding: 1px 6px;
+  margin-left: 4px;
+}
+
+/* Intel details */
+.intel-details {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.detail-section h4 {
+  margin: 0 0 0.5rem;
+  font-size: 0.85rem;
+  color: #94a3b8;
+}
+
+.detail-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.chip {
+  background: rgba(255, 255, 255, 0.06);
+  border-radius: 6px;
+  padding: 0.3rem 0.7rem;
+  font-size: 0.8rem;
+  color: #cbd5e1;
+}
+
+.chip.block {
+  background: rgba(239, 68, 68, 0.15);
+  color: #fca5a5;
+}
+
+.chip.allow {
+  background: rgba(34, 197, 94, 0.15);
+  color: #86efac;
+}
+
+.port-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.port-tag {
+  background: rgba(99, 102, 241, 0.1);
+  border: 1px solid rgba(99, 102, 241, 0.2);
+  border-radius: 6px;
+  padding: 0.25rem 0.6rem;
+  font-family: monospace;
+  font-size: 0.8rem;
+  color: #a5b4fc;
+}
+
+.port-tag small {
+  color: #64748b;
+  margin-left: 2px;
+}
+
+.signature-row {
+  display: flex;
+  gap: 1rem;
+  padding: 0.3rem 0;
+  font-size: 0.8rem;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+}
+
+.sig-name {
+  color: #fca5a5;
+  flex: 1;
+}
+
+.sig-class {
+  color: #94a3b8;
+}
+
+.sig-count {
+  color: #64748b;
+  font-family: monospace;
+}
+
+.related-ips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.related-ip {
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 6px;
+  padding: 0.3rem 0.6rem;
+  font-size: 0.8rem;
+  font-family: monospace;
+  color: #94a3b8;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.related-ip:hover {
+  background: rgba(99, 102, 241, 0.1);
+  border-color: #6366f1;
+  color: #e2e8f0;
+}
+
+.time-range {
+  font-family: monospace;
+  font-size: 0.85rem;
+  color: #94a3b8;
+  margin: 0;
+}
+
+/* AI Analysis */
+.ai-analysis {
+  background: rgba(0, 0, 0, 0.3);
+  border: 1px solid rgba(99, 102, 241, 0.2);
+  border-radius: 12px;
+  padding: 1.5rem;
+}
+
+.ai-analysis h3 {
+  margin: 0 0 1rem;
+  font-size: 1rem;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.provider-tag {
+  font-size: 0.7rem;
+  background: rgba(255, 255, 255, 0.06);
+  padding: 3px 10px;
+  border-radius: 10px;
+  color: #94a3b8;
+  font-weight: 400;
+}
+
+.analysis-content {
+  color: #cbd5e1;
+  line-height: 1.7;
+  font-size: 0.9rem;
+}
+
+.analysis-content h2,
+.analysis-content h3,
+.analysis-content h4 {
+  color: #e2e8f0;
+  margin: 1.25rem 0 0.5rem;
+}
+
+.analysis-content h2 { font-size: 1.1rem; }
+.analysis-content h3 { font-size: 1rem; }
+.analysis-content h4 { font-size: 0.9rem; }
+
+.analysis-content strong {
+  color: #e2e8f0;
+}
+
+.analysis-content code {
+  background: rgba(255, 255, 255, 0.08);
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 0.85em;
+}
+
+.analysis-content ul {
+  padding-left: 1.25rem;
+  margin: 0.5rem 0;
+}
+
+.analysis-content li {
+  margin: 0.25rem 0;
+}
+
+.analysis-meta {
+  margin-top: 1rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+  font-size: 0.7rem;
+  color: #475569;
+}
+
+/* History */
+.hunt-history {
+  margin-top: 1rem;
+}
+
+.hunt-history h3 {
+  font-size: 0.9rem;
+  color: #64748b;
+  margin: 0 0 0.5rem;
+}
+
+.history-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.history-item {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 6px;
+  padding: 0.4rem 0.75rem;
+  cursor: pointer;
+  color: #94a3b8;
+  font-size: 0.8rem;
+  transition: all 0.15s;
+}
+
+.history-item:hover {
+  background: rgba(255, 255, 255, 0.06);
+  color: #e2e8f0;
+}
+
+.history-target {
+  font-family: monospace;
+}
+
+.history-time {
+  color: #475569;
+  font-size: 0.7rem;
+}
+
+/* Responsive */
+@media (max-width: 768px) {
+  .provider-selector {
+    flex-direction: column;
+  }
+
+  .input-row {
+    flex-direction: column;
+  }
+
+  .intel-cards {
+    flex-direction: column;
+  }
+}

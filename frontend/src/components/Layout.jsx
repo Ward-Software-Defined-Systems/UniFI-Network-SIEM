@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Activity, BarChart3, Globe, Heart, Settings, Shield } from 'lucide-react';
+import { Activity, BarChart3, Crosshair, Globe, Heart, Settings, Shield } from 'lucide-react';
 import { getHealth } from '../lib/api';
 import { formatNumber } from '../lib/format';
 
@@ -7,6 +7,7 @@ const NAV_ITEMS = [
   { id: 'dashboard', label: 'Dashboard', icon: BarChart3 },
   { id: 'map', label: 'Live Map', icon: Globe },
   { id: 'intel', label: 'Threat Intel', icon: Shield },
+  { id: 'hunt', label: 'Threat Hunt', icon: Crosshair, badge: 'BETA' },
   { id: 'live', label: 'Live Stream', icon: Activity },
   { id: 'settings', label: 'Settings', icon: Settings },
 ];
@@ -31,7 +32,7 @@ export default function Layout({ activeView, onViewChange, children }) {
         </div>
 
         <nav className="flex-1 p-2 space-y-1">
-          {NAV_ITEMS.map(({ id, label, icon: Icon }) => (
+          {NAV_ITEMS.map(({ id, label, icon: Icon, badge }) => (
             <button
               key={id}
               onClick={() => onViewChange(id)}
@@ -43,6 +44,11 @@ export default function Layout({ activeView, onViewChange, children }) {
             >
               <Icon className="w-4 h-4" />
               {label}
+              {badge && (
+                <span className="ml-auto text-[0.6rem] font-semibold bg-amber-500 text-black px-1.5 py-0.5 rounded-full leading-none">
+                  {badge}
+                </span>
+              )}
             </button>
           ))}
         </nav>
