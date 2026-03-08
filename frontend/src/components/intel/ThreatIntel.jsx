@@ -62,7 +62,7 @@ const COLUMNS = [
 
 export default function ThreatIntel() {
   const [period, setPeriod] = useState('1h');
-  const [data, setData] = useState({ summary: { totalEnriched: 0, withAbuseScore: 0, highThreat: 0, countries: 0 }, ips: [] });
+  const [data, setData] = useState({ summary: { totalEnriched: 0, withAbuseScore: 0, highThreat: 0, countries: 0 }, periodSummary: { enriched: 0, flagged: 0, highThreat: 0, countries: 0 }, ips: [] });
   const [sortField, setSortField] = useState('event_count');
   const [sortDir, setSortDir] = useState('desc');
   const [filters, setFilters] = useState({});
@@ -147,7 +147,7 @@ export default function ThreatIntel() {
     return rows;
   }, [data.ips, sortField, sortDir, filters]);
 
-  const { summary } = data;
+  const { summary, periodSummary } = data;
   const activeFilterCount = Object.keys(filters).length;
 
   return (
@@ -178,12 +178,20 @@ export default function ThreatIntel() {
       </div>
 
       <div className="flex-1 overflow-auto p-4 space-y-4">
-        {/* Summary cards */}
+        {/* All-time summary cards */}
         <div className="grid grid-cols-4 gap-3">
-          <SummaryCard label="Enriched IPs" value={summary.totalEnriched} />
-          <SummaryCard label="Flagged IPs" value={summary.withAbuseScore} color="text-yellow-400" />
-          <SummaryCard label="High Threat (50%+)" value={summary.highThreat} color="text-red-400" />
-          <SummaryCard label="Countries" value={summary.countries} color="text-blue-400" />
+          <SummaryCard label="Enriched IPs (All Time)" value={summary.totalEnriched} />
+          <SummaryCard label="Flagged IPs (All Time)" value={summary.withAbuseScore} color="text-yellow-400" />
+          <SummaryCard label="High Threat 50%+ (All Time)" value={summary.highThreat} color="text-red-400" />
+          <SummaryCard label="Countries (All Time)" value={summary.countries} color="text-blue-400" />
+        </div>
+
+        {/* Period-filtered summary cards */}
+        <div className="grid grid-cols-4 gap-3">
+          <SummaryCard label={`Enriched IPs (${period})`} value={periodSummary.enriched} />
+          <SummaryCard label={`Flagged IPs (${period})`} value={periodSummary.flagged} color="text-yellow-400" />
+          <SummaryCard label={`High Threat 50%+ (${period})`} value={periodSummary.highThreat} color="text-red-400" />
+          <SummaryCard label={`Countries (${period})`} value={periodSummary.countries} color="text-blue-400" />
         </div>
 
         {/* IP table */}

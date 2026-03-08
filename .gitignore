@@ -22,6 +22,9 @@ frontend/dist/
 .DS_Store
 Thumbs.db
 
+# Internal docs (not for repo)
+ARCHITECTURE.md
+
 # Claude Code
 .claude/
 CLAUDE.md

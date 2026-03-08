@@ -281,8 +281,31 @@ router.get('/threat-intel', (req, res) => {
       "SELECT COUNT(DISTINCT geo_country) as c FROM ip_enrichment_cache WHERE geo_country IS NOT NULL AND is_private = 0"
     ).get().c;
 
+    // Period-filtered summary — query the full dataset, not the limited rows
+    const periodStats = db.prepare(`
+      SELECT
+        COUNT(DISTINCT ip) as enriched,
+        COUNT(DISTINCT CASE WHEN abuse_score > 0 THEN ip END) as flagged,
+        COUNT(DISTINCT CASE WHEN abuse_score >= 50 THEN ip END) as highThreat,
+        COUNT(DISTINCT country) as countries
+      FROM (
+        SELECT src_ip as ip, src_abuse_score as abuse_score, src_geo_country as country
+        FROM events
+        WHERE src_ip IS NOT NULL AND (src_geo_country IS NOT NULL OR src_abuse_score IS NOT NULL) AND received_at >= ?
+        UNION
+        SELECT dst_ip, dst_abuse_score, dst_geo_country
+        FROM events
+        WHERE dst_ip IS NOT NULL AND (dst_geo_country IS NOT NULL OR dst_abuse_score IS NOT NULL) AND received_at >= ?
+      )
+    `).get(since, since);
+    const periodEnriched = periodStats.enriched;
+    const periodFlagged = periodStats.flagged;
+    const periodHighThreat = periodStats.highThreat;
+    const periodCountries = periodStats.countries;
+
     res.json({
       summary: { totalEnriched, withAbuseScore, highThreat, countries },
+      periodSummary: { enriched: periodEnriched, flagged: periodFlagged, highThreat: periodHighThreat, countries: periodCountries },
       ips: rows,
     });
   } catch (err) {
