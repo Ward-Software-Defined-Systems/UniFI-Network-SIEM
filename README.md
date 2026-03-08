@@ -12,6 +12,7 @@ A self-contained Node.js application that collects syslog from UniFi consoles an
 - **GeoIP & threat enrichment** — MaxMind GeoLite2 for geolocation, AbuseIPDB for threat scoring, reverse DNS — all async with caching
 - **Country flags & abuse badges** — 🇺🇸 emoji flags with country codes on external IPs; color-coded abuse score badges across all views
 - **Threat Intel** — sortable/filterable table of enriched IPs with abuse scores, event counts, and locations; period-filtered summary cards alongside all-time totals
+- **Threat Hunt (Beta)** — AI-powered threat actor investigation. Enter any IP to get a full profile: local SIEM activity (events, ports, timeline, IDS signatures, related /24 IPs), external intel (rDNS, WHOIS/ASN), and a structured AI threat assessment. Supports Anthropic (Opus 4.6), OpenAI (GPT-5.4), and Google (Gemini 3.1 Pro) with on-page API key management
 - **HTTPS by default** — auto-generated self-signed TLS certificate
 - **SQLite storage** — WAL mode, batched inserts, automatic retention cleanup
 - **Zero external services** — everything runs in one process
@@ -153,6 +154,9 @@ For full functionality, three logging sources on the UniFi Console should be con
 | `GET /api/settings` | App settings (sensitive values redacted) |
 | `PUT /api/settings` | Update settings (AbuseIPDB key, etc.) |
 | `POST /api/settings/reset-db` | Clear all events and enrichment cache |
+| `GET /api/threat-hunt/settings` | Threat Hunt AI provider settings |
+| `PUT /api/threat-hunt/settings` | Update AI provider/keys |
+| `POST /api/threat-hunt/investigate` | Run AI-powered threat investigation on an IP |
 | `WSS /ws/events` | Live event stream with filtering |
 
 ## Configuration (.env)
@@ -216,6 +220,7 @@ frontend/                      # React + Vite + Tailwind
       dashboard/               # Analytics dashboard
       map/                     # Live Map (Leaflet)
       intel/                   # Threat Intel view
+      hunt/                    # Threat Hunt (Beta) — AI investigation
       shared/                  # Badges, selectors
     hooks/                     # WebSocket & query hooks
     lib/                       # API client, formatters
@@ -263,7 +268,7 @@ The app runs HTTPS by default with an auto-generated self-signed certificate. Be
 |---|---|---|
 | AbuseIPDB scores not populating | **Fixed** | AbuseIPDB API field name was `abuseConfidenceScore` but code referenced `abuseConfidencePercentage` — scores were always `null`. Fixed in commit `11607e4`. Also added re-queue logic for cached IPs missing abuse scores. |
 | Database reset pegs CPU on large datasets | **Fixed** | Using "Initialize Database" previously ran `DELETE` + `VACUUM` on millions of rows, pegging CPU at 100% for 10+ minutes. Fixed by switching to `DROP TABLE` + schema recreate, which is instant regardless of database size. Fixed in commit `11607e4`. |
-| Enrichment backfill pegs CPU at 100% | **Known** | After enrichment completes, `updateEventsWithEnrichment()` runs UPDATE queries across all events for each cached IP to backfill geo/abuse data. At high event volumes (300K+/hr) this can sustain 100% CPU even on modest networks. Needs optimization — batch updates, indexed lookups on unenriched rows, or deferred backfill during idle periods. |
+| Enrichment backfill pegs CPU at 100% | **WIP** | After enrichment completes, `updateEventsWithEnrichment()` runs UPDATE queries across all events for each cached IP to backfill geo/abuse data. At high event volumes (300K+/hr) this can sustain 100% CPU even on modest networks. Partially mitigated with deferred startup (30s delay), chunked processing (5 IPs/chunk with 50ms yield), row limits (1000/IP), and partial indexes on unenriched rows. Further optimization planned. |
 
 ## Roadmap
 
