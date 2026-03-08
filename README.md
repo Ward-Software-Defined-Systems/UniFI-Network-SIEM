@@ -81,6 +81,9 @@ For full functionality, three logging sources on the UniFi Console should be con
 ### Source 1: Traffic Logging / Syslog (firewall, IDS, DHCP, Wi-Fi)
 
 1. **Settings > Policy Engine** — for each firewall rule, Edit > Advanced > **Enable Syslog Logging**
+
+> ⚠️ **Important**: This must be enabled on **every firewall rule** you want to monitor — including WAN IN/OUT and inter-VLAN rules. Rules without syslog enabled will pass/drop traffic silently with no log sent. This is the most commonly missed step and will result in missing events (especially external IP traffic needed for the Live Map and Threat Intel).
+
 2. **Settings > CyberSecure > Traffic Logging**:
    - Flow Logging: **All Traffic** (or Blocked Only for less volume)
    - Activity Logging (Syslog): Enable **SIEM Server**
