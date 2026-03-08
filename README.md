@@ -1,6 +1,10 @@
 # UniFi Network SIEM
 
-A self-contained Node.js application that collects syslog from UniFi consoles and gateways, parses all event types, stores them in SQLite, and serves a real-time security dashboard.
+![AI Powered](https://img.shields.io/badge/AI-Powered_Threat_Hunting-blueviolet?style=flat-square&logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyNCIgaGVpZ2h0PSIyNCIgdmlld0JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9IndoaXRlIiBzdHJva2Utd2lkdGg9IjIiPjxwYXRoIGQ9Ik0xMiAyYTEwIDEwIDAgMSAwIDAgMjAgMTAgMTAgMCAwIDAgMC0yMHoiLz48cGF0aCBkPSJNMTIgOHY0bDMgMyIvPjwvc3ZnPg==)
+![License](https://img.shields.io/badge/License-Apache_2.0-blue?style=flat-square)
+![Node.js](https://img.shields.io/badge/Node.js-18+-green?style=flat-square)
+
+A self-contained, **AI-powered** Node.js application that collects syslog from UniFi consoles and gateways, parses all event types, stores them in SQLite, and serves a real-time security dashboard with built-in AI threat hunting.
 
 ## Features
 

@@ -29,6 +29,40 @@
   letter-spacing: 0.05em;
 }
 
+.ai-badge {
+  font-size: 0.6rem;
+  font-weight: 600;
+  background: linear-gradient(135deg, #6366f1, #8b5cf6);
+  color: white;
+  padding: 2px 8px;
+  border-radius: 10px;
+  vertical-align: super;
+  letter-spacing: 0.05em;
+}
+
+.results-toolbar {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 0.75rem;
+}
+
+.export-btn {
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  color: #94a3b8;
+  padding: 0.4rem 1rem;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 0.8rem;
+  transition: all 0.15s;
+}
+
+.export-btn:hover {
+  background: rgba(255, 255, 255, 0.1);
+  color: #e2e8f0;
+  border-color: rgba(255, 255, 255, 0.2);
+}
+
 .hunt-subtitle {
   color: #94a3b8;
   font-size: 0.85rem;
