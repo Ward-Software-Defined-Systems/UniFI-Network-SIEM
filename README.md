@@ -268,7 +268,7 @@ The app runs HTTPS by default with an auto-generated self-signed certificate. Be
 
 - [x] Abuse score badges on IPs in tables
 - [x] Country flags on external IPs
-- [ ] Threat Hunting view — investigation workspace for profiling threat actors (IP timeline, associated events, geo history, abuse reports, related IPs)
+- [ ] Threat Hunting view — AI-powered investigation workspace for profiling threat actors (IP timeline, associated events, geo history, abuse reports, related IPs). Integrates with Gemini, OpenAI, or Anthropic APIs for automated threat analysis and natural language investigation queries
 - [ ] CSV export
 - [ ] Dark/light mode toggle
 - [ ] launchd plist for macOS auto-start
