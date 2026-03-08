@@ -263,6 +263,7 @@ The app runs HTTPS by default with an auto-generated self-signed certificate. Be
 |---|---|---|
 | AbuseIPDB scores not populating | **Fixed** | AbuseIPDB API field name was `abuseConfidenceScore` but code referenced `abuseConfidencePercentage` — scores were always `null`. Fixed in commit `11607e4`. Also added re-queue logic for cached IPs missing abuse scores. |
 | Database reset pegs CPU on large datasets | **Fixed** | Using "Initialize Database" previously ran `DELETE` + `VACUUM` on millions of rows, pegging CPU at 100% for 10+ minutes. Fixed by switching to `DROP TABLE` + schema recreate, which is instant regardless of database size. Fixed in commit `11607e4`. |
+| Enrichment backfill pegs CPU at 100% | **Known** | After enrichment completes, `updateEventsWithEnrichment()` runs UPDATE queries across all events for each cached IP to backfill geo/abuse data. At high event volumes (300K+/hr) this can sustain 100% CPU even on modest networks. Needs optimization — batch updates, indexed lookups on unenriched rows, or deferred backfill during idle periods. |
 
 ## Roadmap
 
