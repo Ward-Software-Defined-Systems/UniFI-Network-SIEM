@@ -60,8 +60,7 @@ const COLUMNS = [
   { field: 'lastSeen', label: 'Last Seen', align: 'right', type: 'string' },
 ];
 
-export default function ThreatIntel() {
-  const [period, setPeriod] = useState('1h');
+export default function ThreatIntel({ period, setPeriod }) {
   const [data, setData] = useState({ summary: { totalEnriched: 0, withAbuseScore: 0, highThreat: 0, countries: 0 }, periodSummary: { enriched: 0, flagged: 0, highThreat: 0, countries: 0 }, ips: [] });
   const [sortField, setSortField] = useState('event_count');
   const [sortDir, setSortDir] = useState('desc');

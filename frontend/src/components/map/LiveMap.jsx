@@ -102,8 +102,8 @@ function StatsOverlay({ geoEvents, recentEvents }) {
   );
 }
 
-export default function LiveMap() {
-  const [period, setPeriod] = useState('1h');
+export default function LiveMap({ period, setPeriod }) {
+  // period and setPeriod come from props
   const [geoEvents, setGeoEvents] = useState([]);
   const [recentEvents, setRecentEvents] = useState([]);
 

@@ -8,13 +8,14 @@ import Settings from './components/Settings';
 
 export default function App() {
   const [view, setView] = useState('dashboard');
+  const [period, setPeriod] = useState('1h');
 
   return (
     <Layout activeView={view} onViewChange={setView}>
       {view === 'live' && <LiveStream />}
-      {view === 'dashboard' && <Dashboard />}
-      {view === 'map' && <LiveMap />}
-      {view === 'intel' && <ThreatIntel />}
+      {view === 'dashboard' && <Dashboard period={period} setPeriod={setPeriod} />}
+      {view === 'map' && <LiveMap period={period} setPeriod={setPeriod} />}
+      {view === 'intel' && <ThreatIntel period={period} setPeriod={setPeriod} />}
       {view === 'settings' && <Settings />}
     </Layout>
   );

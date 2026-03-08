@@ -8,8 +8,7 @@ import TopThreats from './TopThreats';
 import TopClients from './TopClients';
 import { getStatsOverview, getTimeline, getTopTalkers, getTopBlocked, getTopPorts, getTopThreats, getTopClients } from '../../lib/api';
 
-export default function Dashboard() {
-  const [period, setPeriod] = useState('1h');
+export default function Dashboard({ period, setPeriod }) {
   const [excludePrivate, setExcludePrivate] = useState(true);
   const [overview, setOverview] = useState(null);
   const [timeline, setTimeline] = useState([]);
