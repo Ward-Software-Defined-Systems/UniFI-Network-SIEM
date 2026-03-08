@@ -7,7 +7,7 @@ function parseIds(message, header) {
   const match = message.match(SURICATA_RE);
   if (!match) {
     return {
-      event_type: 'threat',
+      event_type: 'system',
       source_format: 'suricata',
       severity: header.severity,
       hostname: header.hostname,

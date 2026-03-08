@@ -25,23 +25,36 @@ export default function Dashboard() {
     const bucket = period === '1h' ? '5m' : period === '6h' ? '15m' : '1h';
     const ep = excludePrivate ? '1' : undefined;
 
+    let cancelled = false;
+
     const fetchAll = () => {
       Promise.all([
-        getStatsOverview(period).then(setOverview).catch(() => {}),
-        getTimeline(period, bucket).then(setTimeline).catch(() => {}),
-        getTopTalkers(period, 10, 'src').then(setTopSrc).catch(() => {}),
-        getTopBlocked(period, 10, 'src', ep).then(setTopBlockedSrc).catch(() => {}),
-        getTopBlocked(period, 10, 'dst', ep).then(setTopBlockedDst).catch(() => {}),
-        getTopPorts(period, 10).then(setTopPorts).catch(() => {}),
-        getTopThreats(period, 10).then(setTopThreats).catch(() => {}),
-        getTopClients(period, 10).then(setTopClients).catch(() => {}),
-        getTopTalkers(period, 10, 'dst', ep).then(setTopDst).catch(() => {}),
-      ]);
+        getStatsOverview(period),
+        getTimeline(period, bucket),
+        getTopTalkers(period, 10, 'src'),
+        getTopBlocked(period, 10, 'src', ep),
+        getTopBlocked(period, 10, 'dst', ep),
+        getTopPorts(period, 10),
+        getTopThreats(period, 10),
+        getTopClients(period, 10),
+        getTopTalkers(period, 10, 'dst', ep),
+      ]).then(([overview, timeline, src, blockedSrc, blockedDst, ports, threats, clients, dst]) => {
+        if (cancelled) return;
+        setOverview(overview);
+        setTimeline(timeline);
+        setTopSrc(src);
+        setTopBlockedSrc(blockedSrc);
+        setTopBlockedDst(blockedDst);
+        setTopPorts(ports);
+        setTopThreats(threats);
+        setTopClients(clients);
+        setTopDst(dst);
+      }).catch(() => {});
     };
 
     fetchAll();
     const interval = setInterval(fetchAll, 10000);
-    return () => clearInterval(interval);
+    return () => { cancelled = true; clearInterval(interval); };
   }, [period, excludePrivate]);
 
   return (

@@ -108,14 +108,21 @@ export default function LiveMap() {
   const [recentEvents, setRecentEvents] = useState([]);
 
   useEffect(() => {
+    let cancelled = false;
     const fetchData = () => {
-      getGeoEvents(period, 1000).then(setGeoEvents).catch(() => {});
-      getRecentGeoEvents(50).then(setRecentEvents).catch(() => {});
+      Promise.all([
+        getGeoEvents(period, 1000),
+        getRecentGeoEvents(50),
+      ]).then(([geo, recent]) => {
+        if (cancelled) return;
+        setGeoEvents(geo);
+        setRecentEvents(recent);
+      }).catch(() => {});
     };
 
     fetchData();
     const interval = setInterval(fetchData, 10000);
-    return () => clearInterval(interval);
+    return () => { cancelled = true; clearInterval(interval); };
   }, [period]);
 
   const filteredEvents = geoEvents.filter(e => !isPrivateIp(e.ip));

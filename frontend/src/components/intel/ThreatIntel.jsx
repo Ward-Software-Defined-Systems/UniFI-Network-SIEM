@@ -69,12 +69,15 @@ export default function ThreatIntel() {
   const [showFilters, setShowFilters] = useState(false);
 
   useEffect(() => {
+    let cancelled = false;
     const fetchData = () => {
-      getThreatIntel(period, 200).then(setData).catch(() => {});
+      getThreatIntel(period, 200).then(d => {
+        if (!cancelled) setData(d);
+      }).catch(() => {});
     };
     fetchData();
     const interval = setInterval(fetchData, 10000);
-    return () => clearInterval(interval);
+    return () => { cancelled = true; clearInterval(interval); };
   }, [period]);
 
   const handleSort = (field) => {
