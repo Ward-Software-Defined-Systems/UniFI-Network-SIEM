@@ -10,7 +10,8 @@ A self-contained Node.js application that collects syslog from UniFi consoles an
 - **Dashboard** — stats cards, event timeline chart, top blocked, top threats, top ports, top clients, top sources, top destinations
 - **Live Map** — Leaflet-based world map showing geo-enriched traffic with color-coded markers (normal/blocked/threat), flow lines, and stats overlay
 - **GeoIP & threat enrichment** — MaxMind GeoLite2 for geolocation, AbuseIPDB for threat scoring, reverse DNS — all async with caching
-- **Threat Intel** — sortable/filterable table of enriched IPs with abuse scores, event counts, and locations
+- **Country flags & abuse badges** — 🇺🇸 emoji flags with country codes on external IPs; color-coded abuse score badges across all views
+- **Threat Intel** — sortable/filterable table of enriched IPs with abuse scores, event counts, and locations; period-filtered summary cards alongside all-time totals
 - **HTTPS by default** — auto-generated self-signed TLS certificate
 - **SQLite storage** — WAL mode, batched inserts, automatic retention cleanup
 - **Zero external services** — everything runs in one process
@@ -258,8 +259,8 @@ The app runs HTTPS by default with an auto-generated self-signed certificate. Be
 
 ## Roadmap
 
-- [ ] Abuse score badges on IPs in tables
-- [ ] Country flags on external IPs
+- [x] Abuse score badges on IPs in tables
+- [x] Country flags on external IPs
 - [ ] CSV export
 - [ ] Dark/light mode toggle
 - [ ] launchd plist for macOS auto-start

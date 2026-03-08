@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { MapContainer, TileLayer, CircleMarker, Polyline, Popup, useMap } from 'react-leaflet';
 import PeriodSelector from '../shared/PeriodSelector';
 import { getGeoEvents, getRecentGeoEvents } from '../../lib/api';
-import { formatNumber, formatDateTime } from '../../lib/format';
+import { formatNumber, formatDateTime, countryFlag } from '../../lib/format';
 import 'leaflet/dist/leaflet.css';
 
 function isPrivateIp(ip) {
@@ -178,9 +178,9 @@ export default function LiveMap() {
                 <div className="text-xs space-y-1 min-w-[180px]">
                   <div className="font-bold text-sm">{event.ip}</div>
                   {event.city && event.country && (
-                    <div>{event.city}, {event.country}</div>
+                    <div>{countryFlag(event.country)} {event.city}, {event.country}</div>
                   )}
-                  {!event.city && event.country && <div>{event.country}</div>}
+                  {!event.city && event.country && <div>{countryFlag(event.country)} {event.country}</div>}
                   <div>Events: <strong>{formatNumber(event.count)}</strong></div>
                   {event.blocked > 0 && (
                     <div style={{ color: '#f97316' }}>Blocked: {formatNumber(event.blocked)}</div>

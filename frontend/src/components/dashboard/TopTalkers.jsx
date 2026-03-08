@@ -1,5 +1,5 @@
 import React from 'react';
-import { formatNumber } from '../../lib/format';
+import { formatNumber, countryFlag, abuseScoreColor } from '../../lib/format';
 
 export default function TopTalkers({ data, title = 'Top Talkers' }) {
   if (!data || data.length === 0) {
@@ -27,7 +27,8 @@ export default function TopTalkers({ data, title = 'Top Talkers' }) {
               <div className="flex items-center gap-2">
                 <span className="text-xs text-gray-500 w-5">{i + 1}</span>
                 <span className="text-xs font-mono text-gray-200">{row.ip}</span>
-                {row.country && <span className="text-xs text-gray-500">{row.country}</span>}
+                {row.abuseScore > 0 && (() => { const c = abuseScoreColor(row.abuseScore); return c ? <span className={`text-[10px] px-1.5 py-0.5 rounded-full border ${c.bg} ${c.text} ${c.border}`}>{row.abuseScore}%</span> : null; })()}
+                {row.country && <span className="text-xs text-gray-500">{countryFlag(row.country)} {row.country}</span>}
                 {row.hostname && <span className="text-xs text-gray-500">{row.hostname}</span>}
               </div>
               <span className="text-xs font-medium text-gray-300">{formatNumber(row.count)}</span>

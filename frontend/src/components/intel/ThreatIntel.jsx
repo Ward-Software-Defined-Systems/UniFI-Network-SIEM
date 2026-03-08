@@ -2,7 +2,7 @@ import React, { useState, useEffect, useMemo } from 'react';
 import { ChevronUp, ChevronDown } from 'lucide-react';
 import PeriodSelector from '../shared/PeriodSelector';
 import { getThreatIntel } from '../../lib/api';
-import { formatNumber, formatDateTime } from '../../lib/format';
+import { formatNumber, formatDateTime, countryFlag } from '../../lib/format';
 
 function AbuseScoreBar({ score }) {
   if (score == null) return <span className="text-gray-600 text-xs">—</span>;
@@ -253,6 +253,7 @@ export default function ThreatIntel() {
                     {ip.hostname || '—'}
                   </td>
                   <td className="px-4 py-2.5 text-xs text-gray-400">
+                    {ip.country && <span className="mr-1">{countryFlag(ip.country)}</span>}
                     {ip.city && ip.country ? `${ip.city}, ${ip.country}` : ip.country || '—'}
                   </td>
                   <td className="px-4 py-2.5">
