@@ -7,7 +7,7 @@ function runRetentionCleanup() {
     const db = getDb();
     const days = config.db.retentionDays;
     const result = db.prepare(
-      "DELETE FROM events WHERE received_at < datetime('now', ?)"
+      "DELETE FROM events WHERE received_at < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?)"
     ).run(`-${days} days`);
 
     if (result.changes > 0) {

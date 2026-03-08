@@ -42,7 +42,7 @@ router.get('/overview', (req, res) => {
     const interval = periodToInterval(period);
     const db = getDb();
 
-    const since = db.prepare("SELECT datetime('now', ?) as t").get(interval).t;
+    const since = db.prepare("SELECT strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?) as t").get(interval).t;
     const total = db.prepare('SELECT COUNT(*) as c FROM events WHERE received_at >= ?').get(since).c;
     const byType = getEventTypeCounts(since);
 
@@ -66,7 +66,7 @@ router.get('/timeline', (req, res) => {
     const fmt = bucketToFormat(bucket);
     const db = getDb();
 
-    const since = db.prepare("SELECT datetime('now', ?) as t").get(interval).t;
+    const since = db.prepare("SELECT strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?) as t").get(interval).t;
 
     let sql;
     if (req.query.event_type === 'firewall') {
@@ -104,7 +104,7 @@ router.get('/top-talkers', (req, res) => {
     const excludePriv = req.query.exclude_private === '1';
     const interval = periodToInterval(period);
     const db = getDb();
-    const since = db.prepare("SELECT datetime('now', ?) as t").get(interval).t;
+    const since = db.prepare("SELECT strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?) as t").get(interval).t;
     const col = direction === 'dst' ? 'dst_ip' : 'src_ip';
     const geoCol = direction === 'dst' ? 'dst_geo_country' : 'src_geo_country';
     const hostCol = direction === 'dst' ? 'dst_hostname' : 'src_hostname';
@@ -131,7 +131,7 @@ router.get('/top-blocked', (req, res) => {
     const excludePriv = req.query.exclude_private === '1';
     const interval = periodToInterval(period);
     const db = getDb();
-    const since = db.prepare("SELECT datetime('now', ?) as t").get(interval).t;
+    const since = db.prepare("SELECT strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?) as t").get(interval).t;
     const col = direction === 'dst' ? 'dst_ip' : 'src_ip';
     const geoCol = direction === 'dst' ? 'dst_geo_country' : 'src_geo_country';
     const abuseCol = direction === 'dst' ? 'dst_abuse_score' : 'src_abuse_score';
@@ -157,7 +157,7 @@ router.get('/top-ports', (req, res) => {
     const limit = Math.min(parseInt(req.query.limit || '10', 10), 50);
     const interval = periodToInterval(period);
     const db = getDb();
-    const since = db.prepare("SELECT datetime('now', ?) as t").get(interval).t;
+    const since = db.prepare("SELECT strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?) as t").get(interval).t;
 
     const rows = db.prepare(`
       SELECT dst_port as port, protocol, COUNT(*) as count
@@ -177,7 +177,7 @@ router.get('/top-clients', (req, res) => {
     const limit = Math.min(parseInt(req.query.limit || '10', 10), 50);
     const interval = periodToInterval(period);
     const db = getDb();
-    const since = db.prepare("SELECT datetime('now', ?) as t").get(interval).t;
+    const since = db.prepare("SELECT strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?) as t").get(interval).t;
 
     const rows = db.prepare(`
       SELECT
@@ -205,7 +205,7 @@ router.get('/top-threats', (req, res) => {
     const limit = Math.min(parseInt(req.query.limit || '10', 10), 50);
     const interval = periodToInterval(period);
     const db = getDb();
-    const since = db.prepare("SELECT datetime('now', ?) as t").get(interval).t;
+    const since = db.prepare("SELECT strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?) as t").get(interval).t;
 
     const rows = db.prepare(`
       SELECT ids_signature as signature, ids_classification as classification,
@@ -226,7 +226,7 @@ router.get('/threat-intel', (req, res) => {
     const limit = Math.min(parseInt(req.query.limit || '50', 10), 200);
     const interval = periodToInterval(period);
     const db = getDb();
-    const since = db.prepare("SELECT datetime('now', ?) as t").get(interval).t;
+    const since = db.prepare("SELECT strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?) as t").get(interval).t;
 
     // Get enriched IPs with event counts in this period
     const rows = db.prepare(`
@@ -296,7 +296,7 @@ router.get('/geo-events', (req, res) => {
     const limit = Math.min(parseInt(req.query.limit || '500', 10), 1000);
     const interval = periodToInterval(period);
     const db = getDb();
-    const since = db.prepare("SELECT datetime('now', ?) as t").get(interval).t;
+    const since = db.prepare("SELECT strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?) as t").get(interval).t;
     const half = Math.ceil(limit / 2);
 
     // Query src and dst separately with individual limits to ensure
