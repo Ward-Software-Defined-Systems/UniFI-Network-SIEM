@@ -36,8 +36,8 @@ async function main() {
   // Initialize GeoIP (async, non-blocking if DB missing)
   await initGeoIp();
 
-  // Backfill any events missing enrichment data from the cache
-  backfillFromCache();
+  // Defer backfill — let the server start and stabilize first (30s delay)
+  setTimeout(() => backfillFromCache(), 30000);
 
   // Set up WebSocket broadcast + enrichment on each inserted event
   setOnInsert((event) => {

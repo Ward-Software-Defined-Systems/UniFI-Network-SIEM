@@ -117,6 +117,8 @@ function initSchema(db) {
     CREATE INDEX IF NOT EXISTS idx_events_action ON events(action);
     CREATE INDEX IF NOT EXISTS idx_events_src_ip ON events(src_ip);
     CREATE INDEX IF NOT EXISTS idx_events_dst_ip ON events(dst_ip);
+    CREATE INDEX IF NOT EXISTS idx_events_src_unenriched ON events(src_ip) WHERE src_geo_country IS NULL;
+    CREATE INDEX IF NOT EXISTS idx_events_dst_unenriched ON events(dst_ip) WHERE dst_geo_country IS NULL;
     CREATE INDEX IF NOT EXISTS idx_events_dst_port ON events(dst_port);
     CREATE INDEX IF NOT EXISTS idx_events_severity ON events(severity);
     CREATE INDEX IF NOT EXISTS idx_events_client_mac ON events(client_mac);

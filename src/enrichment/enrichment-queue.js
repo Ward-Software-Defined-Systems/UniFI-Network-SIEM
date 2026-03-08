@@ -129,28 +129,36 @@ async function enrichIp(ip) {
 function updateEventsWithEnrichment(ip, data) {
   const db = getDb();
 
-  // Update events where this IP is the source
+  // Update only recent unenriched events (last 1000 per IP per direction)
+  // Older events get backfilled gradually during idle periods
+  const BATCH_LIMIT = 1000;
+
   db.prepare(`
     UPDATE events SET
       src_geo_country = ?, src_geo_city = ?, src_geo_lat = ?, src_geo_lon = ?,
       src_abuse_score = ?, src_hostname = ?
-    WHERE src_ip = ? AND src_geo_country IS NULL
+    WHERE rowid IN (
+      SELECT rowid FROM events WHERE src_ip = ? AND src_geo_country IS NULL
+      ORDER BY rowid DESC LIMIT ?
+    )
   `).run(
     data.geo_country, data.geo_city, data.geo_lat, data.geo_lon,
     data.abuse_score, data.hostname,
-    ip,
+    ip, BATCH_LIMIT,
   );
 
-  // Update events where this IP is the destination
   db.prepare(`
     UPDATE events SET
       dst_geo_country = ?, dst_geo_city = ?, dst_geo_lat = ?, dst_geo_lon = ?,
       dst_abuse_score = ?, dst_hostname = ?
-    WHERE dst_ip = ? AND dst_geo_country IS NULL
+    WHERE rowid IN (
+      SELECT rowid FROM events WHERE dst_ip = ? AND dst_geo_country IS NULL
+      ORDER BY rowid DESC LIMIT ?
+    )
   `).run(
     data.geo_country, data.geo_city, data.geo_lat, data.geo_lon,
     data.abuse_score, data.hostname,
-    ip,
+    ip, BATCH_LIMIT,
   );
 }
 
@@ -159,6 +167,7 @@ function getQueueSize() {
 }
 
 // Backfill geo data for events that have IPs in the cache but NULL geo fields
+// Runs in batched chunks to avoid blocking the event loop
 function backfillFromCache() {
   try {
     const db = getDb();
@@ -168,27 +177,27 @@ function backfillFromCache() {
 
     if (cached.length === 0) return;
 
-    const updateSrc = db.prepare(`
-      UPDATE events SET
-        src_geo_country = ?, src_geo_city = ?, src_geo_lat = ?, src_geo_lon = ?,
-        src_abuse_score = ?, src_hostname = ?
-      WHERE src_ip = ? AND src_geo_country IS NULL
-    `);
-    const updateDst = db.prepare(`
-      UPDATE events SET
-        dst_geo_country = ?, dst_geo_city = ?, dst_geo_lat = ?, dst_geo_lon = ?,
-        dst_abuse_score = ?, dst_hostname = ?
-      WHERE dst_ip = ? AND dst_geo_country IS NULL
-    `);
+    const CHUNK_SIZE = 5;
+    let offset = 0;
 
-    const txn = db.transaction(() => {
-      for (const c of cached) {
-        updateSrc.run(c.geo_country, c.geo_city, c.geo_lat, c.geo_lon, c.abuse_score, c.hostname, c.ip);
-        updateDst.run(c.geo_country, c.geo_city, c.geo_lat, c.geo_lon, c.abuse_score, c.hostname, c.ip);
+    function processChunk() {
+      const chunk = cached.slice(offset, offset + CHUNK_SIZE);
+      if (chunk.length === 0) {
+        logger.info({ ips: cached.length }, 'Backfilled enrichment data from cache to events');
+        return;
       }
-    });
-    txn();
-    logger.info({ ips: cached.length }, 'Backfilled enrichment data from cache to events');
+
+      for (const c of chunk) {
+        updateEventsWithEnrichment(c.ip, c);
+      }
+
+      offset += CHUNK_SIZE;
+      // Yield to event loop between chunks so syslog + API stay responsive
+      setTimeout(processChunk, 50);
+    }
+
+    logger.info({ ips: cached.length }, 'Starting enrichment backfill (chunked)');
+    setImmediate(processChunk);
   } catch (err) {
     logger.warn({ err }, 'Failed to backfill enrichment from cache');
   }
