@@ -66,7 +66,7 @@ export default function Settings() {
           <div className="space-y-3">
             {dbEngines.backends.map((backend) => {
               const isActive = selectedEngine === backend.id;
-              const isComingSoon = backend.status === 'beta_coming_soon';
+              const isComingSoon = backend.status === 'beta_coming_soon' || backend.status === 'coming_soon';
               return (
                 <div
                   key={backend.id}
