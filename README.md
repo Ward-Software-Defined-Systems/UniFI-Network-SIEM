@@ -35,6 +35,9 @@ A self-contained, **AI-powered** Node.js application that collects syslog from U
 ### Live Stream
 ![Live Stream](screenshots/LiveStream.png)
 
+### Threat Hunt (Beta)
+![Threat Hunt Beta](screenshots/ThreatHuntBeta.png)
+
 ### Settings
 ![Settings](screenshots/Settings.png)
 
@@ -281,4 +284,5 @@ The app runs HTTPS by default with an auto-generated self-signed certificate. Be
 - [ ] Threat Hunting view — AI-powered investigation workspace for profiling threat actors (IP timeline, associated events, geo history, abuse reports, related IPs). Integrates with Gemini, OpenAI, or Anthropic APIs for automated threat analysis and natural language investigation queries
 - [ ] CSV export
 - [ ] Dark/light mode toggle
+- [ ] Performance optimization — enrichment backfill, query tuning, multi-core utilization for high-volume deployments
 - [ ] launchd plist for macOS auto-start
