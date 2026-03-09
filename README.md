@@ -18,6 +18,7 @@ A self-contained, **AI-powered** Node.js application that collects syslog from U
 - **Threat Intel** — sortable/filterable table of enriched IPs with abuse scores, event counts, and locations; period-filtered summary cards alongside all-time totals
 - **Threat Hunt (Beta)** — AI-powered threat actor investigation. Enter any IP to get a full profile: local SIEM activity (events, ports, timeline, IDS signatures, related /24 IPs), external intel (rDNS, WHOIS/ASN), and a structured AI threat assessment with PDF export. Supports Anthropic (Opus 4.6), OpenAI (GPT-5.4), and Google (Gemini 3.1 Pro) with on-page API key management. *Currently tested with Anthropic only — OpenAI and Google integrations are implemented but untested.*
 - **HTTPS by default** — auto-generated self-signed TLS certificate
+- **Pluggable storage backends** — SQLite (built-in default), WardSONDB (Beta — Coming Soon), OpenSearch (Beta — Coming Soon)
 - **SQLite storage** — WAL mode, batched inserts, automatic retention cleanup, worker thread enrichment
 - **Zero external services** — everything runs in one process
 
@@ -207,6 +208,12 @@ src/
     database.js                # SQLite connection & schema
     events.js                  # Event CRUD & batch insert
     retention.js               # Periodic cleanup
+    backends/
+      interface.js             # StorageBackend base class
+      index.js                 # Backend registry & factory
+      sqlite.js                # SQLite backend (default)
+      wardsondb.js             # WardSONDB backend (Beta — Coming Soon)
+      opensearch.js            # OpenSearch backend (Beta — Coming Soon)
   api/
     server.js                  # Express + static serving
     websocket.js               # WebSocket live stream
@@ -289,5 +296,8 @@ The app runs HTTPS by default with an auto-generated self-signed certificate. Be
 - [ ] CSV export
 - [ ] Dark/light mode toggle
 - [x] Performance optimization — enrichment backfill moved to worker thread for non-blocking operation
-- [ ] Query performance optimization — tuning for large datasets (millions of rows), potential migration to document-based storage
+- [x] Storage backend abstraction — pluggable database engine (SQLite, WardSONDB, OpenSearch) selectable from Settings
+- [ ] WardSONDB integration — high-performance Rust-based JSON document database for large-scale deployments
+- [ ] OpenSearch integration — enterprise search and analytics engine with built-in SIEM capabilities
+- [ ] Query performance optimization — tuning for large datasets (millions of rows)
 - [ ] launchd plist for macOS auto-start
