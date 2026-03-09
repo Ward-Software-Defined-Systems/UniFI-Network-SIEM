@@ -24,9 +24,11 @@ class WardsonDbBackend extends StorageBackend {
     this.eventsCollection = 'events';
     this.cacheCollection = 'enrichment_cache';
 
-    // If TLS with self-signed certs, disable Node's cert verification
+    // If TLS with self-signed certs, disable Node's TLS verification globally
+    // Node's native fetch doesn't support per-request agent/dispatcher options
     if (config.useTls && !this.verifyCerts) {
-      this.agent = new (require('https').Agent)({ rejectUnauthorized: false });
+      process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+      logger.warn('TLS certificate verification disabled for WardSONDB connection');
     }
   }
 
@@ -53,7 +55,7 @@ class WardsonDbBackend extends StorageBackend {
       method,
       headers: { 'Content-Type': 'application/json' },
     };
-    if (this.agent) opts.agent = this.agent;
+
     if (this.apiKey) opts.headers['Authorization'] = `Bearer ${this.apiKey}`;
     if (body) opts.body = JSON.stringify(body);
 
