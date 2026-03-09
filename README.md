@@ -262,6 +262,9 @@ The app runs HTTPS by default with an auto-generated self-signed certificate. Be
 | Database reset without auth | **Low** | The `POST /api/settings/reset-db` endpoint requires no credentials. Mitigated by the network-only access constraint and the two-click confirmation in the UI. |
 | TLS certificate trust | **Info** | The self-signed certificate will trigger browser warnings. For production, replace `data/server.key` and `data/server.cert` with certs from a trusted CA or your own internal CA. |
 
+**Known advisories:**
+- **esbuild ≤ 0.24.2 (moderate)** — allows any website to send requests to the Vite dev server and read responses ([GHSA-67mh-4wv8-2f99](https://github.com/advisories/GHSA-67mh-4wv8-2f99)). This is a dev-only dependency used during frontend development — it does not affect production builds or the deployed SIEM. Fix requires upgrading Vite to 7.x (breaking change).
+
 **Already mitigated:**
 - **SQL injection** — all queries use parameterized prepared statements
 - **XSS** — React auto-escapes all rendered content including untrusted syslog data
