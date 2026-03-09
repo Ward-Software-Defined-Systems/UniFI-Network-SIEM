@@ -32,11 +32,11 @@ A self-contained, **AI-powered** Node.js application that collects syslog from U
 ### Threat Intel
 ![Threat Intel](screenshots/ThreatIntel.png)
 
-### Live Stream
-![Live Stream](screenshots/LiveStream.png)
-
 ### Threat Hunt (Beta)
 ![Threat Hunt Beta](screenshots/ThreatHuntBeta.png)
+
+### Live Stream
+![Live Stream](screenshots/LiveStream.png)
 
 ### Settings
 ![Settings](screenshots/Settings.png)
