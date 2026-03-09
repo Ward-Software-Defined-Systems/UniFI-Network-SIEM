@@ -276,7 +276,7 @@ The app runs HTTPS by default with an auto-generated self-signed certificate. Be
 |---|---|---|
 | AbuseIPDB scores not populating | **Fixed** | AbuseIPDB API field name was `abuseConfidenceScore` but code referenced `abuseConfidencePercentage` — scores were always `null`. Fixed in commit `11607e4`. Also added re-queue logic for cached IPs missing abuse scores. |
 | Database reset pegs CPU on large datasets | **Fixed** | Using "Initialize Database" previously ran `DELETE` + `VACUUM` on millions of rows, pegging CPU at 100% for 10+ minutes. Fixed by switching to `DROP TABLE` + schema recreate, which is instant regardless of database size. Fixed in commit `11607e4`. |
-| Enrichment backfill pegs CPU at 100% | **Fixed** | Backfill UPDATE queries blocked the main Node.js event loop via synchronous `better-sqlite3` calls, sustaining 99% CPU for 4+ hours. Fixed by moving all enrichment UPDATEs to a dedicated `worker_threads` Worker with its own DB connection. Backfill of 6,600+ IPs now completes in ~1.5 minutes with 0% main thread CPU. Fixed in commit `TBD`. |
+| Enrichment backfill pegs CPU at 100% | **Fixed** | Backfill UPDATE queries blocked the main Node.js event loop via synchronous `better-sqlite3` calls, sustaining 99% CPU for 4+ hours. Fixed by moving all enrichment UPDATEs to a dedicated `worker_threads` Worker with its own DB connection. Backfill of 6,600+ IPs now completes in ~1.5 minutes with 0% main thread CPU. Fixed in commit `ca0f8ea`. |
 
 ## Roadmap
 
