@@ -7,7 +7,7 @@ const { createSyslogServer } = require('./collector/syslog-server');
 const { createServer } = require('./api/server');
 const { broadcastEvent } = require('./api/websocket');
 const { initGeoIp } = require('./enrichment/geoip');
-const { enqueueEvent, backfillFromCache } = require('./enrichment/enrichment-queue');
+const { enqueueEvent, backfillFromCache, shutdownWorker } = require('./enrichment/enrichment-queue');
 
 async function main() {
   logger.info('Starting UniFi Network SIEM...');
@@ -76,6 +76,7 @@ async function main() {
   // Graceful shutdown
   const shutdown = () => {
     logger.info('Shutting down...');
+    shutdownWorker();
     flushQueue();
     closeDb();
     process.exit(0);

@@ -18,7 +18,7 @@ A self-contained, **AI-powered** Node.js application that collects syslog from U
 - **Threat Intel** — sortable/filterable table of enriched IPs with abuse scores, event counts, and locations; period-filtered summary cards alongside all-time totals
 - **Threat Hunt (Beta)** — AI-powered threat actor investigation. Enter any IP to get a full profile: local SIEM activity (events, ports, timeline, IDS signatures, related /24 IPs), external intel (rDNS, WHOIS/ASN), and a structured AI threat assessment with PDF export. Supports Anthropic (Opus 4.6), OpenAI (GPT-5.4), and Google (Gemini 3.1 Pro) with on-page API key management. *Currently tested with Anthropic only — OpenAI and Google integrations are implemented but untested.*
 - **HTTPS by default** — auto-generated self-signed TLS certificate
-- **SQLite storage** — WAL mode, batched inserts, automatic retention cleanup
+- **SQLite storage** — WAL mode, batched inserts, automatic retention cleanup, worker thread enrichment
 - **Zero external services** — everything runs in one process
 
 ## Screenshots
@@ -217,7 +217,8 @@ src/
     geoip.js                   # MaxMind GeoLite2 lookup
     abuseipdb.js               # AbuseIPDB API client
     rdns.js                    # Reverse DNS lookup
-    enrichment-queue.js        # Async background worker
+    enrichment-queue.js        # Async enrichment coordinator
+    enrichment-worker.js       # Worker thread for UPDATE operations
   db/cache.js                  # IP enrichment cache
 
 frontend/                      # React + Vite + Tailwind
@@ -275,7 +276,7 @@ The app runs HTTPS by default with an auto-generated self-signed certificate. Be
 |---|---|---|
 | AbuseIPDB scores not populating | **Fixed** | AbuseIPDB API field name was `abuseConfidenceScore` but code referenced `abuseConfidencePercentage` — scores were always `null`. Fixed in commit `11607e4`. Also added re-queue logic for cached IPs missing abuse scores. |
 | Database reset pegs CPU on large datasets | **Fixed** | Using "Initialize Database" previously ran `DELETE` + `VACUUM` on millions of rows, pegging CPU at 100% for 10+ minutes. Fixed by switching to `DROP TABLE` + schema recreate, which is instant regardless of database size. Fixed in commit `11607e4`. |
-| Enrichment backfill pegs CPU at 100% | **WIP** | After enrichment completes, `updateEventsWithEnrichment()` runs UPDATE queries across all events for each cached IP to backfill geo/abuse data. At high event volumes (300K+/hr) this can sustain 100% CPU even on modest networks. Partially mitigated with deferred startup (30s delay), chunked processing (5 IPs/chunk with 50ms yield), row limits (1000/IP), and partial indexes on unenriched rows. Further optimization planned. |
+| Enrichment backfill pegs CPU at 100% | **Fixed** | Backfill UPDATE queries blocked the main Node.js event loop via synchronous `better-sqlite3` calls, sustaining 99% CPU for 4+ hours. Fixed by moving all enrichment UPDATEs to a dedicated `worker_threads` Worker with its own DB connection. Backfill of 6,600+ IPs now completes in ~1.5 minutes with 0% main thread CPU. Fixed in commit `TBD`. |
 
 ## Roadmap
 
@@ -284,5 +285,6 @@ The app runs HTTPS by default with an auto-generated self-signed certificate. Be
 - [ ] Threat Hunting view — AI-powered investigation workspace for profiling threat actors (IP timeline, associated events, geo history, abuse reports, related IPs). Integrates with Gemini, OpenAI, or Anthropic APIs for automated threat analysis and natural language investigation queries
 - [ ] CSV export
 - [ ] Dark/light mode toggle
-- [ ] Performance optimization — enrichment backfill, query tuning, multi-core utilization for high-volume deployments
+- [x] Performance optimization — enrichment backfill moved to worker thread for non-blocking operation
+- [ ] Query performance optimization — tuning for large datasets (millions of rows), potential migration to document-based storage
 - [ ] launchd plist for macOS auto-start

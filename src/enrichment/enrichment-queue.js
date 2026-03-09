@@ -1,9 +1,10 @@
+const { Worker } = require('worker_threads');
+const path = require('path');
 const { isPrivateIp } = require('../utils/ip-utils');
 const { lookupGeoIp, isGeoIpAvailable } = require('./geoip');
 const { checkIp, isAbuseIpDbAvailable } = require('./abuseipdb');
 const { reverseLookup } = require('./rdns');
 const { getCachedEnrichment, setCachedEnrichment, markPrivate } = require('../db/cache');
-const { getDb } = require('../db/database');
 const config = require('../config');
 const logger = require('../utils/logger');
 
@@ -11,22 +12,76 @@ const ipQueue = new Set();
 let processing = false;
 let activeCount = 0;
 
+// Worker thread for UPDATE operations
+let worker = null;
+
+function initWorker() {
+  if (worker) return;
+
+  worker = new Worker(path.join(__dirname, 'enrichment-worker.js'), {
+    workerData: { dbPath: config.db.path },
+  });
+
+  worker.on('message', (msg) => {
+    switch (msg.type) {
+      case 'ready':
+        logger.info('Enrichment worker thread started');
+        break;
+      case 'backfill-start':
+        logger.info({ ips: msg.ips }, 'Worker: starting enrichment backfill');
+        break;
+      case 'backfill-progress':
+        logger.info({ processed: msg.processed, total: msg.total, updated: msg.totalUpdated }, 'Worker: backfill progress');
+        break;
+      case 'backfill-done':
+        logger.info({ ips: msg.ips, totalUpdated: msg.totalUpdated }, 'Worker: backfill complete');
+        break;
+      case 'update-done':
+        logger.debug({ ip: msg.ip, src: msg.srcChanged, dst: msg.dstChanged }, 'Worker: enrichment update applied');
+        break;
+    }
+  });
+
+  worker.on('error', (err) => {
+    logger.error({ err }, 'Enrichment worker error');
+  });
+
+  worker.on('exit', (code) => {
+    if (code !== 0) {
+      logger.warn({ code }, 'Enrichment worker exited unexpectedly, restarting...');
+      worker = null;
+      setTimeout(initWorker, 5000);
+    }
+  });
+}
+
+function sendToWorker(msg) {
+  if (!worker) {
+    initWorker();
+  }
+  worker.postMessage(msg);
+}
+
 function enqueueIp(ip) {
   if (!ip || ipQueue.has(ip)) return;
   if (isPrivateIp(ip)) return;
 
-  // Check cache first — if fresh, apply cached data to any new un-enriched events
+  // Check cache first — if fresh, apply cached data via worker
   const cached = getCachedEnrichment(ip);
   if (cached) {
-    // Apply cached enrichment to any events that don't have it yet
     if (cached.geo_country || cached.abuse_score != null) {
-      updateEventsWithEnrichment(ip, {
-        geo_country: cached.geo_country,
-        geo_city: cached.geo_city,
-        geo_lat: cached.geo_lat,
-        geo_lon: cached.geo_lon,
-        abuse_score: cached.abuse_score,
-        hostname: cached.hostname,
+      // Delegate UPDATE to worker thread (non-blocking)
+      sendToWorker({
+        type: 'update',
+        ip,
+        data: {
+          geo_country: cached.geo_country,
+          geo_city: cached.geo_city,
+          geo_lat: cached.geo_lat,
+          geo_lon: cached.geo_lon,
+          abuse_score: cached.abuse_score,
+          hostname: cached.hostname,
+        },
       });
     }
     // Re-queue if missing abuse score and AbuseIPDB is available
@@ -42,7 +97,6 @@ function enqueueIp(ip) {
 }
 
 function enqueueEvent(event) {
-  // Only enrich external IPs from firewall/threat events
   const types = new Set(['firewall', 'threat', 'dns_filter']);
   if (!types.has(event.event_type)) return;
 
@@ -75,7 +129,6 @@ async function enrichIp(ip) {
       return;
     }
 
-    // Start with existing cached data (if any) to avoid overwriting
     const existing = getCachedEnrichment(ip);
     const enrichment = {
       geo_country: existing?.geo_country || null,
@@ -86,7 +139,7 @@ async function enrichIp(ip) {
       hostname: existing?.hostname || null,
     };
 
-    // GeoIP lookup (sync, fast) — only if not already cached
+    // GeoIP lookup (sync, fast)
     if (!enrichment.geo_country && isGeoIpAvailable()) {
       const geo = lookupGeoIp(ip);
       if (geo) {
@@ -102,7 +155,6 @@ async function enrichIp(ip) {
       const abuse = await checkIp(ip);
       if (abuse) {
         enrichment.abuse_score = abuse.abuseScore;
-        // Use country from AbuseIPDB if GeoIP didn't have it
         if (!enrichment.geo_country && abuse.countryCode) {
           enrichment.geo_country = abuse.countryCode;
         }
@@ -114,11 +166,11 @@ async function enrichIp(ip) {
       enrichment.hostname = await reverseLookup(ip);
     }
 
-    // Cache the result
+    // Cache the result (main thread — fast, single row upsert)
     setCachedEnrichment(ip, enrichment);
 
-    // Update existing events with this IP
-    updateEventsWithEnrichment(ip, enrichment);
+    // Delegate heavy UPDATE to worker thread
+    sendToWorker({ type: 'update', ip, data: enrichment });
 
     logger.debug({ ip, country: enrichment.geo_country, abuse: enrichment.abuse_score }, 'Enriched IP');
   } catch (err) {
@@ -126,81 +178,23 @@ async function enrichIp(ip) {
   }
 }
 
-function updateEventsWithEnrichment(ip, data) {
-  const db = getDb();
-
-  // Update only recent unenriched events (last 1000 per IP per direction)
-  // Older events get backfilled gradually during idle periods
-  const BATCH_LIMIT = 1000;
-
-  db.prepare(`
-    UPDATE events SET
-      src_geo_country = ?, src_geo_city = ?, src_geo_lat = ?, src_geo_lon = ?,
-      src_abuse_score = ?, src_hostname = ?
-    WHERE rowid IN (
-      SELECT rowid FROM events WHERE src_ip = ? AND src_geo_country IS NULL
-      ORDER BY rowid DESC LIMIT ?
-    )
-  `).run(
-    data.geo_country, data.geo_city, data.geo_lat, data.geo_lon,
-    data.abuse_score, data.hostname,
-    ip, BATCH_LIMIT,
-  );
-
-  db.prepare(`
-    UPDATE events SET
-      dst_geo_country = ?, dst_geo_city = ?, dst_geo_lat = ?, dst_geo_lon = ?,
-      dst_abuse_score = ?, dst_hostname = ?
-    WHERE rowid IN (
-      SELECT rowid FROM events WHERE dst_ip = ? AND dst_geo_country IS NULL
-      ORDER BY rowid DESC LIMIT ?
-    )
-  `).run(
-    data.geo_country, data.geo_city, data.geo_lat, data.geo_lon,
-    data.abuse_score, data.hostname,
-    ip, BATCH_LIMIT,
-  );
-}
-
 function getQueueSize() {
   return ipQueue.size;
 }
 
-// Backfill geo data for events that have IPs in the cache but NULL geo fields
-// Runs in batched chunks to avoid blocking the event loop
 function backfillFromCache() {
-  try {
-    const db = getDb();
-    const cached = db.prepare(
-      'SELECT ip, geo_country, geo_city, geo_lat, geo_lon, abuse_score, hostname FROM ip_enrichment_cache WHERE is_private = 0 AND (geo_country IS NOT NULL OR abuse_score IS NOT NULL)'
-    ).all();
+  initWorker();
+  // Give worker a moment to initialize, then send backfill command
+  setTimeout(() => {
+    sendToWorker({ type: 'backfill' });
+  }, 1000);
+}
 
-    if (cached.length === 0) return;
-
-    const CHUNK_SIZE = 5;
-    let offset = 0;
-
-    function processChunk() {
-      const chunk = cached.slice(offset, offset + CHUNK_SIZE);
-      if (chunk.length === 0) {
-        logger.info({ ips: cached.length }, 'Backfilled enrichment data from cache to events');
-        return;
-      }
-
-      for (const c of chunk) {
-        updateEventsWithEnrichment(c.ip, c);
-      }
-
-      offset += CHUNK_SIZE;
-      // Yield to event loop between chunks so syslog + API stay responsive
-      setTimeout(processChunk, 50);
-    }
-
-    logger.info({ ips: cached.length }, 'Starting enrichment backfill (chunked)');
-    setImmediate(processChunk);
-  } catch (err) {
-    logger.warn({ err }, 'Failed to backfill enrichment from cache');
+function shutdownWorker() {
+  if (worker) {
+    worker.postMessage({ type: 'shutdown' });
+    worker = null;
   }
 }
 
-module.exports = { enqueueEvent, enqueueIp, getQueueSize, backfillFromCache };
+module.exports = { enqueueEvent, enqueueIp, getQueueSize, backfillFromCache, shutdownWorker };
