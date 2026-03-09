@@ -18,10 +18,16 @@ const logger = require('../../utils/logger');
 class WardsonDbBackend extends StorageBackend {
   constructor(config = {}) {
     super('WardSONDB', config);
-    this.baseUrl = `http${config.useTls ? 's' : ''}://${config.host || 'localhost'}:${config.port || 7820}`;
+    this.baseUrl = `http${config.useTls ? 's' : ''}://${config.host || 'localhost'}:${config.port || 8080}`;
     this.apiKey = config.apiKey || '';
+    this.verifyCerts = config.verifyCerts !== false; // default true
     this.eventsCollection = 'events';
     this.cacheCollection = 'enrichment_cache';
+
+    // If TLS with self-signed certs, disable Node's cert verification
+    if (config.useTls && !this.verifyCerts) {
+      this.agent = new (require('https').Agent)({ rejectUnauthorized: false });
+    }
   }
 
   static get metadata() {
@@ -34,6 +40,7 @@ class WardsonDbBackend extends StorageBackend {
         { key: 'port', label: 'Port', type: 'number', placeholder: '8080', default: 8080 },
         { key: 'apiKey', label: 'API Key', type: 'password', placeholder: 'Optional', default: '' },
         { key: 'useTls', label: 'Use TLS', type: 'boolean', default: false },
+        { key: 'verifyCerts', label: 'Verify Certificates', type: 'boolean', default: true },
       ],
     };
   }
@@ -46,6 +53,7 @@ class WardsonDbBackend extends StorageBackend {
       method,
       headers: { 'Content-Type': 'application/json' },
     };
+    if (this.agent) opts.agent = this.agent;
     if (this.apiKey) opts.headers['Authorization'] = `Bearer ${this.apiKey}`;
     if (body) opts.body = JSON.stringify(body);
 

@@ -24,8 +24,22 @@ export default function Settings() {
     // Load database engine info
     fetchApi('/api/settings/database-engines').then((data) => {
       setDbEngines(data);
-      setSelectedEngine(data.activeEngine || 'sqlite');
-      setEngineConfig(data.engineConfig || {});
+      const engine = data.activeEngine || 'sqlite';
+      setSelectedEngine(engine);
+      // Merge saved config with defaults so all fields have values
+      const saved = data.engineConfig || {};
+      const activeBackend = data.backends.find(b => b.id === engine);
+      if (activeBackend?.configFields) {
+        const merged = { ...saved };
+        for (const field of activeBackend.configFields) {
+          if (merged[field.key] === undefined && field.default !== undefined) {
+            merged[field.key] = field.default;
+          }
+        }
+        setEngineConfig(merged);
+      } else {
+        setEngineConfig(saved);
+      }
     }).catch(() => {});
   }, []);
 
@@ -70,7 +84,22 @@ export default function Settings() {
               return (
                 <div
                   key={backend.id}
-                  onClick={() => !isComingSoon && setSelectedEngine(backend.id)}
+                  onClick={() => {
+                    if (isComingSoon) return;
+                    setSelectedEngine(backend.id);
+                    // Initialize config with defaults for this backend
+                    if (backend.configFields && backend.configFields.length > 0) {
+                      setEngineConfig(prev => {
+                        const updated = { ...prev };
+                        for (const field of backend.configFields) {
+                          if (updated[field.key] === undefined && field.default !== undefined) {
+                            updated[field.key] = field.default;
+                          }
+                        }
+                        return updated;
+                      });
+                    }
+                  }}
                   className={`relative p-4 rounded-lg border transition-all ${
                     isComingSoon
                       ? 'border-gray-800 bg-gray-900/50 opacity-60 cursor-not-allowed'
