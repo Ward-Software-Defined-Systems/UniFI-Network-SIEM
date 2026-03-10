@@ -37,6 +37,7 @@ router.get('/', async (req, res) => {
       eventsTotal,
       eventsToday,
       dbSizeMB,
+      totalDocuments: healthCheck.details?.totalDocuments || null,
       lastEventAt,
       eventTypeCounts,
       enrichment: {

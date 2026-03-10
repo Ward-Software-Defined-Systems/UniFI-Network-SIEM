@@ -550,55 +550,298 @@ class WardsonDbBackend extends StorageBackend {
     };
   }
 
-  // Phase 1 stubs — return empty results with a note
-  async getTimeline() {
-    logger.debug('WardSONDB: getTimeline() requires aggregation (Phase 2)');
-    return [];
+  // --- Aggregation-powered stats ---
+
+  async _aggregate(pipeline) {
+    return this._post(`/${this.eventsCollection}/aggregate`, { pipeline });
   }
 
-  async getTopTalkers() {
-    logger.debug('WardSONDB: getTopTalkers() requires aggregation (Phase 2)');
-    return [];
+  async getTimeline(since, bucketFormat, eventType) {
+    // WardSONDB doesn't have strftime bucketing — we'll fetch events and bucket client-side
+    // For now, use hourly buckets by truncating _created_at
+    const matchFilter = { received_at: { '$gte': since } };
+    if (eventType === 'firewall') matchFilter.event_type = 'firewall';
+
+    // Query recent events with timestamps and aggregate client-side
+    const result = await this._post(`/${this.eventsCollection}/query`, {
+      filter: matchFilter,
+      fields: ['event_type', 'received_at', 'network'],
+      sort: [{ 'received_at': 'asc' }],
+      limit: 10000,
+    });
+
+    const buckets = {};
+    for (const doc of (result.data || [])) {
+      const ts = doc.received_at || doc._created_at || '';
+      // Truncate to hour
+      const bucket = ts.substring(0, 13) + ':00:00Z';
+
+      if (!buckets[bucket]) {
+        buckets[bucket] = eventType === 'firewall'
+          ? { ts: bucket, allowed: 0, blocked: 0 }
+          : { ts: bucket, firewall: 0, threat: 0, dhcp: 0, dns_filter: 0, wifi: 0, admin: 0, system: 0, total: 0 };
+      }
+
+      const b = buckets[bucket];
+      if (eventType === 'firewall') {
+        if (doc.network?.action === 'allow') b.allowed++;
+        else if (doc.network?.action === 'block') b.blocked++;
+      } else {
+        const t = doc.event_type;
+        if (b[t] !== undefined) b[t]++;
+        b.total++;
+      }
+    }
+
+    return Object.values(buckets).sort((a, b) => a.ts.localeCompare(b.ts));
   }
 
-  async getTopBlocked() {
-    logger.debug('WardSONDB: getTopBlocked() requires aggregation (Phase 2)');
-    return [];
+  async getTopTalkers(since, direction, limit, excludePrivate) {
+    const ipField = direction === 'dst' ? 'network.dst_ip' : 'network.src_ip';
+    const pipeline = [
+      { '$match': { received_at: { '$gte': since }, [ipField]: { '$exists': true } } },
+      { '$group': {
+        '_id': ipField,
+        'count': { '$count': {} },
+        'lastSeen': { '$max': 'received_at' },
+      }},
+      { '$sort': { 'count': 'desc' } },
+      { '$limit': limit },
+    ];
+
+    const result = await this._aggregate(pipeline);
+    return (result.data || []).map(r => ({
+      ip: r._id,
+      count: r.count,
+      lastSeen: r.lastSeen,
+      country: null, // Enrichment not embedded in events yet
+      hostname: null,
+    }));
   }
 
-  async getTopPorts() {
-    logger.debug('WardSONDB: getTopPorts() requires aggregation (Phase 2)');
-    return [];
+  async getTopBlocked(since, direction, limit, excludePrivate) {
+    const ipField = direction === 'dst' ? 'network.dst_ip' : 'network.src_ip';
+    const pipeline = [
+      { '$match': { 'network.action': 'block', received_at: { '$gte': since }, [ipField]: { '$exists': true } } },
+      { '$group': {
+        '_id': ipField,
+        'count': { '$count': {} },
+        'lastSeen': { '$max': 'received_at' },
+      }},
+      { '$sort': { 'count': 'desc' } },
+      { '$limit': limit },
+    ];
+
+    const result = await this._aggregate(pipeline);
+    return (result.data || []).map(r => ({
+      ip: r._id,
+      count: r.count,
+      lastSeen: r.lastSeen,
+      country: null,
+      abuseScore: null,
+      hostname: null,
+    }));
   }
 
-  async getTopClients() {
-    logger.debug('WardSONDB: getTopClients() requires aggregation (Phase 2)');
-    return [];
+  async getTopPorts(since, limit) {
+    const pipeline = [
+      { '$match': { received_at: { '$gte': since }, 'network.dst_port': { '$exists': true } } },
+      { '$group': {
+        '_id': { 'port': 'network.dst_port', 'protocol': 'network.protocol' },
+        'count': { '$count': {} },
+      }},
+      { '$sort': { 'count': 'desc' } },
+      { '$limit': limit },
+    ];
+
+    const result = await this._aggregate(pipeline);
+    return (result.data || []).map(r => ({
+      port: r._id?.port,
+      protocol: r._id?.protocol,
+      count: r.count,
+    }));
   }
 
-  async getTopThreats() {
-    logger.debug('WardSONDB: getTopThreats() requires aggregation (Phase 2)');
-    return [];
+  async getTopClients(since, limit) {
+    // Client MAC is spread across wifi.client_mac, dhcp.mac, client.mac
+    // Without $or in aggregation _id, query wifi events as proxy
+    const pipeline = [
+      { '$match': { received_at: { '$gte': since }, 'wifi.client_mac': { '$exists': true } } },
+      { '$group': {
+        '_id': 'wifi.client_mac',
+        'eventCount': { '$count': {} },
+      }},
+      { '$sort': { 'eventCount': 'desc' } },
+      { '$limit': limit },
+    ];
+
+    const result = await this._aggregate(pipeline);
+    return (result.data || []).map(r => ({
+      mac: r._id,
+      alias: null,
+      ip: null,
+      eventCount: r.eventCount,
+      wifiEvents: r.eventCount,
+      dhcpEvents: 0,
+      firewallEvents: 0,
+    }));
   }
 
-  async getThreatIntel() {
-    logger.debug('WardSONDB: getThreatIntel() requires aggregation (Phase 2)');
-    return { summary: { totalEnriched: 0, withAbuseScore: 0, highThreat: 0, countries: 0 }, periodSummary: { enriched: 0, flagged: 0, highThreat: 0, countries: 0 }, ips: [] };
+  async getTopThreats(since, limit) {
+    const pipeline = [
+      { '$match': { event_type: 'threat', 'ids.signature': { '$exists': true }, received_at: { '$gte': since } } },
+      { '$group': {
+        '_id': 'ids.signature',
+        'count': { '$count': {} },
+        'lastSeen': { '$max': 'received_at' },
+      }},
+      { '$sort': { 'count': 'desc' } },
+      { '$limit': limit },
+    ];
+
+    const result = await this._aggregate(pipeline);
+    return (result.data || []).map(r => ({
+      signature: r._id,
+      classification: null,
+      count: r.count,
+      lastSeen: r.lastSeen,
+    }));
   }
 
-  async getGeoEvents() {
-    logger.debug('WardSONDB: getGeoEvents() requires aggregation (Phase 2)');
-    return [];
+  async getThreatIntel(since, limit) {
+    // Enrichment not embedded in events yet — use cache collection for summary
+    const cacheResult = await this._post(`/${this.cacheCollection}/query`, {
+      filter: { is_private: false },
+      limit: 10000,
+    });
+
+    const cacheData = cacheResult.data || [];
+    const totalEnriched = cacheData.filter(d => d.geo_country || d.abuse_score != null).length;
+    const withAbuseScore = cacheData.filter(d => d.abuse_score > 0).length;
+    const highThreat = cacheData.filter(d => d.abuse_score >= 50).length;
+    const countries = new Set(cacheData.filter(d => d.geo_country).map(d => d.geo_country)).size;
+
+    // Get top IPs by event count using aggregation
+    const pipeline = [
+      { '$match': { received_at: { '$gte': since }, 'network.src_ip': { '$exists': true } } },
+      { '$group': {
+        '_id': 'network.src_ip',
+        'event_count': { '$count': {} },
+        'lastSeen': { '$max': 'received_at' },
+      }},
+      { '$sort': { 'event_count': 'desc' } },
+      { '$limit': limit },
+    ];
+
+    const aggResult = await this._aggregate(pipeline);
+    const cacheMap = new Map(cacheData.map(d => [d.ip, d]));
+
+    const ips = (aggResult.data || []).map(r => {
+      const cached = cacheMap.get(r._id);
+      return {
+        ip: r._id,
+        country: cached?.geo_country || null,
+        city: cached?.geo_city || null,
+        lat: cached?.geo_lat ?? null,
+        lon: cached?.geo_lon ?? null,
+        abuse_score: cached?.abuse_score ?? null,
+        hostname: cached?.hostname || null,
+        event_count: r.event_count,
+        blocked_count: 0,
+        threat_count: 0,
+        lastSeen: r.lastSeen,
+      };
+    });
+
+    return {
+      summary: { totalEnriched, withAbuseScore, highThreat, countries },
+      periodSummary: { enriched: ips.length, flagged: ips.filter(i => i.abuse_score > 0).length, highThreat: ips.filter(i => i.abuse_score >= 50).length, countries: new Set(ips.filter(i => i.country).map(i => i.country)).size },
+      ips,
+    };
+  }
+
+  async getGeoEvents(since, limit) {
+    // Use cache data + aggregation to get geo events
+    const cacheResult = await this._post(`/${this.cacheCollection}/query`, {
+      filter: { is_private: false, geo_lat: { '$exists': true } },
+      limit: 10000,
+    });
+    const cacheMap = new Map((cacheResult.data || []).map(d => [d.ip, d]));
+
+    const pipeline = [
+      { '$match': { received_at: { '$gte': since }, 'network.src_ip': { '$exists': true } } },
+      { '$group': {
+        '_id': 'network.src_ip',
+        'count': { '$count': {} },
+        'lastSeen': { '$max': 'received_at' },
+      }},
+      { '$sort': { 'count': 'desc' } },
+      { '$limit': Math.ceil(limit / 2) },
+    ];
+
+    const result = await this._aggregate(pipeline);
+    return (result.data || [])
+      .filter(r => cacheMap.has(r._id) && cacheMap.get(r._id).geo_lat)
+      .map(r => {
+        const c = cacheMap.get(r._id);
+        return {
+          ip: r._id,
+          country: c.geo_country,
+          city: c.geo_city,
+          lat: c.geo_lat,
+          lon: c.geo_lon,
+          abuseScore: c.abuse_score,
+          count: r.count,
+          blocked: 0,
+          threats: 0,
+          lastSeen: r.lastSeen,
+          direction: 'src',
+        };
+      });
   }
 
   async getRecentGeoEvents(limit) {
-    // This one we can partially support — get recent events with enrichment
+    // Get recent events and join with cache for geo data
     const result = await this._post(`/${this.eventsCollection}/query`, {
-      filter: { 'enrichment.src.geo_lat': { '$exists': true } },
+      filter: { 'network.src_ip': { '$exists': true } },
       sort: [{ '_created_at': 'desc' }],
-      limit: Math.min(limit, 200),
+      limit: Math.min(limit * 3, 500), // Over-fetch since not all will have geo
     });
-    return (result.data || []).map(d => this._documentToEvent(d));
+
+    const cacheResult = await this._post(`/${this.cacheCollection}/query`, {
+      filter: { is_private: false, geo_lat: { '$exists': true } },
+      limit: 10000,
+    });
+    const cacheMap = new Map((cacheResult.data || []).map(d => [d.ip, d]));
+
+    const events = [];
+    for (const doc of (result.data || [])) {
+      const srcIp = doc.network?.src_ip;
+      const dstIp = doc.network?.dst_ip;
+      const srcGeo = srcIp ? cacheMap.get(srcIp) : null;
+      const dstGeo = dstIp ? cacheMap.get(dstIp) : null;
+      if (!srcGeo && !dstGeo) continue;
+
+      const event = this._documentToEvent(doc);
+      if (srcGeo) {
+        event.src_geo_lat = srcGeo.geo_lat;
+        event.src_geo_lon = srcGeo.geo_lon;
+        event.src_geo_country = srcGeo.geo_country;
+        event.src_geo_city = srcGeo.geo_city;
+        event.src_abuse_score = srcGeo.abuse_score;
+      }
+      if (dstGeo) {
+        event.dst_geo_lat = dstGeo.geo_lat;
+        event.dst_geo_lon = dstGeo.geo_lon;
+        event.dst_geo_country = dstGeo.geo_country;
+        event.dst_geo_city = dstGeo.geo_city;
+        event.dst_abuse_score = dstGeo.abuse_score;
+      }
+      events.push(event);
+      if (events.length >= limit) break;
+    }
+
+    return events;
   }
 
   // --- Enrichment Cache ---
