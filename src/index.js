@@ -85,11 +85,26 @@ async function main() {
     setTimeout(() => backfillFromCache(), 30000);
   } else {
     // For external backends, cache operations go through the backend
+    // Maintain an in-memory mirror so the sync enrichment queue can check cache
     const backend = storage.getBackend();
+    const memCache = new Map();
+    // Pre-warm: load existing cache entries from backend
+    backend.getAllCachedEnrichments?.().then(entries => {
+      for (const e of (entries || [])) {
+        if (e.ip) memCache.set(e.ip, e);
+      }
+      logger.info({ size: memCache.size }, 'Enrichment memory cache warmed from backend');
+    }).catch(() => {});
     setCacheAccessors(
-      (ip) => { /* async not supported in sync path — enrichment queue will handle */ return null; },
-      (ip, data) => { backend.setCachedEnrichment(ip, data).catch(() => {}); },
-      (ip) => { backend.markPrivate(ip).catch(() => {}); },
+      (ip) => memCache.get(ip) || null,
+      (ip, data) => {
+        memCache.set(ip, { ip, ...data });
+        backend.setCachedEnrichment(ip, data).catch(() => {});
+      },
+      (ip) => {
+        memCache.set(ip, { ip, is_private: true });
+        backend.markPrivate(ip).catch(() => {});
+      },
     );
   }
 

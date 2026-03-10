@@ -915,6 +915,23 @@ class WardsonDbBackend extends StorageBackend {
 
   // --- Enrichment Cache ---
 
+  async getAllCachedEnrichments() {
+    const result = await this._post(`/${this.cacheCollection}/query`, {
+      filter: {},
+      limit: 100000,
+    });
+    return (result.data || []).map(d => ({
+      ip: d.ip,
+      geo_country: d.geo_country || null,
+      geo_city: d.geo_city || null,
+      geo_lat: d.geo_lat ?? null,
+      geo_lon: d.geo_lon ?? null,
+      abuse_score: d.abuse_score ?? null,
+      hostname: d.hostname || null,
+      is_private: d.is_private || false,
+    }));
+  }
+
   async getCachedEnrichment(ip) {
     const result = await this._post(`/${this.cacheCollection}/query`, {
       filter: { ip },
