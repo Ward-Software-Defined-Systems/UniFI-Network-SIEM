@@ -561,15 +561,21 @@ class WardsonDbBackend extends StorageBackend {
     // per-type counts, then generate hourly buckets from the time range.
     // This gives accurate totals per bucket using multiple targeted queries.
 
-    // Determine time range
+    // Determine time range — align to hour boundaries
     const sinceDate = new Date(since);
     const nowDate = new Date();
-    const hours = Math.ceil((nowDate - sinceDate) / 3600000);
+    // Floor sinceDate to hour
+    const startHour = new Date(sinceDate);
+    startHour.setUTCMinutes(0, 0, 0);
+    // Ceil nowDate to include current partial hour
+    const endHour = new Date(nowDate);
+    endHour.setUTCMinutes(0, 0, 0);
+    const hours = Math.floor((endHour - startHour) / 3600000) + 1;
 
     // Generate empty buckets
     const buckets = {};
     for (let i = 0; i < hours; i++) {
-      const d = new Date(sinceDate.getTime() + i * 3600000);
+      const d = new Date(startHour.getTime() + i * 3600000);
       const ts = d.toISOString().substring(0, 13) + ':00:00Z';
       buckets[ts] = eventType === 'firewall'
         ? { ts, allowed: 0, blocked: 0 }
