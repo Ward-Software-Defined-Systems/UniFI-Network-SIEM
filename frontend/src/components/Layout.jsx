@@ -69,10 +69,18 @@ export default function Layout({ activeView, onViewChange, children }) {
                 <span>Today</span>
                 <span className="text-gray-300">{formatNumber(health.eventsToday)}</span>
               </div>
-              <div className="flex justify-between">
-                <span>DB size</span>
-                <span className="text-gray-300">{health.dbSizeMB} MB</span>
-              </div>
+              {health.dbSizeMB ? (
+                <div className="flex justify-between">
+                  <span>DB size</span>
+                  <span className="text-gray-300">{health.dbSizeMB} MB</span>
+                </div>
+              ) : null}
+              {health.totalDocuments != null ? (
+                <div className="flex justify-between">
+                  <span>Documents</span>
+                  <span className="text-gray-300">{formatNumber(health.totalDocuments)}</span>
+                </div>
+              ) : null}
             </div>
           </div>
         )}
