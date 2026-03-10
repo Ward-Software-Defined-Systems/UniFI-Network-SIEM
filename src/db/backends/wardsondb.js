@@ -632,8 +632,17 @@ class WardsonDbBackend extends StorageBackend {
     return this._cacheMap;
   }
 
+  _isPrivateIp(ip) {
+    if (!ip) return true;
+    return ip.startsWith('10.') || ip.startsWith('192.168.') || ip.startsWith('127.') ||
+      ip.startsWith('169.254.') || ip.startsWith('100.64.') ||
+      /^172\.(1[6-9]|2\d|3[01])\./.test(ip);
+  }
+
   async getTopTalkers(since, direction, limit, excludePrivate) {
     const ipField = direction === 'dst' ? 'network.dst_ip' : 'network.src_ip';
+    // Over-fetch if filtering private IPs, then trim client-side
+    const fetchLimit = excludePrivate ? limit * 5 : limit;
     const pipeline = [
       { '$match': { received_at: { '$gte': since }, [ipField]: { '$exists': true } } },
       { '$group': {
@@ -642,12 +651,12 @@ class WardsonDbBackend extends StorageBackend {
         'lastSeen': { '$max': 'received_at' },
       }},
       { '$sort': { 'count': 'desc' } },
-      { '$limit': limit },
+      { '$limit': fetchLimit },
     ];
 
     const result = await this._aggregate(pipeline);
     const cacheMap = await this._getCacheMap();
-    return (result.data || []).map(r => {
+    let rows = (result.data || []).map(r => {
       const cached = cacheMap.get(r._id);
       return {
         ip: r._id,
@@ -657,10 +666,13 @@ class WardsonDbBackend extends StorageBackend {
         hostname: cached?.hostname || null,
       };
     });
+    if (excludePrivate) rows = rows.filter(r => !this._isPrivateIp(r.ip));
+    return rows.slice(0, limit);
   }
 
   async getTopBlocked(since, direction, limit, excludePrivate) {
     const ipField = direction === 'dst' ? 'network.dst_ip' : 'network.src_ip';
+    const fetchLimit = excludePrivate ? limit * 5 : limit;
     const pipeline = [
       { '$match': { 'network.action': 'block', received_at: { '$gte': since }, [ipField]: { '$exists': true } } },
       { '$group': {
@@ -669,12 +681,12 @@ class WardsonDbBackend extends StorageBackend {
         'lastSeen': { '$max': 'received_at' },
       }},
       { '$sort': { 'count': 'desc' } },
-      { '$limit': limit },
+      { '$limit': fetchLimit },
     ];
 
     const result = await this._aggregate(pipeline);
     const cacheMap = await this._getCacheMap();
-    return (result.data || []).map(r => {
+    let rows = (result.data || []).map(r => {
       const cached = cacheMap.get(r._id);
       return {
         ip: r._id,
@@ -685,6 +697,8 @@ class WardsonDbBackend extends StorageBackend {
         hostname: cached?.hostname || null,
       };
     });
+    if (excludePrivate) rows = rows.filter(r => !this._isPrivateIp(r.ip));
+    return rows.slice(0, limit);
   }
 
   async getTopPorts(since, limit) {
