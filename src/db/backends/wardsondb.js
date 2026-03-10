@@ -556,50 +556,55 @@ class WardsonDbBackend extends StorageBackend {
     return this._post(`/${this.eventsCollection}/aggregate`, { pipeline });
   }
 
-  async getTimeline(since, bucketFormat, eventType) {
-    // WardSONDB doesn't have strftime bucketing — use aggregation to get
-    // per-type counts, then generate hourly buckets from the time range.
-    // This gives accurate totals per bucket using multiple targeted queries.
+  async getTimeline(since, bucketFormat, eventType, bucketSize) {
+    // Determine bucket interval in milliseconds
+    const bucketMs = {
+      '5m': 5 * 60000,
+      '15m': 15 * 60000,
+      '1h': 3600000,
+      '1d': 86400000,
+    }[bucketSize || '1h'] || 3600000;
 
-    // Determine time range — align to hour boundaries
+    // Determine time range — align to bucket boundaries
     const sinceDate = new Date(since);
     const nowDate = new Date();
-    // Floor sinceDate to hour
-    const startHour = new Date(sinceDate);
-    startHour.setUTCMinutes(0, 0, 0);
-    // Ceil nowDate to include current partial hour
-    const endHour = new Date(nowDate);
-    endHour.setUTCMinutes(0, 0, 0);
-    const hours = Math.floor((endHour - startHour) / 3600000) + 1;
+    // Floor sinceDate to bucket boundary
+    const startTime = new Date(Math.floor(sinceDate.getTime() / bucketMs) * bucketMs);
+    const endTime = new Date(Math.floor(nowDate.getTime() / bucketMs) * bucketMs);
+    const numBuckets = Math.floor((endTime - startTime) / bucketMs) + 1;
+
+    // Cap at reasonable number to avoid too many queries
+    const maxBuckets = 200;
+    const actualBuckets = Math.min(numBuckets, maxBuckets);
 
     // Generate empty buckets
     const buckets = {};
-    for (let i = 0; i < hours; i++) {
-      const d = new Date(startHour.getTime() + i * 3600000);
-      const ts = d.toISOString().substring(0, 13) + ':00:00Z';
+    for (let i = 0; i < actualBuckets; i++) {
+      const d = new Date(startTime.getTime() + i * bucketMs);
+      const ts = d.toISOString();
       buckets[ts] = eventType === 'firewall'
         ? { ts, allowed: 0, blocked: 0 }
         : { ts, firewall: 0, threat: 0, dhcp: 0, dns_filter: 0, wifi: 0, admin: 0, system: 0, total: 0 };
     }
 
-    // For each hour bucket, run a count query (parallelized in batches)
+    // For each bucket, run count queries (parallelized in batches)
     const bucketKeys = Object.keys(buckets);
-    const PARALLEL = 5;
+    const PARALLEL = 8;
 
     for (let i = 0; i < bucketKeys.length; i += PARALLEL) {
       const batch = bucketKeys.slice(i, i + PARALLEL);
       await Promise.all(batch.map(async (ts) => {
-        const hourStart = ts;
-        const hourEnd = new Date(new Date(ts).getTime() + 3600000).toISOString();
+        const bucketStart = ts;
+        const bucketEnd = new Date(new Date(ts).getTime() + bucketMs).toISOString();
 
         if (eventType === 'firewall') {
           const [allowed, blocked] = await Promise.all([
             this._post(`/${this.eventsCollection}/query`, {
-              filter: { '$and': [{ event_type: 'firewall' }, { 'network.action': 'allow' }, { received_at: { '$gte': hourStart } }, { received_at: { '$lt': hourEnd } }] },
+              filter: { '$and': [{ event_type: 'firewall' }, { 'network.action': 'allow' }, { received_at: { '$gte': bucketStart } }, { received_at: { '$lt': bucketEnd } }] },
               count_only: true,
             }),
             this._post(`/${this.eventsCollection}/query`, {
-              filter: { '$and': [{ event_type: 'firewall' }, { 'network.action': 'block' }, { received_at: { '$gte': hourStart } }, { received_at: { '$lt': hourEnd } }] },
+              filter: { '$and': [{ event_type: 'firewall' }, { 'network.action': 'block' }, { received_at: { '$gte': bucketStart } }, { received_at: { '$lt': bucketEnd } }] },
               count_only: true,
             }),
           ]);
@@ -609,7 +614,7 @@ class WardsonDbBackend extends StorageBackend {
           const types = ['firewall', 'threat', 'dhcp', 'dns_filter', 'wifi', 'admin', 'system'];
           const results = await Promise.all(types.map(t =>
             this._post(`/${this.eventsCollection}/query`, {
-              filter: { '$and': [{ event_type: t }, { received_at: { '$gte': hourStart } }, { received_at: { '$lt': hourEnd } }] },
+              filter: { '$and': [{ event_type: t }, { received_at: { '$gte': bucketStart } }, { received_at: { '$lt': bucketEnd } }] },
               count_only: true,
             })
           ));

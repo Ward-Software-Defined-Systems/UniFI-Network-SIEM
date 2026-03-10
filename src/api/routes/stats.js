@@ -47,7 +47,7 @@ router.get('/timeline', async (req, res) => {
     const bucket = req.query.bucket || '1h';
     const since = getSince(period);
     const backend = storage.getBackend();
-    const rows = await backend.getTimeline(since, bucketToFormat(bucket), req.query.event_type);
+    const rows = await backend.getTimeline(since, bucketToFormat(bucket), req.query.event_type, bucket);
     res.json(rows);
   } catch (err) {
     res.status(500).json({ error: 'Failed to get timeline' });
