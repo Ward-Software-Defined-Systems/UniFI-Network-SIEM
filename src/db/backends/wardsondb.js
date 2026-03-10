@@ -49,7 +49,7 @@ class WardsonDbBackend extends StorageBackend {
 
   // --- HTTP Client ---
 
-  async _request(method, path, body = null) {
+  async _request(method, path, body = null, retries = 3) {
     const url = `${this.baseUrl}${path}`;
     const opts = {
       method,
@@ -59,18 +59,34 @@ class WardsonDbBackend extends StorageBackend {
     if (this.apiKey) opts.headers['Authorization'] = `Bearer ${this.apiKey}`;
     if (body) opts.body = JSON.stringify(body);
 
-    const resp = await fetch(url, opts);
-    const json = await resp.json();
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      try {
+        const resp = await fetch(url, opts);
+        const json = await resp.json();
 
-    if (!json.ok) {
-      const code = json.error?.code || 'UNKNOWN';
-      const msg = json.error?.message || 'Unknown error';
-      // Don't throw on 404 for get operations — caller handles null
-      if (resp.status === 404) return { _notFound: true, code, message: msg };
-      throw new Error(`WardSONDB ${code}: ${msg}`);
+        if (!json.ok) {
+          const code = json.error?.code || 'UNKNOWN';
+          const msg = json.error?.message || 'Unknown error';
+          if (resp.status === 404) return { _notFound: true, code, message: msg };
+          // Retry on 5xx
+          if (resp.status >= 500 && attempt < retries) {
+            await new Promise(r => setTimeout(r, 500 * (attempt + 1)));
+            continue;
+          }
+          throw new Error(`WardSONDB ${code}: ${msg}`);
+        }
+
+        return json;
+      } catch (err) {
+        // Retry on network errors (ETIMEDOUT, ECONNREFUSED, fetch failed)
+        if (attempt < retries && (err.cause || err.message?.includes('fetch failed'))) {
+          logger.debug({ err: err.message, attempt, path }, 'WardSONDB request failed, retrying');
+          await new Promise(r => setTimeout(r, 500 * (attempt + 1)));
+          continue;
+        }
+        throw err;
+      }
     }
-
-    return json;
   }
 
   async _get(path) { return this._request('GET', path); }
