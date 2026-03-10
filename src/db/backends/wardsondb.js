@@ -557,43 +557,79 @@ class WardsonDbBackend extends StorageBackend {
   }
 
   async getTimeline(since, bucketFormat, eventType) {
-    // WardSONDB doesn't have strftime bucketing — we'll fetch events and bucket client-side
-    // For now, use hourly buckets by truncating _created_at
-    const matchFilter = { received_at: { '$gte': since } };
-    if (eventType === 'firewall') matchFilter.event_type = 'firewall';
+    // WardSONDB doesn't have strftime bucketing — use aggregation to get
+    // per-type counts, then generate hourly buckets from the time range.
+    // This gives accurate totals per bucket using multiple targeted queries.
 
-    // Query recent events with timestamps and aggregate client-side
-    const result = await this._post(`/${this.eventsCollection}/query`, {
-      filter: matchFilter,
-      fields: ['event_type', 'received_at', 'network'],
-      sort: [{ 'received_at': 'asc' }],
-      limit: 10000,
-    });
+    // Determine time range
+    const sinceDate = new Date(since);
+    const nowDate = new Date();
+    const hours = Math.ceil((nowDate - sinceDate) / 3600000);
 
+    // Generate empty buckets
     const buckets = {};
-    for (const doc of (result.data || [])) {
-      const ts = doc.received_at || doc._created_at || '';
-      // Truncate to hour
-      const bucket = ts.substring(0, 13) + ':00:00Z';
-
-      if (!buckets[bucket]) {
-        buckets[bucket] = eventType === 'firewall'
-          ? { ts: bucket, allowed: 0, blocked: 0 }
-          : { ts: bucket, firewall: 0, threat: 0, dhcp: 0, dns_filter: 0, wifi: 0, admin: 0, system: 0, total: 0 };
-      }
-
-      const b = buckets[bucket];
-      if (eventType === 'firewall') {
-        if (doc.network?.action === 'allow') b.allowed++;
-        else if (doc.network?.action === 'block') b.blocked++;
-      } else {
-        const t = doc.event_type;
-        if (b[t] !== undefined) b[t]++;
-        b.total++;
-      }
+    for (let i = 0; i < hours; i++) {
+      const d = new Date(sinceDate.getTime() + i * 3600000);
+      const ts = d.toISOString().substring(0, 13) + ':00:00Z';
+      buckets[ts] = eventType === 'firewall'
+        ? { ts, allowed: 0, blocked: 0 }
+        : { ts, firewall: 0, threat: 0, dhcp: 0, dns_filter: 0, wifi: 0, admin: 0, system: 0, total: 0 };
     }
 
-    return Object.values(buckets).sort((a, b) => a.ts.localeCompare(b.ts));
+    // For each hour bucket, run a count query (parallelized in batches)
+    const bucketKeys = Object.keys(buckets);
+    const PARALLEL = 5;
+
+    for (let i = 0; i < bucketKeys.length; i += PARALLEL) {
+      const batch = bucketKeys.slice(i, i + PARALLEL);
+      await Promise.all(batch.map(async (ts) => {
+        const hourStart = ts;
+        const hourEnd = new Date(new Date(ts).getTime() + 3600000).toISOString();
+
+        if (eventType === 'firewall') {
+          const [allowed, blocked] = await Promise.all([
+            this._post(`/${this.eventsCollection}/query`, {
+              filter: { '$and': [{ event_type: 'firewall' }, { 'network.action': 'allow' }, { received_at: { '$gte': hourStart } }, { received_at: { '$lt': hourEnd } }] },
+              count_only: true,
+            }),
+            this._post(`/${this.eventsCollection}/query`, {
+              filter: { '$and': [{ event_type: 'firewall' }, { 'network.action': 'block' }, { received_at: { '$gte': hourStart } }, { received_at: { '$lt': hourEnd } }] },
+              count_only: true,
+            }),
+          ]);
+          buckets[ts].allowed = allowed.meta?.total_count || allowed.data?.count || 0;
+          buckets[ts].blocked = blocked.meta?.total_count || blocked.data?.count || 0;
+        } else {
+          const types = ['firewall', 'threat', 'dhcp', 'dns_filter', 'wifi', 'admin', 'system'];
+          const results = await Promise.all(types.map(t =>
+            this._post(`/${this.eventsCollection}/query`, {
+              filter: { '$and': [{ event_type: t }, { received_at: { '$gte': hourStart } }, { received_at: { '$lt': hourEnd } }] },
+              count_only: true,
+            })
+          ));
+          let total = 0;
+          results.forEach((r, idx) => {
+            const count = r.meta?.total_count || r.data?.count || 0;
+            buckets[ts][types[idx]] = count;
+            total += count;
+          });
+          buckets[ts].total = total;
+        }
+      }));
+    }
+
+    return Object.values(buckets);
+  }
+
+  async _getCacheMap() {
+    if (this._cacheMapTs && Date.now() - this._cacheMapTs < 30000) return this._cacheMap;
+    const result = await this._post(`/${this.cacheCollection}/query`, {
+      filter: { is_private: false },
+      limit: 10000,
+    });
+    this._cacheMap = new Map((result.data || []).map(d => [d.ip, d]));
+    this._cacheMapTs = Date.now();
+    return this._cacheMap;
   }
 
   async getTopTalkers(since, direction, limit, excludePrivate) {
@@ -610,13 +646,17 @@ class WardsonDbBackend extends StorageBackend {
     ];
 
     const result = await this._aggregate(pipeline);
-    return (result.data || []).map(r => ({
-      ip: r._id,
-      count: r.count,
-      lastSeen: r.lastSeen,
-      country: null, // Enrichment not embedded in events yet
-      hostname: null,
-    }));
+    const cacheMap = await this._getCacheMap();
+    return (result.data || []).map(r => {
+      const cached = cacheMap.get(r._id);
+      return {
+        ip: r._id,
+        count: r.count,
+        lastSeen: r.lastSeen,
+        country: cached?.geo_country || null,
+        hostname: cached?.hostname || null,
+      };
+    });
   }
 
   async getTopBlocked(since, direction, limit, excludePrivate) {
@@ -633,14 +673,18 @@ class WardsonDbBackend extends StorageBackend {
     ];
 
     const result = await this._aggregate(pipeline);
-    return (result.data || []).map(r => ({
-      ip: r._id,
-      count: r.count,
-      lastSeen: r.lastSeen,
-      country: null,
-      abuseScore: null,
-      hostname: null,
-    }));
+    const cacheMap = await this._getCacheMap();
+    return (result.data || []).map(r => {
+      const cached = cacheMap.get(r._id);
+      return {
+        ip: r._id,
+        count: r.count,
+        lastSeen: r.lastSeen,
+        country: cached?.geo_country || null,
+        abuseScore: cached?.abuse_score ?? null,
+        hostname: cached?.hostname || null,
+      };
+    });
   }
 
   async getTopPorts(since, limit) {
