@@ -293,7 +293,9 @@ export default function Settings() {
             <span className="text-gray-500">Events today</span>
             <span className="text-gray-300">{health.eventsToday?.toLocaleString()}</span>
             <span className="text-gray-500">Database size</span>
-            <span className="text-gray-300">{health.dbSizeMB} MB</span>
+            <span className="text-gray-300">{health.dbSizeMB ? `${health.dbSizeMB} MB` : '—'}</span>
+            <span className="text-gray-500">Total documents</span>
+            <span className="text-gray-300">{health.totalDocuments?.toLocaleString() || '—'}</span>
           </div>
         </div>
       )}
