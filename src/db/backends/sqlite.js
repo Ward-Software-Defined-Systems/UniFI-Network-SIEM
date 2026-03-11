@@ -330,7 +330,7 @@ class SqliteBackend extends StorageBackend {
     return { total, byType, firewall };
   }
 
-  async getTimeline(since, bucketFormat, eventType) {
+  async getTimeline(since, bucketFormat, eventType, bucketSize) {
     let sql;
     if (eventType === 'firewall') {
       sql = `SELECT strftime('${bucketFormat}', received_at) as ts,

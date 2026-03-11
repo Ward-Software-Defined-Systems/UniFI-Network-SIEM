@@ -29,7 +29,6 @@ function getAvailableBackends() {
       isDefault: true,
     },
     {
-      id: 'wardsondb',
       ...WardsonDbBackend.metadata,
       id: 'wardsondb',
     },

@@ -52,7 +52,7 @@ export default function Dashboard({ period, setPeriod }) {
     };
 
     fetchAll();
-    const interval = setInterval(fetchAll, 10000);
+    const interval = setInterval(fetchAll, 30000);
     return () => { cancelled = true; clearInterval(interval); };
   }, [period, excludePrivate]);
 

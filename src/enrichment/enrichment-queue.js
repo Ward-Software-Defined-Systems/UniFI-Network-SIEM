@@ -4,7 +4,6 @@ const { isPrivateIp } = require('../utils/ip-utils');
 const { lookupGeoIp, isGeoIpAvailable } = require('./geoip');
 const { checkIp, isAbuseIpDbAvailable } = require('./abuseipdb');
 const { reverseLookup } = require('./rdns');
-const { getCachedEnrichment, setCachedEnrichment, markPrivate } = require('../db/cache');
 const config = require('../config');
 const logger = require('../utils/logger');
 
@@ -12,8 +11,19 @@ const ipQueue = new Set();
 let processing = false;
 let activeCount = 0;
 
-// Worker thread for UPDATE operations
+// Worker thread for SQLite UPDATE operations (only used with SQLite backend)
 let worker = null;
+
+// Cache access — resolved at runtime based on active backend
+let _getCache = null;
+let _setCache = null;
+let _markPrivate = null;
+
+function setCacheAccessors(getCached, setCached, markPriv) {
+  _getCache = getCached;
+  _setCache = setCached;
+  _markPrivate = markPriv;
+}
 
 function initWorker() {
   if (worker) return;
@@ -56,35 +66,34 @@ function initWorker() {
 }
 
 function sendToWorker(msg) {
-  if (!worker) {
-    initWorker();
-  }
+  if (!worker) initWorker();
   worker.postMessage(msg);
 }
 
 function enqueueIp(ip) {
   if (!ip || ipQueue.has(ip)) return;
   if (isPrivateIp(ip)) return;
+  if (!_getCache) return; // Not initialized yet
 
-  // Check cache first — if fresh, apply cached data via worker
-  const cached = getCachedEnrichment(ip);
+  const cached = _getCache(ip);
   if (cached) {
     if (cached.geo_country || cached.abuse_score != null) {
-      // Delegate UPDATE to worker thread (non-blocking)
-      sendToWorker({
-        type: 'update',
-        ip,
-        data: {
-          geo_country: cached.geo_country,
-          geo_city: cached.geo_city,
-          geo_lat: cached.geo_lat,
-          geo_lon: cached.geo_lon,
-          abuse_score: cached.abuse_score,
-          hostname: cached.hostname,
-        },
-      });
+      // Delegate UPDATE to worker thread (SQLite) or skip (WardSONDB handles differently)
+      if (worker) {
+        sendToWorker({
+          type: 'update',
+          ip,
+          data: {
+            geo_country: cached.geo_country,
+            geo_city: cached.geo_city,
+            geo_lat: cached.geo_lat,
+            geo_lon: cached.geo_lon,
+            abuse_score: cached.abuse_score,
+            hostname: cached.hostname,
+          },
+        });
+      }
     }
-    // Re-queue if missing abuse score and AbuseIPDB is available
     if (cached.abuse_score == null && isAbuseIpDbAvailable()) {
       ipQueue.add(ip);
       processQueue();
@@ -125,11 +134,11 @@ async function processQueue() {
 async function enrichIp(ip) {
   try {
     if (isPrivateIp(ip)) {
-      markPrivate(ip);
+      if (_markPrivate) _markPrivate(ip);
       return;
     }
 
-    const existing = getCachedEnrichment(ip);
+    const existing = _getCache ? _getCache(ip) : null;
     const enrichment = {
       geo_country: existing?.geo_country || null,
       geo_city: existing?.geo_city || null,
@@ -139,7 +148,6 @@ async function enrichIp(ip) {
       hostname: existing?.hostname || null,
     };
 
-    // GeoIP lookup (sync, fast)
     if (!enrichment.geo_country && isGeoIpAvailable()) {
       const geo = lookupGeoIp(ip);
       if (geo) {
@@ -150,7 +158,6 @@ async function enrichIp(ip) {
       }
     }
 
-    // AbuseIPDB lookup (async, rate-limited)
     if (isAbuseIpDbAvailable()) {
       const abuse = await checkIp(ip);
       if (abuse) {
@@ -161,16 +168,17 @@ async function enrichIp(ip) {
       }
     }
 
-    // rDNS lookup (async, optional)
     if (config.enrichment.rdnsEnabled) {
       enrichment.hostname = await reverseLookup(ip);
     }
 
-    // Cache the result (main thread — fast, single row upsert)
-    setCachedEnrichment(ip, enrichment);
+    // Cache the result
+    if (_setCache) _setCache(ip, enrichment);
 
-    // Delegate heavy UPDATE to worker thread
-    sendToWorker({ type: 'update', ip, data: enrichment });
+    // Update existing events via worker (SQLite only)
+    if (worker) {
+      sendToWorker({ type: 'update', ip, data: enrichment });
+    }
 
     logger.debug({ ip, country: enrichment.geo_country, abuse: enrichment.abuse_score }, 'Enriched IP');
   } catch (err) {
@@ -184,7 +192,6 @@ function getQueueSize() {
 
 function backfillFromCache() {
   initWorker();
-  // Give worker a moment to initialize, then send backfill command
   setTimeout(() => {
     sendToWorker({ type: 'backfill' });
   }, 1000);
@@ -197,4 +204,4 @@ function shutdownWorker() {
   }
 }
 
-module.exports = { enqueueEvent, enqueueIp, getQueueSize, backfillFromCache, shutdownWorker };
+module.exports = { enqueueEvent, enqueueIp, getQueueSize, backfillFromCache, shutdownWorker, setCacheAccessors };

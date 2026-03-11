@@ -24,8 +24,22 @@ export default function Settings() {
     // Load database engine info
     fetchApi('/api/settings/database-engines').then((data) => {
       setDbEngines(data);
-      setSelectedEngine(data.activeEngine || 'sqlite');
-      setEngineConfig(data.engineConfig || {});
+      const engine = data.activeEngine || 'sqlite';
+      setSelectedEngine(engine);
+      // Merge saved config with defaults so all fields have values
+      const saved = data.engineConfig || {};
+      const activeBackend = data.backends.find(b => b.id === engine);
+      if (activeBackend?.configFields) {
+        const merged = { ...saved };
+        for (const field of activeBackend.configFields) {
+          if (merged[field.key] === undefined && field.default !== undefined) {
+            merged[field.key] = field.default;
+          }
+        }
+        setEngineConfig(merged);
+      } else {
+        setEngineConfig(saved);
+      }
     }).catch(() => {});
   }, []);
 
@@ -62,15 +76,36 @@ export default function Settings() {
             Select the storage backend for event data. SQLite is the default zero-dependency option.
             External engines offer higher scalability for large deployments.
           </p>
+          <div className="flex items-start gap-2 p-2 rounded bg-yellow-900/20 border border-yellow-800/30">
+            <span className="text-yellow-500 text-xs mt-0.5">⚠️</span>
+            <p className="text-xs text-yellow-600">
+              Settings and configuration are always stored in the local SQLite database, regardless of the active backend. Do not delete the SQLite database file (<code className="text-yellow-500">data/events.db</code>) even when using an external backend.
+            </p>
+          </div>
 
           <div className="space-y-3">
             {dbEngines.backends.map((backend) => {
               const isActive = selectedEngine === backend.id;
-              const isComingSoon = backend.status === 'beta_coming_soon';
+              const isComingSoon = backend.status === 'beta_coming_soon' || backend.status === 'coming_soon';
               return (
                 <div
                   key={backend.id}
-                  onClick={() => !isComingSoon && setSelectedEngine(backend.id)}
+                  onClick={() => {
+                    if (isComingSoon) return;
+                    setSelectedEngine(backend.id);
+                    // Initialize config with defaults for this backend
+                    if (backend.configFields && backend.configFields.length > 0) {
+                      setEngineConfig(prev => {
+                        const updated = { ...prev };
+                        for (const field of backend.configFields) {
+                          if (updated[field.key] === undefined && field.default !== undefined) {
+                            updated[field.key] = field.default;
+                          }
+                        }
+                        return updated;
+                      });
+                    }
+                  }}
                   className={`relative p-4 rounded-lg border transition-all ${
                     isComingSoon
                       ? 'border-gray-800 bg-gray-900/50 opacity-60 cursor-not-allowed'
@@ -152,8 +187,8 @@ export default function Settings() {
                   });
                   const data = await resp.json();
                   setEngineSaved(true);
-                  setEngineSaveMsg(data.message || 'Saved!');
-                  setTimeout(() => setEngineSaved(false), 5000);
+                  setEngineSaveMsg((data.message || 'Saved!') + ' ⚠️ Restart the SIEM for changes to take effect.');
+                  // Don't auto-hide — restart warning should persist
                 } catch {
                   setEngineSaveMsg('Failed to save.');
                   setEngineSaved(true);
@@ -164,7 +199,7 @@ export default function Settings() {
             >
               Save Database Engine
             </button>
-            {engineSaved && <p className="text-xs text-green-400">{engineSaveMsg}</p>}
+            {engineSaved && <p className="text-xs text-yellow-400">{engineSaveMsg}</p>}
           </div>
         </div>
       )}
@@ -264,7 +299,9 @@ export default function Settings() {
             <span className="text-gray-500">Events today</span>
             <span className="text-gray-300">{health.eventsToday?.toLocaleString()}</span>
             <span className="text-gray-500">Database size</span>
-            <span className="text-gray-300">{health.dbSizeMB} MB</span>
+            <span className="text-gray-300">{health.dbSizeMB ? `${health.dbSizeMB} MB` : '—'}</span>
+            <span className="text-gray-500">Total documents</span>
+            <span className="text-gray-300">{health.totalDocuments?.toLocaleString() || '—'}</span>
           </div>
         </div>
       )}
@@ -306,7 +343,7 @@ export default function Settings() {
             </button>
           </div>
         )}
-        {resetDone && <p className="text-xs text-green-400">Database cleared successfully.</p>}
+        {resetDone && <p className="text-xs text-green-400">Database cleared successfully. Indexes rebuilding — dashboard will resume in ~60 seconds.</p>}
       </div>
     </div>
   );

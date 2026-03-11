@@ -1,20 +1,22 @@
 const express = require('express');
-const { queryEvents, getEventById } = require('../../db/events');
+const storage = require('../../db/storage');
 
 const router = express.Router();
 
-router.get('/', (req, res) => {
+router.get('/', async (req, res) => {
   try {
-    const events = queryEvents(req.query);
-    res.json(events);
+    const backend = storage.getBackend();
+    const result = await backend.queryEvents(req.query);
+    res.json(result.events);
   } catch (err) {
     res.status(500).json({ error: 'Failed to query events' });
   }
 });
 
-router.get('/:id', (req, res) => {
+router.get('/:id', async (req, res) => {
   try {
-    const event = getEventById(parseInt(req.params.id, 10));
+    const backend = storage.getBackend();
+    const event = await backend.getEventById(req.params.id);
     if (!event) return res.status(404).json({ error: 'Event not found' });
     res.json(event);
   } catch (err) {

@@ -18,7 +18,7 @@ A self-contained, **AI-powered** Node.js application that collects syslog from U
 - **Threat Intel** — sortable/filterable table of enriched IPs with abuse scores, event counts, and locations; period-filtered summary cards alongside all-time totals
 - **Threat Hunt (Beta)** — AI-powered threat actor investigation. Enter any IP to get a full profile: local SIEM activity (events, ports, timeline, IDS signatures, related /24 IPs), external intel (rDNS, WHOIS/ASN), and a structured AI threat assessment with PDF export. Supports Anthropic (Opus 4.6), OpenAI (GPT-5.4), and Google (Gemini 3.1 Pro) with on-page API key management. *Currently tested with Anthropic only — OpenAI and Google integrations are implemented but untested.*
 - **HTTPS by default** — auto-generated self-signed TLS certificate
-- **Pluggable storage backends** — SQLite (built-in default), WardSONDB (Beta — Coming Soon), OpenSearch (Beta — Coming Soon)
+- **Pluggable storage backends** — SQLite (built-in default), WardSONDB (Beta), OpenSearch (Beta — Coming Soon)
 - **SQLite storage** — WAL mode, batched inserts, automatic retention cleanup, worker thread enrichment
 - **Zero external services** — everything runs in one process
 
@@ -184,6 +184,8 @@ For full functionality, three logging sources on the UniFi Console should be con
 | `INSERT_BATCH_SIZE` | 50 | Batch insert threshold |
 | `INSERT_BATCH_INTERVAL_MS` | 500 | Batch insert flush interval |
 
+> **⚠️ Important:** Settings and configuration are always stored in the local SQLite database (`data/events.db`), regardless of which storage backend is active. Do not delete this file even when using WardSONDB or OpenSearch — it contains your backend configuration, API keys, and other settings needed to boot the application. Changing the storage backend requires a SIEM restart to take effect.
+
 ## Project Structure
 
 ```
@@ -212,7 +214,7 @@ src/
       interface.js             # StorageBackend base class
       index.js                 # Backend registry & factory
       sqlite.js                # SQLite backend (default)
-      wardsondb.js             # WardSONDB backend (Beta — Coming Soon)
+      wardsondb.js             # WardSONDB backend (Beta)
       opensearch.js            # OpenSearch backend (Beta — Coming Soon)
   api/
     server.js                  # Express + static serving
@@ -297,7 +299,7 @@ The app runs HTTPS by default with an auto-generated self-signed certificate. Be
 - [ ] Dark/light mode toggle
 - [x] Performance optimization — enrichment backfill moved to worker thread for non-blocking operation
 - [x] Storage backend abstraction — pluggable database engine (SQLite, WardSONDB, OpenSearch) selectable from Settings
-- [ ] WardSONDB integration — high-performance Rust-based JSON document database for large-scale deployments
+- [x] WardSONDB integration — high-performance Rust-based JSON document database with deferred index creation and write pressure detection
 - [ ] OpenSearch integration — enterprise search and analytics engine with built-in SIEM capabilities
 - [ ] Query performance optimization — tuning for large datasets (millions of rows)
 - [ ] launchd plist for macOS auto-start
