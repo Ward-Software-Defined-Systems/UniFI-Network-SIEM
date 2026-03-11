@@ -106,7 +106,84 @@ class WardsonDbBackend extends StorageBackend {
     await this._ensureCollection(this.eventsCollection);
     await this._ensureCollection(this.cacheCollection);
 
+    // Check if indexes already exist (from a previous run)
+    const existingIndexes = await this._get(`/${this.eventsCollection}/indexes`);
+    const indexCount = (existingIndexes.data || []).length;
+
+    if (indexCount >= 9) {
+      logger.info({ indexCount }, 'WardSONDB indexes already exist, skipping deferred creation');
+    } else {
+      // Start background index creation — pauses ingestion, creates indexes, then resumes
+      this._startDeferredIndexCreation();
+    }
+
+    this._ingestPaused = false; // Flag to pause ingestion during index creation
     logger.info({ backend: 'wardsondb' }, 'Storage backend initialized');
+  }
+
+  _getRequiredIndexes() {
+    return [
+      { name: 'idx_event_type', field: 'event_type' },
+      { name: 'idx_received_at', field: 'received_at' },
+      { name: 'idx_network_action', field: 'network.action' },
+      { name: 'idx_src_ip', field: 'network.src_ip' },
+      { name: 'idx_dst_ip', field: 'network.dst_ip' },
+      { name: 'idx_dst_port', field: 'network.dst_port' },
+      { name: 'idx_type_time', fields: ['event_type', 'received_at'] },
+      { name: 'idx_action_time', fields: ['network.action', 'received_at'] },
+      { name: 'idx_type_action', fields: ['event_type', 'network.action'] },
+    ];
+  }
+
+  _startDeferredIndexCreation() {
+    const INITIAL_DELAY = 15000; // Wait 15s after startup for initial ingest burst to settle
+    const INDEX_DELAY = 5000; // 5 seconds between each index creation
+
+    logger.info('WardSONDB deferred index creation — will pause ingestion and create indexes in 15 seconds');
+
+    this._deferredIndexTimeout = setTimeout(async () => {
+      try {
+        // Pause ingestion
+        this._ingestPaused = true;
+        logger.info('WardSONDB ingestion paused for index creation');
+
+        // Brief wait for in-flight inserts to complete
+        await new Promise(r => setTimeout(r, 2000));
+
+        await this._createIndexesSequentially(INDEX_DELAY);
+      } catch (err) {
+        logger.error({ err: err.message }, 'WardSONDB deferred index creation failed');
+      } finally {
+        // Always resume ingestion
+        this._ingestPaused = false;
+        logger.info('WardSONDB ingestion resumed');
+      }
+    }, INITIAL_DELAY);
+  }
+
+  async _createIndexesSequentially(delayMs) {
+    const indexes = this._getRequiredIndexes();
+
+    for (const idx of indexes) {
+      try {
+        const body = { name: idx.name };
+        if (idx.fields) body.fields = idx.fields;
+        else body.field = idx.field;
+        await this._post(`/${this.eventsCollection}/indexes`, body);
+        logger.info({ index: idx.name }, 'Created WardSONDB index');
+
+        // Pause between indexes to let compaction catch up
+        await new Promise(r => setTimeout(r, delayMs));
+      } catch (err) {
+        if (err.message.includes('INDEX_EXISTS')) {
+          logger.debug({ index: idx.name }, 'WardSONDB index already exists');
+          continue;
+        }
+        logger.warn({ index: idx.name, err: err.message }, 'Failed to create WardSONDB index');
+      }
+    }
+
+    logger.info('WardSONDB deferred index creation complete — all indexes ready');
   }
 
   async _ensureCollection(name) {
@@ -120,21 +197,37 @@ class WardsonDbBackend extends StorageBackend {
   }
 
   async close() {
-    // HTTP client — nothing to close
+    if (this._deferredIndexTimeout) {
+      clearTimeout(this._deferredIndexTimeout);
+      this._deferredIndexTimeout = null;
+    }
   }
 
   async healthCheck() {
     try {
       const health = await this._get('/_health');
       const stats = await this._get('/_stats');
+      // Fetch storage info for the events collection (oldest/newest doc, index count)
+      let storageInfo = null;
+      try {
+        const storage = await this._get(`/${this.eventsCollection}/storage`);
+        storageInfo = storage.data;
+      } catch {}
       return {
         ok: health.data.status === 'healthy',
+        writePressure: health.data.write_pressure || 'normal',
         details: {
           backend: 'wardsondb',
           url: this.baseUrl,
           collections: stats.data.collection_count,
           totalDocuments: stats.data.total_documents,
           uptime: stats.data.uptime_seconds,
+          eventsStorage: storageInfo ? {
+            docCount: storageInfo.doc_count,
+            indexCount: storageInfo.index_count,
+            oldestDoc: storageInfo.oldest_doc,
+            newestDoc: storageInfo.newest_doc,
+          } : null,
         },
       };
     } catch (err) {
@@ -360,6 +453,12 @@ class WardsonDbBackend extends StorageBackend {
   // --- Write Operations ---
 
   async insertEvents(events) {
+    // Drop events while ingestion is paused (during index creation)
+    if (this._ingestPaused) {
+      logger.debug({ dropped: events.length }, 'WardSONDB ingestion paused — dropping batch');
+      return events.length; // Report as inserted to avoid retry storms
+    }
+
     const documents = events.map(e => this._eventToDocument(e));
 
     // Batch in chunks of 500 (WardSONDB optimal batch size)
@@ -838,9 +937,22 @@ class WardsonDbBackend extends StorageBackend {
       };
     });
 
+    // Compute period summary from distinct IPs seen in the time range (not capped by limit)
+    const periodDistinct = await this._post(`/${this.eventsCollection}/distinct`, {
+      field: 'network.src_ip',
+      filter: { received_at: { '$gte': since }, 'network.src_ip': { '$exists': true } },
+      limit: 10000,
+    });
+    const periodIps = new Set((periodDistinct.data?.values || []));
+    const periodCached = cacheData.filter(d => periodIps.has(d.ip));
+    const periodEnriched = periodCached.filter(d => d.geo_country || d.abuse_score != null).length;
+    const periodFlagged = periodCached.filter(d => d.abuse_score > 0).length;
+    const periodHighThreat = periodCached.filter(d => d.abuse_score >= 50).length;
+    const periodCountries = new Set(periodCached.filter(d => d.geo_country).map(d => d.geo_country)).size;
+
     return {
       summary: { totalEnriched, withAbuseScore, highThreat, countries },
-      periodSummary: { enriched: ips.length, flagged: ips.filter(i => i.abuse_score > 0).length, highThreat: ips.filter(i => i.abuse_score >= 50).length, countries: new Set(ips.filter(i => i.country).map(i => i.country)).size },
+      periodSummary: { enriched: periodEnriched, flagged: periodFlagged, highThreat: periodHighThreat, countries: periodCountries },
       ips,
     };
   }
@@ -861,12 +973,13 @@ class WardsonDbBackend extends StorageBackend {
         'lastSeen': { '$max': 'received_at' },
       }},
       { '$sort': { 'count': 'desc' } },
-      { '$limit': Math.ceil(limit / 2) },
+      { '$limit': limit * 3 },  // Over-fetch to survive geo-data filter (not all IPs have geo)
     ];
 
     const result = await this._aggregate(pipeline);
     return (result.data || [])
       .filter(r => cacheMap.has(r._id) && cacheMap.get(r._id).geo_lat)
+      .slice(0, limit)  // Trim to requested limit after filtering
       .map(r => {
         const c = cacheMap.get(r._id);
         return {

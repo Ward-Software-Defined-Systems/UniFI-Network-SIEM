@@ -76,6 +76,12 @@ export default function Settings() {
             Select the storage backend for event data. SQLite is the default zero-dependency option.
             External engines offer higher scalability for large deployments.
           </p>
+          <div className="flex items-start gap-2 p-2 rounded bg-yellow-900/20 border border-yellow-800/30">
+            <span className="text-yellow-500 text-xs mt-0.5">⚠️</span>
+            <p className="text-xs text-yellow-600">
+              Settings and configuration are always stored in the local SQLite database, regardless of the active backend. Do not delete the SQLite database file (<code className="text-yellow-500">data/events.db</code>) even when using an external backend.
+            </p>
+          </div>
 
           <div className="space-y-3">
             {dbEngines.backends.map((backend) => {
@@ -181,8 +187,8 @@ export default function Settings() {
                   });
                   const data = await resp.json();
                   setEngineSaved(true);
-                  setEngineSaveMsg(data.message || 'Saved!');
-                  setTimeout(() => setEngineSaved(false), 5000);
+                  setEngineSaveMsg((data.message || 'Saved!') + ' ⚠️ Restart the SIEM for changes to take effect.');
+                  // Don't auto-hide — restart warning should persist
                 } catch {
                   setEngineSaveMsg('Failed to save.');
                   setEngineSaved(true);
@@ -193,7 +199,7 @@ export default function Settings() {
             >
               Save Database Engine
             </button>
-            {engineSaved && <p className="text-xs text-green-400">{engineSaveMsg}</p>}
+            {engineSaved && <p className="text-xs text-yellow-400">{engineSaveMsg}</p>}
           </div>
         </div>
       )}
@@ -337,7 +343,7 @@ export default function Settings() {
             </button>
           </div>
         )}
-        {resetDone && <p className="text-xs text-green-400">Database cleared successfully.</p>}
+        {resetDone && <p className="text-xs text-green-400">Database cleared successfully. Indexes rebuilding — dashboard will resume in ~60 seconds.</p>}
       </div>
     </div>
   );

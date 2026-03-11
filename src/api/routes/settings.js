@@ -87,14 +87,31 @@ router.put('/', async (req, res) => {
   }
 });
 
+// Grace period after DB reset — suppress heavy queries while indexes rebuild
+let lastResetAt = null;
+const RESET_GRACE_SECONDS = 60;
+
+function getResetGraceStatus() {
+  if (!lastResetAt) return null;
+  const elapsed = (Date.now() - lastResetAt) / 1000;
+  if (elapsed < RESET_GRACE_SECONDS) {
+    return { rebuilding: true, secondsLeft: Math.ceil(RESET_GRACE_SECONDS - elapsed) };
+  }
+  lastResetAt = null; // Grace period over, clear
+  return null;
+}
+
 router.post('/reset-db', async (req, res) => {
   try {
     const backend = storage.getBackend();
     await backend.resetData();
-    res.json({ ok: true });
+    lastResetAt = Date.now();
+    res.json({ ok: true, gracePeriod: RESET_GRACE_SECONDS });
   } catch (err) {
     res.status(500).json({ error: 'Failed to reset database' });
   }
 });
 
+// Export router + helper for health endpoint
 module.exports = router;
+module.exports.getResetGraceStatus = getResetGraceStatus;
