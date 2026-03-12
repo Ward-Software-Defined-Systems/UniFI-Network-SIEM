@@ -347,6 +347,42 @@ export default function ThreatHunt() {
                 </div>
               )}
 
+              {result.intel.topDestinations?.length > 0 && (
+                <div className="detail-section">
+                  <h4>🎯 Destination Targets</h4>
+                  <div className="related-ips">
+                    {result.intel.topDestinations.map(d => (
+                      <span
+                        key={d.ip}
+                        className="related-ip"
+                        onClick={() => { setTarget(d.ip); }}
+                        title="Click to investigate"
+                      >
+                        {d.ip} <small>×{d.count?.toLocaleString()}</small>
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {result.intel.topSources?.length > 0 && (
+                <div className="detail-section">
+                  <h4>📡 Sources Communicating</h4>
+                  <div className="related-ips">
+                    {result.intel.topSources.map(s => (
+                      <span
+                        key={s.ip}
+                        className="related-ip"
+                        onClick={() => { setTarget(s.ip); }}
+                        title="Click to investigate"
+                      >
+                        {s.ip} <small>×{s.count?.toLocaleString()}</small>
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
+
               {result.intel.relatedIPs?.length > 0 && (
                 <div className="detail-section">
                   <h4>🔗 Related IPs (Same /24)</h4>
@@ -375,6 +411,9 @@ export default function ThreatHunt() {
                   <h4>⏱️ Activity Window</h4>
                   <p className="time-range">
                     {new Date(result.intel.firstSeen).toLocaleString()} → {new Date(result.intel.lastSeen).toLocaleString()}
+                  </p>
+                  <p className="time-note" style={{ fontSize: '0.75rem', color: '#6b7280', marginTop: '4px' }}>
+                    Based on all {result.intel.totalEvents?.toLocaleString()} logged events for this IP
                   </p>
                 </div>
               )}

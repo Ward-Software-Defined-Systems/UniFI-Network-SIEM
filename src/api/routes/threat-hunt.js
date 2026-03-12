@@ -1,5 +1,6 @@
 const express = require('express');
 const { getDb } = require('../../db/database');
+const storage = require('../../db/storage');
 const config = require('../../config');
 const logger = require('../../utils/logger');
 
@@ -75,8 +76,8 @@ router.post('/investigate', async (req, res) => {
   if (!key) return res.status(400).json({ error: `No API key configured for ${huntSettings.provider}` });
 
   try {
-    // Gather local intelligence
-    const intel = gatherLocalIntel(target);
+    // Gather local intelligence (async for WardSONDB support)
+    const intel = await gatherLocalIntel(target);
 
     // Gather external intelligence
     const external = await gatherExternalIntel(target);
@@ -108,96 +109,250 @@ function getActiveKey() {
   }
 }
 
-function gatherLocalIntel(target) {
+async function gatherLocalIntel(target) {
+  const backendName = storage.getBackendName();
+
+  if (backendName === 'WardSONDB') {
+    return gatherLocalIntelWardsonDB(target);
+  }
+
+  // SQLite path (original)
+  return gatherLocalIntelSQLite(target);
+}
+
+function gatherLocalIntelSQLite(target) {
   const db = getDb();
 
-  // Check enrichment cache
   const cached = db.prepare('SELECT * FROM ip_enrichment_cache WHERE ip = ?').get(target);
-
-  // Event summary
   const totalEvents = db.prepare(
     'SELECT COUNT(*) as c FROM events WHERE src_ip = ? OR dst_ip = ?'
   ).get(target, target).c;
-
-  // Events by action
   const byAction = db.prepare(`
     SELECT action, COUNT(*) as count FROM events
     WHERE (src_ip = ? OR dst_ip = ?) AND action IS NOT NULL
     GROUP BY action ORDER BY count DESC
   `).all(target, target);
-
-  // Events by type
   const byType = db.prepare(`
     SELECT event_type, COUNT(*) as count FROM events
     WHERE src_ip = ? OR dst_ip = ?
     GROUP BY event_type ORDER BY count DESC
   `).all(target, target);
-
-  // Top destination ports targeted
   const topPorts = db.prepare(`
     SELECT dst_port, protocol, COUNT(*) as count FROM events
     WHERE src_ip = ? AND dst_port IS NOT NULL
     GROUP BY dst_port, protocol ORDER BY count DESC LIMIT 20
   `).all(target);
-
-  // Top source ports (if target is destination)
   const topSrcPorts = db.prepare(`
     SELECT src_port, protocol, COUNT(*) as count FROM events
     WHERE dst_ip = ? AND src_port IS NOT NULL
     GROUP BY src_port, protocol ORDER BY count DESC LIMIT 10
   `).all(target);
-
-  // Activity timeline (hourly)
   const timeline = db.prepare(`
     SELECT strftime('%Y-%m-%dT%H:00:00Z', received_at) as hour, COUNT(*) as count
     FROM events WHERE src_ip = ? OR dst_ip = ?
     GROUP BY hour ORDER BY hour
   `).all(target, target);
-
-  // First and last seen
   const firstSeen = db.prepare(
     'SELECT MIN(received_at) as t FROM events WHERE src_ip = ? OR dst_ip = ?'
   ).get(target, target).t;
-
   const lastSeen = db.prepare(
     'SELECT MAX(received_at) as t FROM events WHERE src_ip = ? OR dst_ip = ?'
   ).get(target, target).t;
-
-  // Related IPs from same /24 subnet
   const subnet = target.split('.').slice(0, 3).join('.');
   const relatedIPs = db.prepare(`
     SELECT ip, abuse_score, geo_country, hostname FROM ip_enrichment_cache
     WHERE ip LIKE ? AND ip != ? AND is_private = 0
     ORDER BY abuse_score DESC LIMIT 10
   `).all(subnet + '.%', target);
-
-  // IDS/IPS signatures triggered
   const signatures = db.prepare(`
     SELECT ids_signature, ids_classification, COUNT(*) as count
     FROM events WHERE (src_ip = ? OR dst_ip = ?) AND ids_signature IS NOT NULL
     GROUP BY ids_signature ORDER BY count DESC LIMIT 10
   `).all(target, target);
-
-  // Unique destination IPs targeted by this source
   const targetsHit = db.prepare(`
     SELECT COUNT(DISTINCT dst_ip) as c FROM events WHERE src_ip = ?
   `).get(target).c;
+  const topDestinations = db.prepare(`
+    SELECT dst_ip as ip, COUNT(*) as count FROM events
+    WHERE src_ip = ? AND dst_ip IS NOT NULL
+    GROUP BY dst_ip ORDER BY count DESC LIMIT 20
+  `).all(target);
+  const topSources = db.prepare(`
+    SELECT src_ip as ip, COUNT(*) as count FROM events
+    WHERE dst_ip = ? AND src_ip IS NOT NULL
+    GROUP BY src_ip ORDER BY count DESC LIMIT 20
+  `).all(target);
 
-  return {
-    cached,
-    totalEvents,
-    byAction,
-    byType,
-    topPorts,
-    topSrcPorts,
-    timeline,
-    firstSeen,
-    lastSeen,
-    relatedIPs,
-    signatures,
-    targetsHit,
-  };
+  return { cached, totalEvents, byAction, byType, topPorts, topSrcPorts, timeline, firstSeen, lastSeen, relatedIPs, signatures, targetsHit, topDestinations, topSources };
 }
+
+async function gatherLocalIntelWardsonDB(target) {
+  const backend = storage.getBackend();
+  const col = 'events';
+  const cacheCol = 'enrichment_cache';
+
+  const post = (path, body) => backend._post(path, body);
+
+  // All queries run in parallel for speed
+  const ipFilter = { '$or': [{ 'network.src_ip': target }, { 'network.dst_ip': target }] };
+
+  const [
+    cachedResult,
+    totalResult,
+    byActionResult,
+    byTypeResult,
+    topPortsResult,
+    topSrcPortsResult,
+    firstLastResult,
+    signaturesResult,
+    targetsHitResult,
+    topDestinationsResult,
+    topSourcesResult,
+  ] = await Promise.all([
+    // Enrichment cache lookup
+    post(`/${cacheCol}/query`, { filter: { ip: target }, limit: 1 }).catch(() => ({ data: [] })),
+
+    // Total events
+    post(`/${col}/query`, { filter: ipFilter, count_only: true }).catch(() => ({ data: { count: 0 } })),
+
+    // Events by action
+    post(`/${col}/aggregate`, { pipeline: [
+      { '$match': ipFilter },
+      { '$group': { '_id': 'network.action', count: { '$count': {} } } },
+      { '$sort': { count: 'desc' } },
+    ]}).catch(() => ({ data: [] })),
+
+    // Events by type
+    post(`/${col}/aggregate`, { pipeline: [
+      { '$match': ipFilter },
+      { '$group': { '_id': 'event_type', count: { '$count': {} } } },
+      { '$sort': { count: 'desc' } },
+    ]}).catch(() => ({ data: [] })),
+
+    // Top destination ports (target as source)
+    post(`/${col}/aggregate`, { pipeline: [
+      { '$match': { 'network.src_ip': target, 'network.dst_port': { '$exists': true } } },
+      { '$group': { '_id': { port: 'network.dst_port', protocol: 'network.protocol' }, count: { '$count': {} } } },
+      { '$sort': { count: 'desc' } },
+      { '$limit': 20 },
+    ]}).catch(() => ({ data: [] })),
+
+    // Top source ports (target as destination)
+    post(`/${col}/aggregate`, { pipeline: [
+      { '$match': { 'network.dst_ip': target, 'network.src_port': { '$exists': true } } },
+      { '$group': { '_id': { port: 'network.src_port', protocol: 'network.protocol' }, count: { '$count': {} } } },
+      { '$sort': { count: 'desc' } },
+      { '$limit': 10 },
+    ]}).catch(() => ({ data: [] })),
+
+    // First and last seen (sort asc limit 1 + sort desc limit 1)
+    Promise.all([
+      post(`/${col}/query`, { filter: ipFilter, sort: [{ received_at: 'asc' }], fields: ['received_at'], limit: 1 }),
+      post(`/${col}/query`, { filter: ipFilter, sort: [{ received_at: 'desc' }], fields: ['received_at'], limit: 1 }),
+    ]).catch(() => [{ data: [] }, { data: [] }]),
+
+    // IDS signatures
+    post(`/${col}/aggregate`, { pipeline: [
+      { '$match': { '$and': [ipFilter, { 'ids_signature': { '$exists': true } }] } },
+      { '$group': { '_id': { sig: 'ids_signature', cls: 'ids_classification' }, count: { '$count': {} } } },
+      { '$sort': { count: 'desc' } },
+      { '$limit': 10 },
+    ]}).catch(() => ({ data: [] })),
+
+    // Unique destination IPs targeted (count)
+    post(`/${col}/distinct`, { field: 'network.dst_ip', filter: { 'network.src_ip': target } })
+      .catch(() => ({ data: { count: 0 } })),
+
+    // Top destination IPs targeted (with event counts)
+    post(`/${col}/aggregate`, { pipeline: [
+      { '$match': { 'network.src_ip': target } },
+      { '$group': { '_id': 'network.dst_ip', count: { '$count': {} } } },
+      { '$sort': { count: 'desc' } },
+      { '$limit': 20 },
+    ]}).catch(() => ({ data: [] })),
+
+    // Top source IPs communicating with target (as destination)
+    post(`/${col}/aggregate`, { pipeline: [
+      { '$match': { 'network.dst_ip': target } },
+      { '$group': { '_id': 'network.src_ip', count: { '$count': {} } } },
+      { '$sort': { count: 'desc' } },
+      { '$limit': 20 },
+    ]}).catch(() => ({ data: [] })),
+  ]);
+
+  // Parse results
+  const cached = cachedResult.data?.[0] || null;
+  const totalEvents = totalResult.data?.count ?? totalResult.meta?.total_count ?? 0;
+  const byAction = (byActionResult.data || []).map(r => ({ action: r._id, count: r.count }));
+  const byType = (byTypeResult.data || []).map(r => ({ event_type: r._id, count: r.count }));
+  const topPorts = (topPortsResult.data || []).map(r => ({ dst_port: r._id?.port, protocol: r._id?.protocol, count: r.count }));
+  const topSrcPorts = (topSrcPortsResult.data || []).map(r => ({ src_port: r._id?.port, protocol: r._id?.protocol, count: r.count }));
+
+  const [firstResult, lastResult] = firstLastResult;
+  const firstSeen = firstResult.data?.[0]?.received_at || null;
+  const lastSeen = lastResult.data?.[0]?.received_at || null;
+
+  const signatures = (signaturesResult.data || []).map(r => ({
+    ids_signature: r._id?.sig, ids_classification: r._id?.cls, count: r.count,
+  }));
+
+  const targetsHit = targetsHitResult.data?.count ?? 0;
+  const topDestinations = (topDestinationsResult.data || []).map(r => ({ ip: r._id, count: r.count }));
+  const topSources = (topSourcesResult.data || []).map(r => ({ ip: r._id, count: r.count }));
+
+  // Timeline: fetch events with projection, bucket client-side (hourly)
+  let timeline = [];
+  try {
+    const timelineDocs = [];
+    let offset = 0;
+    const PAGE = 10000;
+    let hasMore = true;
+    while (hasMore) {
+      const page = await post(`/${col}/query`, {
+        filter: ipFilter,
+        fields: ['received_at'],
+        limit: PAGE,
+        offset,
+      });
+      const docs = page.data || [];
+      timelineDocs.push(...docs);
+      hasMore = docs.length === PAGE;
+      offset += PAGE;
+      // Safety cap — don't fetch more than 100K docs for timeline
+      if (offset >= 100000) break;
+    }
+    // Bucket by hour
+    const buckets = {};
+    for (const doc of timelineDocs) {
+      if (!doc.received_at) continue;
+      const hour = doc.received_at.substring(0, 13) + ':00:00Z';
+      buckets[hour] = (buckets[hour] || 0) + 1;
+    }
+    timeline = Object.entries(buckets)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([hour, count]) => ({ hour, count }));
+  } catch (err) {
+    logger.warn({ err }, 'Failed to build timeline for threat hunt');
+  }
+
+  // Related IPs from same /24 subnet (from enrichment cache)
+  let relatedIPs = [];
+  try {
+    const subnet = target.split('.').slice(0, 3).join('.');
+    const cacheResult = await post(`/${cacheCol}/query`, {
+      filter: { ip: { '$regex': `^${subnet.replace(/\./g, '\\\\.')}\\\\.` }, is_private: false },
+      limit: 100,
+    });
+    relatedIPs = (cacheResult.data || [])
+      .filter(r => r.ip !== target)
+      .sort((a, b) => (b.abuse_score || 0) - (a.abuse_score || 0))
+      .slice(0, 10)
+      .map(r => ({ ip: r.ip, abuse_score: r.abuse_score, geo_country: r.geo_country, hostname: r.hostname }));
+  } catch {}
+
+  return { cached, totalEvents, byAction, byType, topPorts, topSrcPorts, timeline, firstSeen, lastSeen, relatedIPs, signatures, targetsHit, topDestinations, topSources };
+}
+
 
 async function gatherExternalIntel(target) {
   const results = { rdns: null, whois: null };
