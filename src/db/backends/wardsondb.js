@@ -648,85 +648,62 @@ class WardsonDbBackend extends StorageBackend {
   // --- Stats / Aggregation ---
 
   async getOverviewStats(since) {
-    // Single aggregation: group by event_type + network.action to get all stats in one pass
-    const pipeline = [
-      { '$match': { received_at: { '$gte': since } } },
-      { '$group': {
-        '_id': { type: 'event_type', action: 'network.action' },
-        count: { '$count': {} },
-      }},
-    ];
+    // Bitmap-optimized: parallel count queries instead of composite $group aggregation.
+    // Each query hits bitmap scan (event_type, network.action) for <1ms response times.
+    // The old composite $group forced full doc loads at scale, causing 30s+ timeouts.
+    const timeFilter = { received_at: { '$gte': since } };
 
-    try {
-      const result = await this._post(`/${this.eventsCollection}/aggregate`, { pipeline });
-      const rows = result.data || [];
+    const [totalResult, byTypeResult, allowed, blocked, threats] = await Promise.all([
+      // Total count for time range
+      this._post(`/${this.eventsCollection}/query`, {
+        filter: timeFilter,
+        count_only: true,
+      }),
+      // Count by event_type (bitmap_aggregate path)
+      this._post(`/${this.eventsCollection}/aggregate`, {
+        pipeline: [
+          { '$match': timeFilter },
+          { '$group': { '_id': 'event_type', count: { '$count': {} } } },
+        ],
+      }),
+      // Firewall allowed count (bitmap AND: event_type + network.action)
+      this._post(`/${this.eventsCollection}/query`, {
+        filter: { event_type: 'firewall', 'network.action': 'allow', ...timeFilter },
+        count_only: true,
+      }),
+      // Firewall blocked count
+      this._post(`/${this.eventsCollection}/query`, {
+        filter: { event_type: 'firewall', 'network.action': 'block', ...timeFilter },
+        count_only: true,
+      }),
+      // Threat count
+      this._post(`/${this.eventsCollection}/query`, {
+        filter: { event_type: 'threat', ...timeFilter },
+        count_only: true,
+      }),
+    ]);
 
-      // Aggregate results
-      let total = 0;
-      const byType = {};
-      let fwAllowed = 0;
-      let fwBlocked = 0;
-      let threatCount = 0;
-
-      for (const row of rows) {
-        const type = row._id?.type;
-        const action = row._id?.action;
-        const count = row.count || 0;
-        total += count;
-
-        if (type) {
-          byType[type] = (byType[type] || 0) + count;
-        }
-
-        if (type === 'firewall') {
-          if (action === 'allow') fwAllowed += count;
-          else if (action === 'block') fwBlocked += count;
-        }
-        if (type === 'threat') threatCount += count;
+    const byType = {};
+    let total = 0;
+    for (const row of (byTypeResult.data || [])) {
+      if (row._id) {
+        byType[row._id] = row.count || 0;
+        total += row.count || 0;
       }
-
-      return {
-        total,
-        byType,
-        firewall: {
-          allowed: fwAllowed,
-          blocked: fwBlocked,
-          threats: threatCount,
-        },
-      };
-    } catch (err) {
-      logger.warn({ err }, 'Aggregation failed for getOverviewStats, falling back to individual queries');
-      // Fallback to individual queries
-      const [totalResult, byType, allowed, blocked, threats] = await Promise.all([
-        this._post(`/${this.eventsCollection}/query`, {
-          filter: { received_at: { '$gte': since } },
-          count_only: true,
-        }),
-        this.getEventTypeCounts(since),
-        this._post(`/${this.eventsCollection}/query`, {
-          filter: { '$and': [{ event_type: 'firewall' }, { 'network.action': 'allow' }, { received_at: { '$gte': since } }] },
-          count_only: true,
-        }),
-        this._post(`/${this.eventsCollection}/query`, {
-          filter: { '$and': [{ event_type: 'firewall' }, { 'network.action': 'block' }, { received_at: { '$gte': since } }] },
-          count_only: true,
-        }),
-        this._post(`/${this.eventsCollection}/query`, {
-          filter: { '$and': [{ event_type: 'threat' }, { received_at: { '$gte': since } }] },
-          count_only: true,
-        }),
-      ]);
-
-      return {
-        total: totalResult.meta?.total_count || totalResult.data?.count || 0,
-        byType,
-        firewall: {
-          allowed: allowed.meta?.total_count || allowed.data?.count || 0,
-          blocked: blocked.meta?.total_count || blocked.data?.count || 0,
-          threats: threats.meta?.total_count || threats.data?.count || 0,
-        },
-      };
     }
+    // Prefer the direct count if available (more accurate with time filter)
+    const directTotal = totalResult.meta?.total_count || totalResult.data?.count;
+    if (directTotal != null) total = directTotal;
+
+    return {
+      total,
+      byType,
+      firewall: {
+        allowed: allowed.meta?.total_count || allowed.data?.count || 0,
+        blocked: blocked.meta?.total_count || blocked.data?.count || 0,
+        threats: threats.meta?.total_count || threats.data?.count || 0,
+      },
+    };
   }
 
   // --- Aggregation-powered stats ---
