@@ -19,7 +19,7 @@ function withTimeout(promise, ms, fallback) {
   ]);
 }
 
-const HEALTH_TIMEOUT_MS = 5000; // If backend doesn't respond in 5s, assume overloaded
+const HEALTH_TIMEOUT_MS = 30000; // Timeout for backend health queries (generous for remote/VPN + large datasets)
 
 router.get('/', async (req, res) => {
   try {
@@ -41,48 +41,59 @@ router.get('/', async (req, res) => {
     const TIMEOUT = '_TIMEOUT_';
     const wrap = (p) => useTimeout ? withTimeout(p, HEALTH_TIMEOUT_MS, TIMEOUT) : p;
 
-    const [eventsTotal, eventsToday, lastEventAt, eventTypeCounts, healthCheck] = await Promise.all([
-      wrap(backend.getEventCount()),
-      wrap(backend.getEventCountToday()),
-      wrap(backend.getLastEventTime()),
-      wrap(backend.getEventTypeCounts()),
-      wrap(backend.healthCheck()),
-    ]);
+    if (backendName === 'WardSONDB') {
+      // Optimized path for WardSONDB: reuse data from healthCheck() to avoid
+      // expensive full-scan queries (getEventCount, getLastEventTime).
+      // healthCheck() already calls /_health, /_stats, and /{collection}/storage
+      // which provide totalDocuments, newestDoc, and oldestDoc in O(1).
+      const [healthCheck, eventsToday, eventTypeCounts] = await Promise.all([
+        wrap(backend.healthCheck()),
+        wrap(backend.getEventCountToday()),
+        wrap(backend.getEventTypeCounts()),
+      ]);
 
-    // If any call timed out (WardSONDB only), the backend is overloaded — show rebuilding state
-    const timedOut = useTimeout && [eventsTotal, eventsToday, lastEventAt, eventTypeCounts, healthCheck].some(r => r === TIMEOUT);
+      const timedOut = [healthCheck, eventsToday, eventTypeCounts].some(r => r === TIMEOUT);
+      const hc = healthCheck !== TIMEOUT ? healthCheck : null;
+      const writePressure = hc?.writePressure || (timedOut ? 'high' : null);
+      // Only show rebuilding during grace period (post-reset) or if health check
+      // itself timed out (truly overloaded). WardSONDB's write_pressure can remain
+      // "high" after compaction even with zero writes — don't treat that as rebuilding.
+      const isRebuilding = !!(graceStatus || (!hc && timedOut));
 
-    if (timedOut) {
+      // Derive eventsTotal and lastEventAt from healthCheck data (O(1) lookups)
+      const eventsTotal = hc?.details?.eventsStorage?.docCount ?? null;
+      const lastEventAt = hc?.details?.eventsStorage?.newestDoc ?? null;
+
       return res.json({
         status: 'ok',
         backend: backendName,
         uptime: Math.floor((Date.now() - startTime) / 1000),
-        eventsTotal: eventsTotal !== TIMEOUT ? eventsTotal : null,
+        eventsTotal,
         eventsToday: eventsToday !== TIMEOUT ? eventsToday : null,
         dbSizeMB: null,
-        totalDocuments: null,
-        lastEventAt: lastEventAt !== TIMEOUT ? lastEventAt : null,
+        totalDocuments: hc?.details?.totalDocuments || null,
+        lastEventAt,
         eventTypeCounts: eventTypeCounts !== TIMEOUT ? eventTypeCounts : {},
         enrichment: {
           geoip: isGeoIpAvailable(),
           abuseipdb: isAbuseIpDbConfigured(),
           queueSize: getQueueSize(),
         },
-        backendHealth: null,
-        rebuilding: true,
-        writePressure: 'high',
+        backendHealth: hc?.details || null,
+        ...(isRebuilding ? { rebuilding: true, writePressure } : {}),
       });
     }
 
-    // For WardSONDB, show document count and time range instead of file size
-    if (backendName === 'WardSONDB' && healthCheck.details?.eventsStorage) {
-      const es = healthCheck.details.eventsStorage;
-      dbSizeMB = null; // No file-based size for WardSONDB
-    }
+    // SQLite path — original logic (all queries are fast/synchronous)
+    const [eventsTotal, eventsToday, lastEventAt, eventTypeCounts, healthCheck] = await Promise.all([
+      backend.getEventCount(),
+      backend.getEventCountToday(),
+      backend.getLastEventTime(),
+      backend.getEventTypeCounts(),
+      backend.healthCheck(),
+    ]);
 
     const writePressure = healthCheck.writePressure || null;
-
-    // Rebuilding state: either in grace period after reset, or WardSONDB reports high write pressure
     const isRebuilding = !!(graceStatus || writePressure === 'high');
 
     res.json({
