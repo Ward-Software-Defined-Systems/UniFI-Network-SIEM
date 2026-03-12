@@ -149,8 +149,25 @@ export default function LiveMap({ period, setPeriod, refreshRate, setRefreshRate
         </div>
       </div>
 
+      {loading && (
+        <div className="px-4 py-2 space-y-1">
+          <div className="flex items-center gap-2 text-xs text-gray-400">
+            <svg className="animate-spin h-3 w-3 text-blue-400" viewBox="0 0 24 24">
+              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
+              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+            </svg>
+            Loading map data…
+          </div>
+          <div className="w-full bg-gray-800 rounded-full h-1 overflow-hidden">
+            <div className="bg-blue-500 h-1 rounded-full animate-pulse w-full" />
+          </div>
+        </div>
+      )}
+
+      <PausedIndicator paused={paused} loading={loading} />
+
       <div className="flex-1 relative">
-        {!hasData && (
+        {!hasData && !loading && (
           <div className="absolute inset-0 z-[1000] flex items-center justify-center bg-gray-950/80">
             <div className="text-center space-y-2">
               <p className="text-gray-400">No geo-enriched events yet</p>
