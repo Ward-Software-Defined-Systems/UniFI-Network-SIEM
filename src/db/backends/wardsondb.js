@@ -713,10 +713,7 @@ class WardsonDbBackend extends StorageBackend {
   }
 
   async getTimeline(since, bucketFormat, eventType, bucketSize) {
-    // Timeline bucketing: runs count queries per bucket per event type.
-    // Uses compound index (event_type, received_at) for range scans.
-    // Throttled to avoid saturating the HTTP connection pool, which would
-    // starve other concurrent dashboard queries (overview, top talkers, etc).
+    // Determine bucket interval in milliseconds
     const bucketMs = {
       '5m': 5 * 60000,
       '15m': 15 * 60000,
@@ -724,15 +721,21 @@ class WardsonDbBackend extends StorageBackend {
       '1d': 86400000,
     }[bucketSize || '1h'] || 3600000;
 
+    // Determine time range — align to bucket boundaries
     const sinceDate = new Date(since);
     const nowDate = new Date();
+    // Floor sinceDate to bucket boundary
     const startTime = new Date(Math.floor(sinceDate.getTime() / bucketMs) * bucketMs);
     const endTime = new Date(Math.floor(nowDate.getTime() / bucketMs) * bucketMs);
-    const numBuckets = Math.min(Math.floor((endTime - startTime) / bucketMs) + 1, 200);
+    const numBuckets = Math.floor((endTime - startTime) / bucketMs) + 1;
 
-    // Build empty buckets
+    // Cap at reasonable number to avoid too many queries
+    const maxBuckets = 200;
+    const actualBuckets = Math.min(numBuckets, maxBuckets);
+
+    // Generate empty buckets
     const buckets = {};
-    for (let i = 0; i < numBuckets; i++) {
+    for (let i = 0; i < actualBuckets; i++) {
       const d = new Date(startTime.getTime() + i * bucketMs);
       const ts = d.toISOString();
       buckets[ts] = eventType === 'firewall'
@@ -740,56 +743,46 @@ class WardsonDbBackend extends StorageBackend {
         : { ts, firewall: 0, threat: 0, dhcp: 0, dns_filter: 0, wifi: 0, admin: 0, system: 0, total: 0 };
     }
 
+    // For each bucket, run count queries (parallelized in batches)
     const bucketKeys = Object.keys(buckets);
-    if (bucketKeys.length === 0) return Object.values(buckets);
+    const PARALLEL = 8;
 
-    // Build all query descriptors (without executing yet)
-    const queryDescs = [];
+    for (let i = 0; i < bucketKeys.length; i += PARALLEL) {
+      const batch = bucketKeys.slice(i, i + PARALLEL);
+      await Promise.all(batch.map(async (ts) => {
+        const bucketStart = ts;
+        const bucketEnd = new Date(new Date(ts).getTime() + bucketMs).toISOString();
 
-    for (const ts of bucketKeys) {
-      const bucketStart = ts;
-      const bucketEnd = new Date(new Date(ts).getTime() + bucketMs).toISOString();
-      const timeFilter = { received_at: { '$gte': bucketStart, '$lt': bucketEnd } };
-
-      if (eventType === 'firewall') {
-        queryDescs.push({ ts, field: 'allowed', body: {
-          filter: { event_type: 'firewall', 'network.action': 'allow', ...timeFilter }, count_only: true,
-        }});
-        queryDescs.push({ ts, field: 'blocked', body: {
-          filter: { event_type: 'firewall', 'network.action': 'block', ...timeFilter }, count_only: true,
-        }});
-      } else {
-        for (const type of ['firewall', 'threat', 'dhcp', 'dns_filter', 'wifi', 'admin', 'system']) {
-          queryDescs.push({ ts, field: type, body: {
-            filter: { event_type: type, ...timeFilter }, count_only: true,
-          }});
+        if (eventType === 'firewall') {
+          const [allowed, blocked] = await Promise.all([
+            this._post(`/${this.eventsCollection}/query`, {
+              filter: { '$and': [{ event_type: 'firewall' }, { 'network.action': 'allow' }, { received_at: { '$gte': bucketStart } }, { received_at: { '$lt': bucketEnd } }] },
+              count_only: true,
+            }),
+            this._post(`/${this.eventsCollection}/query`, {
+              filter: { '$and': [{ event_type: 'firewall' }, { 'network.action': 'block' }, { received_at: { '$gte': bucketStart } }, { received_at: { '$lt': bucketEnd } }] },
+              count_only: true,
+            }),
+          ]);
+          buckets[ts].allowed = allowed.meta?.total_count || allowed.data?.count || 0;
+          buckets[ts].blocked = blocked.meta?.total_count || blocked.data?.count || 0;
+        } else {
+          const types = ['firewall', 'threat', 'dhcp', 'dns_filter', 'wifi', 'admin', 'system'];
+          const results = await Promise.all(types.map(t =>
+            this._post(`/${this.eventsCollection}/query`, {
+              filter: { '$and': [{ event_type: t }, { received_at: { '$gte': bucketStart } }, { received_at: { '$lt': bucketEnd } }] },
+              count_only: true,
+            })
+          ));
+          let total = 0;
+          results.forEach((r, idx) => {
+            const count = r.meta?.total_count || r.data?.count || 0;
+            buckets[ts][types[idx]] = count;
+            total += count;
+          });
+          buckets[ts].total = total;
         }
-      }
-    }
-
-    // Execute in controlled batches to avoid saturating Node's HTTP connection pool.
-    // Keeps ~4 sockets free for other concurrent dashboard API calls.
-    const BATCH = 4;
-    for (let i = 0; i < queryDescs.length; i += BATCH) {
-      const batch = queryDescs.slice(i, i + BATCH);
-      const results = await Promise.allSettled(
-        batch.map(q => this._post(`/${this.eventsCollection}/query`, q.body))
-      );
-      results.forEach((result, j) => {
-        if (result.status !== 'fulfilled') return;
-        const { ts, field } = batch[j];
-        const count = result.value?.meta?.total_count || result.value?.data?.count || 0;
-        if (buckets[ts]) buckets[ts][field] = count;
-      });
-    }
-
-    // Calculate totals
-    if (eventType !== 'firewall') {
-      for (const ts of bucketKeys) {
-        const b = buckets[ts];
-        b.total = (b.firewall || 0) + (b.threat || 0) + (b.dhcp || 0) +
-          (b.dns_filter || 0) + (b.wifi || 0) + (b.admin || 0) + (b.system || 0);
-      }
+      }));
     }
 
     return Object.values(buckets);
