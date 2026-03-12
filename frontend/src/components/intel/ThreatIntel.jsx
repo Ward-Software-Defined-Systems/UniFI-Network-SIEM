@@ -1,6 +1,7 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { ChevronUp, ChevronDown } from 'lucide-react';
 import PeriodSelector from '../shared/PeriodSelector';
+import RefreshControls, { PausedIndicator } from '../shared/RefreshControls';
 import { getThreatIntel } from '../../lib/api';
 import { formatNumber, formatDateTime, countryFlag } from '../../lib/format';
 
@@ -60,24 +61,34 @@ const COLUMNS = [
   { field: 'lastSeen', label: 'Last Seen', align: 'right', type: 'string' },
 ];
 
+const DEFAULT_REFRESH = 60000;
+
 export default function ThreatIntel({ period, setPeriod }) {
   const [data, setData] = useState({ summary: { totalEnriched: 0, withAbuseScore: 0, highThreat: 0, countries: 0 }, periodSummary: { enriched: 0, flagged: 0, highThreat: 0, countries: 0 }, ips: [] });
   const [sortField, setSortField] = useState('event_count');
   const [sortDir, setSortDir] = useState('desc');
   const [filters, setFilters] = useState({});
   const [showFilters, setShowFilters] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [refreshRate, setRefreshRate] = useState(DEFAULT_REFRESH);
+  const [paused, setPaused] = useState(true);
+  const fetchRef = useRef(null);
+
+  const doFetch = useCallback(() => {
+    setLoading(true);
+    getThreatIntel(period, 200).then(d => {
+      setData(d);
+    }).catch(() => {}).finally(() => setLoading(false));
+  }, [period]);
+
+  useEffect(() => { fetchRef.current = doFetch; }, [doFetch]);
 
   useEffect(() => {
-    let cancelled = false;
-    const fetchData = () => {
-      getThreatIntel(period, 200).then(d => {
-        if (!cancelled) setData(d);
-      }).catch(() => {});
-    };
-    fetchData();
-    const interval = setInterval(fetchData, 30000);
-    return () => { cancelled = true; clearInterval(interval); };
-  }, [period]);
+    doFetch();
+    if (paused) return;
+    const interval = setInterval(() => fetchRef.current?.(), refreshRate);
+    return () => clearInterval(interval);
+  }, [doFetch, refreshRate, paused]);
 
   const handleSort = (field) => {
     if (sortField === field) {
@@ -157,6 +168,14 @@ export default function ThreatIntel({ period, setPeriod }) {
       <div className="flex items-center justify-between p-4 border-b border-gray-800">
         <h2 className="text-lg font-semibold text-gray-200">Threat Intel</h2>
         <div className="flex items-center gap-3">
+          <RefreshControls
+            refreshRate={refreshRate}
+            setRefreshRate={setRefreshRate}
+            paused={paused}
+            setPaused={setPaused}
+            onRefresh={() => fetchRef.current?.()}
+            loading={loading}
+          />
           <button
             onClick={() => setShowFilters(!showFilters)}
             className={`px-3 py-1.5 text-xs rounded-lg border transition-colors ${

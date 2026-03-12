@@ -1,6 +1,7 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { MapContainer, TileLayer, CircleMarker, Polyline, Popup, useMap } from 'react-leaflet';
 import PeriodSelector from '../shared/PeriodSelector';
+import RefreshControls, { PausedIndicator } from '../shared/RefreshControls';
 import { getGeoEvents, getRecentGeoEvents } from '../../lib/api';
 import { formatNumber, formatDateTime, countryFlag } from '../../lib/format';
 import 'leaflet/dist/leaflet.css';
@@ -102,28 +103,35 @@ function StatsOverlay({ geoEvents, recentEvents }) {
   );
 }
 
+const DEFAULT_REFRESH = 60000;
+
 export default function LiveMap({ period, setPeriod }) {
-  // period and setPeriod come from props
   const [geoEvents, setGeoEvents] = useState([]);
   const [recentEvents, setRecentEvents] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [refreshRate, setRefreshRate] = useState(DEFAULT_REFRESH);
+  const [paused, setPaused] = useState(true);
+  const fetchRef = useRef(null);
+
+  const doFetch = useCallback(() => {
+    setLoading(true);
+    Promise.all([
+      getGeoEvents(period, 1000),
+      getRecentGeoEvents(50),
+    ]).then(([geo, recent]) => {
+      setGeoEvents(geo);
+      setRecentEvents(recent);
+    }).catch(() => {}).finally(() => setLoading(false));
+  }, [period]);
+
+  useEffect(() => { fetchRef.current = doFetch; }, [doFetch]);
 
   useEffect(() => {
-    let cancelled = false;
-    const fetchData = () => {
-      Promise.all([
-        getGeoEvents(period, 1000),
-        getRecentGeoEvents(50),
-      ]).then(([geo, recent]) => {
-        if (cancelled) return;
-        setGeoEvents(geo);
-        setRecentEvents(recent);
-      }).catch(() => {});
-    };
-
-    fetchData();
-    const interval = setInterval(fetchData, 30000);
-    return () => { cancelled = true; clearInterval(interval); };
-  }, [period]);
+    doFetch();
+    if (paused) return;
+    const interval = setInterval(() => fetchRef.current?.(), refreshRate);
+    return () => clearInterval(interval);
+  }, [doFetch, refreshRate, paused]);
 
   const filteredEvents = geoEvents.filter(e => !isPrivateIp(e.ip));
   const hasData = filteredEvents.length > 0;
@@ -132,7 +140,17 @@ export default function LiveMap({ period, setPeriod }) {
     <div className="flex flex-col h-full">
       <div className="flex items-center justify-between p-4 border-b border-gray-800">
         <h2 className="text-lg font-semibold text-gray-200">Live Map</h2>
-        <PeriodSelector value={period} onChange={setPeriod} />
+        <div className="flex items-center gap-3">
+          <RefreshControls
+            refreshRate={refreshRate}
+            setRefreshRate={setRefreshRate}
+            paused={paused}
+            setPaused={setPaused}
+            onRefresh={() => fetchRef.current?.()}
+            loading={loading}
+          />
+          <PeriodSelector value={period} onChange={setPeriod} />
+        </div>
       </div>
 
       <div className="flex-1 relative">

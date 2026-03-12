@@ -1,5 +1,6 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import PeriodSelector from '../shared/PeriodSelector';
+import RefreshControls, { PausedIndicator } from '../shared/RefreshControls';
 import StatsCards from './StatsCards';
 import Timeline from './Timeline';
 import TopTalkers from './TopTalkers';
@@ -9,6 +10,7 @@ import TopClients from './TopClients';
 import { getStatsOverview, getTimeline, getTopTalkers, getTopBlocked, getTopPorts, getTopThreats, getTopClients } from '../../lib/api';
 
 const TOTAL_QUERIES = 9;
+const DEFAULT_REFRESH = 60000;
 
 export default function Dashboard({ period, setPeriod }) {
   const [excludePrivate, setExcludePrivate] = useState(true);
@@ -22,54 +24,63 @@ export default function Dashboard({ period, setPeriod }) {
   const [topClients, setTopClients] = useState([]);
   const [topDst, setTopDst] = useState([]);
   const [loadProgress, setLoadProgress] = useState({ completed: 0, total: TOTAL_QUERIES, loading: false });
+  const [refreshRate, setRefreshRate] = useState(DEFAULT_REFRESH);
+  const [paused, setPaused] = useState(true);
+  const fetchRef = useRef(null);
 
-  useEffect(() => {
+  const doFetch = useCallback(() => {
     const bucket = period === '1h' ? '5m' : period === '6h' ? '15m' : '1h';
     const ep = excludePrivate ? '1' : undefined;
 
-    let cancelled = false;
     let completed = 0;
+    setLoadProgress({ completed: 0, total: TOTAL_QUERIES, loading: true });
 
-    // Wrap a promise to track completion and update state progressively
     const track = (promise, setter) =>
       promise.then(data => {
-        if (cancelled) return;
         if (setter) setter(data);
         completed++;
         setLoadProgress({ completed, total: TOTAL_QUERIES, loading: completed < TOTAL_QUERIES });
       }).catch(() => {
-        if (cancelled) return;
         completed++;
         setLoadProgress({ completed, total: TOTAL_QUERIES, loading: completed < TOTAL_QUERIES });
       });
 
-    const fetchAll = () => {
-      completed = 0;
-      setLoadProgress({ completed: 0, total: TOTAL_QUERIES, loading: true });
-
-      Promise.all([
-        track(getStatsOverview(period), setOverview),
-        track(getTimeline(period, bucket), setTimeline),
-        track(getTopTalkers(period, 10, 'src'), setTopSrc),
-        track(getTopBlocked(period, 10, 'src', ep), setTopBlockedSrc),
-        track(getTopBlocked(period, 10, 'dst', ep), setTopBlockedDst),
-        track(getTopPorts(period, 10), setTopPorts),
-        track(getTopThreats(period, 10), setTopThreats),
-        track(getTopClients(period, 10), setTopClients),
-        track(getTopTalkers(period, 10, 'dst', ep), setTopDst),
-      ]);
-    };
-
-    fetchAll();
-    const interval = setInterval(fetchAll, 30000);
-    return () => { cancelled = true; clearInterval(interval); };
+    Promise.all([
+      track(getStatsOverview(period), setOverview),
+      track(getTimeline(period, bucket), setTimeline),
+      track(getTopTalkers(period, 10, 'src'), setTopSrc),
+      track(getTopBlocked(period, 10, 'src', ep), setTopBlockedSrc),
+      track(getTopBlocked(period, 10, 'dst', ep), setTopBlockedDst),
+      track(getTopPorts(period, 10), setTopPorts),
+      track(getTopThreats(period, 10), setTopThreats),
+      track(getTopClients(period, 10), setTopClients),
+      track(getTopTalkers(period, 10, 'dst', ep), setTopDst),
+    ]);
   }, [period, excludePrivate]);
+
+  useEffect(() => { fetchRef.current = doFetch; }, [doFetch]);
+
+  // Initial fetch + auto-refresh interval
+  useEffect(() => {
+    doFetch();
+    if (paused) return;
+    const interval = setInterval(() => fetchRef.current?.(), refreshRate);
+    return () => clearInterval(interval);
+  }, [doFetch, refreshRate, paused]);
 
   return (
     <div className="p-4 space-y-4 overflow-auto h-full">
       <div className="flex items-center justify-between">
         <h2 className="text-lg font-semibold text-gray-200">Dashboard</h2>
         <div className="flex items-center gap-3">
+          <RefreshControls
+            refreshRate={refreshRate}
+            setRefreshRate={setRefreshRate}
+            paused={paused}
+            setPaused={setPaused}
+            onRefresh={() => fetchRef.current?.()}
+            loading={loadProgress.loading}
+          />
           <button
             onClick={() => setExcludePrivate(!excludePrivate)}
             className={`px-3 py-1.5 text-xs rounded-lg border transition-colors ${
@@ -104,6 +115,8 @@ export default function Dashboard({ period, setPeriod }) {
           </div>
         </div>
       )}
+
+      <PausedIndicator paused={paused} loading={loadProgress.loading} />
 
       <StatsCards overview={overview} />
       <Timeline data={timeline} />
