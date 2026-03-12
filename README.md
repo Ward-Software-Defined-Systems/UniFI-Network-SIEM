@@ -11,8 +11,9 @@ A self-contained, **AI-powered** Node.js application that collects syslog from U
 - **Syslog collector** — UDP listener for UniFi Traffic Logging and Activity Logging (CEF)
 - **11 event type parsers** — firewall, threat, DHCP, DNS, DNS filter (CoreDNS ad-block), Wi-Fi, admin, device, client, VPN, system
 - **Real-time live stream** — WebSocket-powered event table with type/action badges, search, and pause
-- **Dashboard** — stats cards, event timeline chart, top blocked, top threats, top ports, top clients, top sources, top destinations
+- **Dashboard** — stats cards, event timeline chart, top blocked, top threats, top ports, top clients, top sources, top destinations; progressive loading with progress bar
 - **Live Map** — Leaflet-based world map showing geo-enriched traffic with color-coded markers (normal/blocked/threat), flow lines, and stats overlay
+- **Refresh controls** — Dashboard, Live Map, and Threat Intel all include manual refresh, pause/resume, and selectable auto-refresh rates (1m, 2m, 5m). Defaults to paused to reduce load on large datasets — especially useful with remote database backends (e.g., WardSONDB over VPN) where concurrent queries can be expensive
 - **GeoIP & threat enrichment** — MaxMind GeoLite2 for geolocation, AbuseIPDB for threat scoring, reverse DNS — all async with caching
 - **Country flags & abuse badges** — 🇺🇸 emoji flags with country codes on external IPs; color-coded abuse score badges across all views
 - **Threat Intel** — sortable/filterable table of enriched IPs with abuse scores, event counts, and locations; period-filtered summary cards alongside all-time totals
