@@ -61,17 +61,13 @@ const COLUMNS = [
   { field: 'lastSeen', label: 'Last Seen', align: 'right', type: 'string' },
 ];
 
-const DEFAULT_REFRESH = 60000;
-
-export default function ThreatIntel({ period, setPeriod }) {
+export default function ThreatIntel({ period, setPeriod, refreshRate, setRefreshRate, paused, setPaused }) {
   const [data, setData] = useState({ summary: { totalEnriched: 0, withAbuseScore: 0, highThreat: 0, countries: 0 }, periodSummary: { enriched: 0, flagged: 0, highThreat: 0, countries: 0 }, ips: [] });
   const [sortField, setSortField] = useState('event_count');
   const [sortDir, setSortDir] = useState('desc');
   const [filters, setFilters] = useState({});
   const [showFilters, setShowFilters] = useState(false);
   const [loading, setLoading] = useState(false);
-  const [refreshRate, setRefreshRate] = useState(DEFAULT_REFRESH);
-  const [paused, setPaused] = useState(true);
   const fetchRef = useRef(null);
 
   const doFetch = useCallback(() => {

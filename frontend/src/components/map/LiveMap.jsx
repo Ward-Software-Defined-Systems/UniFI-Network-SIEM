@@ -103,14 +103,10 @@ function StatsOverlay({ geoEvents, recentEvents }) {
   );
 }
 
-const DEFAULT_REFRESH = 60000;
-
-export default function LiveMap({ period, setPeriod }) {
+export default function LiveMap({ period, setPeriod, refreshRate, setRefreshRate, paused, setPaused }) {
   const [geoEvents, setGeoEvents] = useState([]);
   const [recentEvents, setRecentEvents] = useState([]);
   const [loading, setLoading] = useState(false);
-  const [refreshRate, setRefreshRate] = useState(DEFAULT_REFRESH);
-  const [paused, setPaused] = useState(true);
   const fetchRef = useRef(null);
 
   const doFetch = useCallback(() => {

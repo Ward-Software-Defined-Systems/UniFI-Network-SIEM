@@ -10,9 +10,8 @@ import TopClients from './TopClients';
 import { getStatsOverview, getTimeline, getTopTalkers, getTopBlocked, getTopPorts, getTopThreats, getTopClients } from '../../lib/api';
 
 const TOTAL_QUERIES = 9;
-const DEFAULT_REFRESH = 60000;
 
-export default function Dashboard({ period, setPeriod }) {
+export default function Dashboard({ period, setPeriod, refreshRate, setRefreshRate, paused, setPaused }) {
   const [excludePrivate, setExcludePrivate] = useState(true);
   const [overview, setOverview] = useState(null);
   const [timeline, setTimeline] = useState([]);
@@ -24,8 +23,6 @@ export default function Dashboard({ period, setPeriod }) {
   const [topClients, setTopClients] = useState([]);
   const [topDst, setTopDst] = useState([]);
   const [loadProgress, setLoadProgress] = useState({ completed: 0, total: TOTAL_QUERIES, loading: false });
-  const [refreshRate, setRefreshRate] = useState(DEFAULT_REFRESH);
-  const [paused, setPaused] = useState(true);
   const fetchRef = useRef(null);
 
   const doFetch = useCallback(() => {
