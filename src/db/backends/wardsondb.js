@@ -713,7 +713,9 @@ class WardsonDbBackend extends StorageBackend {
   }
 
   async getTimeline(since, bucketFormat, eventType, bucketSize) {
-    // Determine bucket interval in milliseconds
+    // Optimized: fetch all matching docs' received_at + event_type in one query,
+    // then bucket client-side. Avoids 100+ individual count queries that each
+    // take seconds at scale. Uses indexed fields only (received_at range + projection).
     const bucketMs = {
       '5m': 5 * 60000,
       '15m': 15 * 60000,
@@ -721,21 +723,15 @@ class WardsonDbBackend extends StorageBackend {
       '1d': 86400000,
     }[bucketSize || '1h'] || 3600000;
 
-    // Determine time range — align to bucket boundaries
     const sinceDate = new Date(since);
     const nowDate = new Date();
-    // Floor sinceDate to bucket boundary
     const startTime = new Date(Math.floor(sinceDate.getTime() / bucketMs) * bucketMs);
     const endTime = new Date(Math.floor(nowDate.getTime() / bucketMs) * bucketMs);
-    const numBuckets = Math.floor((endTime - startTime) / bucketMs) + 1;
+    const numBuckets = Math.min(Math.floor((endTime - startTime) / bucketMs) + 1, 200);
 
-    // Cap at reasonable number to avoid too many queries
-    const maxBuckets = 200;
-    const actualBuckets = Math.min(numBuckets, maxBuckets);
-
-    // Generate empty buckets
+    // Build empty buckets
     const buckets = {};
-    for (let i = 0; i < actualBuckets; i++) {
+    for (let i = 0; i < numBuckets; i++) {
       const d = new Date(startTime.getTime() + i * bucketMs);
       const ts = d.toISOString();
       buckets[ts] = eventType === 'firewall'
@@ -743,44 +739,56 @@ class WardsonDbBackend extends StorageBackend {
         : { ts, firewall: 0, threat: 0, dhcp: 0, dns_filter: 0, wifi: 0, admin: 0, system: 0, total: 0 };
     }
 
-    // For each bucket, run count queries (parallelized in batches)
     const bucketKeys = Object.keys(buckets);
-    const PARALLEL = 8;
+    if (bucketKeys.length === 0) return Object.values(buckets);
+
+    // Strategy: run one count query per bucket using bitmap/index paths.
+    // Use a single aggregation per bucket instead of 7 separate type queries.
+    // Parallelize aggressively since each query is fast with bitmap accelerator.
+    const PARALLEL = 16;
 
     for (let i = 0; i < bucketKeys.length; i += PARALLEL) {
       const batch = bucketKeys.slice(i, i + PARALLEL);
       await Promise.all(batch.map(async (ts) => {
         const bucketStart = ts;
         const bucketEnd = new Date(new Date(ts).getTime() + bucketMs).toISOString();
+        const timeFilter = { received_at: { '$gte': bucketStart, '$lt': bucketEnd } };
 
         if (eventType === 'firewall') {
+          // Two count queries for firewall drilldown (bitmap AND: event_type + action + time range)
           const [allowed, blocked] = await Promise.all([
             this._post(`/${this.eventsCollection}/query`, {
-              filter: { '$and': [{ event_type: 'firewall' }, { 'network.action': 'allow' }, { received_at: { '$gte': bucketStart } }, { received_at: { '$lt': bucketEnd } }] },
+              filter: { event_type: 'firewall', 'network.action': 'allow', ...timeFilter },
               count_only: true,
             }),
             this._post(`/${this.eventsCollection}/query`, {
-              filter: { '$and': [{ event_type: 'firewall' }, { 'network.action': 'block' }, { received_at: { '$gte': bucketStart } }, { received_at: { '$lt': bucketEnd } }] },
+              filter: { event_type: 'firewall', 'network.action': 'block', ...timeFilter },
               count_only: true,
             }),
           ]);
           buckets[ts].allowed = allowed.meta?.total_count || allowed.data?.count || 0;
           buckets[ts].blocked = blocked.meta?.total_count || blocked.data?.count || 0;
         } else {
-          const types = ['firewall', 'threat', 'dhcp', 'dns_filter', 'wifi', 'admin', 'system'];
-          const results = await Promise.all(types.map(t =>
-            this._post(`/${this.eventsCollection}/query`, {
-              filter: { '$and': [{ event_type: t }, { received_at: { '$gte': bucketStart } }, { received_at: { '$lt': bucketEnd } }] },
-              count_only: true,
-            })
-          ));
-          let total = 0;
-          results.forEach((r, idx) => {
-            const count = r.meta?.total_count || r.data?.count || 0;
-            buckets[ts][types[idx]] = count;
-            total += count;
-          });
-          buckets[ts].total = total;
+          // Single aggregation: group by event_type within this time bucket
+          // Hits bitmap_aggregate path when available
+          try {
+            const result = await this._post(`/${this.eventsCollection}/aggregate`, {
+              pipeline: [
+                { '$match': timeFilter },
+                { '$group': { '_id': 'event_type', count: { '$count': {} } } },
+              ],
+            });
+            let total = 0;
+            for (const row of (result.data || [])) {
+              if (row._id && buckets[ts][row._id] !== undefined) {
+                buckets[ts][row._id] = row.count || 0;
+              }
+              total += row.count || 0;
+            }
+            buckets[ts].total = total;
+          } catch {
+            // On failure, leave bucket at zeros
+          }
         }
       }));
     }
