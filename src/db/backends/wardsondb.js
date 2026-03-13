@@ -590,8 +590,9 @@ class WardsonDbBackend extends StorageBackend {
   }
 
   async getEventCountToday() {
+    // Use local midnight (not UTC) so "today" matches the operator's timezone
     const today = new Date();
-    today.setUTCHours(0, 0, 0, 0);
+    today.setHours(0, 0, 0, 0);
     const result = await this._post(`/${this.eventsCollection}/query`, {
       filter: { received_at: { '$gte': today.toISOString() } },
       count_only: true,

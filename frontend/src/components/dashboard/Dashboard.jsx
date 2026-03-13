@@ -32,26 +32,27 @@ export default function Dashboard({ period, setPeriod, refreshRate, setRefreshRa
     let completed = 0;
     setLoadProgress({ completed: 0, total: TOTAL_QUERIES, loading: true });
 
-    const track = (promise, setter) =>
+    const track = (promise, setter, label) =>
       promise.then(data => {
         if (setter) setter(data);
         completed++;
         setLoadProgress({ completed, total: TOTAL_QUERIES, loading: completed < TOTAL_QUERIES });
-      }).catch(() => {
+      }).catch((err) => {
+        console.error(`[Dashboard] ${label || 'query'} failed:`, err);
         completed++;
         setLoadProgress({ completed, total: TOTAL_QUERIES, loading: completed < TOTAL_QUERIES });
       });
 
     Promise.all([
-      track(getStatsOverview(period), setOverview),
-      track(getTimeline(period, bucket), setTimeline),
-      track(getTopTalkers(period, 10, 'src'), setTopSrc),
-      track(getTopBlocked(period, 10, 'src', ep), setTopBlockedSrc),
-      track(getTopBlocked(period, 10, 'dst', ep), setTopBlockedDst),
-      track(getTopPorts(period, 10), setTopPorts),
-      track(getTopThreats(period, 10), setTopThreats),
-      track(getTopClients(period, 10), setTopClients),
-      track(getTopTalkers(period, 10, 'dst', ep), setTopDst),
+      track(getStatsOverview(period), setOverview, 'overview'),
+      track(getTimeline(period, bucket), setTimeline, 'timeline'),
+      track(getTopTalkers(period, 10, 'src'), setTopSrc, 'topSrc'),
+      track(getTopBlocked(period, 10, 'src', ep), setTopBlockedSrc, 'topBlockedSrc'),
+      track(getTopBlocked(period, 10, 'dst', ep), setTopBlockedDst, 'topBlockedDst'),
+      track(getTopPorts(period, 10), setTopPorts, 'topPorts'),
+      track(getTopThreats(period, 10), setTopThreats, 'topThreats'),
+      track(getTopClients(period, 10), setTopClients, 'topClients'),
+      track(getTopTalkers(period, 10, 'dst', ep), setTopDst, 'topDst'),
     ]);
   }, [period, excludePrivate]);
 

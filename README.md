@@ -302,5 +302,5 @@ The app runs HTTPS by default with an auto-generated self-signed certificate. Be
 - [x] Storage backend abstraction — pluggable database engine (SQLite, WardSONDB, OpenSearch) selectable from Settings
 - [x] WardSONDB integration — high-performance Rust-based JSON document database with deferred index creation and write pressure detection
 - [ ] OpenSearch integration — enterprise search and analytics engine with built-in SIEM capabilities
-- [ ] Query performance optimization — tuning for large datasets (millions of rows)
+- [x] Query performance optimization — bitmap scan acceleration and compound range scans via WardSONDB at 3.45M+ events
 - [ ] launchd plist for macOS auto-start

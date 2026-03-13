@@ -37,7 +37,8 @@ router.get('/overview', async (req, res) => {
     const result = await backend.getOverviewStats(since);
     res.json(result);
   } catch (err) {
-    res.status(500).json({ error: 'Failed to get overview stats' });
+    console.error('[stats/overview] Error:', err.message || err);
+    res.status(500).json({ error: 'Failed to get overview stats', detail: err.message });
   }
 });
 
@@ -50,7 +51,8 @@ router.get('/timeline', async (req, res) => {
     const rows = await backend.getTimeline(since, bucketToFormat(bucket), req.query.event_type, bucket);
     res.json(rows);
   } catch (err) {
-    res.status(500).json({ error: 'Failed to get timeline' });
+    console.error('[stats/timeline] Error:', err.message || err);
+    res.status(500).json({ error: 'Failed to get timeline', detail: err.message });
   }
 });
 
