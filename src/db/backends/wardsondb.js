@@ -960,7 +960,23 @@ class WardsonDbBackend extends StorageBackend {
     ];
 
     const aggResult = await this._aggregate(pipeline);
+    const topIps = (aggResult.data || []).map(r => r._id).filter(Boolean);
     const cacheMap = new Map(cacheData.map(d => [d.ip, d]));
+
+    // Get blocked and threat counts per IP in parallel
+    const [blockedAgg, threatAgg] = topIps.length > 0 ? await Promise.all([
+      this._aggregate([
+        { '$match': { received_at: { '$gte': since }, 'network.src_ip': { '$in': topIps }, 'network.action': 'block' } },
+        { '$group': { '_id': 'network.src_ip', 'count': { '$count': {} } } },
+      ]),
+      this._aggregate([
+        { '$match': { received_at: { '$gte': since }, 'network.src_ip': { '$in': topIps }, event_type: 'threat' } },
+        { '$group': { '_id': 'network.src_ip', 'count': { '$count': {} } } },
+      ]),
+    ]) : [{ data: [] }, { data: [] }];
+
+    const blockedMap = new Map((blockedAgg.data || []).map(r => [r._id, r.count]));
+    const threatMap = new Map((threatAgg.data || []).map(r => [r._id, r.count]));
 
     const ips = (aggResult.data || []).map(r => {
       const cached = cacheMap.get(r._id);
@@ -973,8 +989,8 @@ class WardsonDbBackend extends StorageBackend {
         abuse_score: cached?.abuse_score ?? null,
         hostname: cached?.hostname || null,
         event_count: r.event_count,
-        blocked_count: 0,
-        threat_count: 0,
+        blocked_count: blockedMap.get(r._id) || 0,
+        threat_count: threatMap.get(r._id) || 0,
         lastSeen: r.lastSeen,
       };
     });
