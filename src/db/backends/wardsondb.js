@@ -49,7 +49,7 @@ class WardsonDbBackend extends StorageBackend {
 
   // --- HTTP Client ---
 
-  async _request(method, path, body = null, retries = 3, timeoutMs = 6000) {
+  async _request(method, path, body = null, retries = 3, timeoutMs = 30000) {
     const url = `${this.baseUrl}${path}`;
     const opts = {
       method,
