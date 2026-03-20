@@ -49,11 +49,12 @@ class WardsonDbBackend extends StorageBackend {
 
   // --- HTTP Client ---
 
-  async _request(method, path, body = null, retries = 3) {
+  async _request(method, path, body = null, retries = 3, timeoutMs = 6000) {
     const url = `${this.baseUrl}${path}`;
     const opts = {
       method,
       headers: { 'Content-Type': 'application/json' },
+      signal: AbortSignal.timeout(timeoutMs),
     };
 
     if (this.apiKey) opts.headers['Authorization'] = `Bearer ${this.apiKey}`;
@@ -118,7 +119,17 @@ class WardsonDbBackend extends StorageBackend {
     }
 
     this._ingestPaused = false; // Flag to pause ingestion during index creation
-    logger.info({ backend: 'wardsondb' }, 'Storage backend initialized');
+
+    // Cache initial doc count — used to short-circuit stats on empty DB
+    // Use /_stats (fast) instead of /collection/storage (can hang)
+    try {
+      const stats = await this._get('/_stats');
+      this._cachedDocCount = stats.data?.total_documents || 0;
+    } catch {
+      this._cachedDocCount = -1; // Unknown
+    }
+
+    logger.info({ backend: 'wardsondb', docCount: this._cachedDocCount }, 'Storage backend initialized');
   }
 
   _getRequiredIndexes() {
@@ -205,14 +216,17 @@ class WardsonDbBackend extends StorageBackend {
 
   async healthCheck() {
     try {
-      const health = await this._get('/_health');
-      const stats = await this._get('/_stats');
-      // Fetch storage info for the events collection (oldest/newest doc, index count)
-      let storageInfo = null;
-      try {
-        const storage = await this._get(`/${this.eventsCollection}/storage`);
-        storageInfo = storage.data;
-      } catch {}
+      // No retries for health checks — they run every 10s, retries just pile up connections.
+      // Only call /_health and /_stats (both are fast O(1) endpoints).
+      // SKIP /{collection}/storage — it can hang/block on WardSONDB (known issue with
+      // empty or freshly-indexed collections). Use /_stats.total_documents instead.
+      const health = await this._request('GET', '/_health', null, 0, 5000);
+      const stats = await this._request('GET', '/_stats', null, 0, 5000);
+
+      // Update cached doc count from stats
+      const totalDocs = stats.data.total_documents || 0;
+      this._cachedDocCount = totalDocs;
+
       return {
         ok: health.data.status === 'healthy',
         writePressure: health.data.write_pressure || 'normal',
@@ -220,14 +234,15 @@ class WardsonDbBackend extends StorageBackend {
           backend: 'wardsondb',
           url: this.baseUrl,
           collections: stats.data.collection_count,
-          totalDocuments: stats.data.total_documents,
+          totalDocuments: totalDocs,
           uptime: stats.data.uptime_seconds,
-          eventsStorage: storageInfo ? {
-            docCount: storageInfo.doc_count,
-            indexCount: storageInfo.index_count,
-            oldestDoc: storageInfo.oldest_doc,
-            newestDoc: storageInfo.newest_doc,
-          } : null,
+          // Synthesize eventsStorage from /_stats (no per-collection oldest/newest without /storage)
+          eventsStorage: {
+            docCount: totalDocs,
+            indexCount: null,
+            oldestDoc: null,
+            newestDoc: null,
+          },
         },
       };
     } catch (err) {
@@ -469,6 +484,8 @@ class WardsonDbBackend extends StorageBackend {
       const chunk = documents.slice(i, i + CHUNK);
       const result = await this._post(`/${this.eventsCollection}/docs/_bulk`, { documents: chunk });
       totalInserted += result.data.inserted;
+      // Update cached doc count so empty-DB short-circuit clears on first ingest
+      if (totalInserted > 0 && this._cachedDocCount === 0) this._cachedDocCount = totalInserted;
       if (result.data.errors?.length > 0) {
         logger.warn({ errors: result.data.errors.length }, 'WardSONDB bulk insert had errors');
       }
@@ -613,6 +630,8 @@ class WardsonDbBackend extends StorageBackend {
   }
 
   async getEventTypeCounts(since) {
+    if (await this._isCollectionEmpty()) return {};
+
     // Use aggregation pipeline — single query instead of 11 separate count queries
     const pipeline = [];
     if (since) {
@@ -631,7 +650,13 @@ class WardsonDbBackend extends StorageBackend {
       }
       return counts;
     } catch (err) {
-      // Fallback to individual count queries if aggregation fails
+      // If the error is a connection timeout, don't cascade into 11 more queries
+      // that will also timeout — just return empty and let the next poll retry.
+      if (err.message?.includes('Timeout') || err.message?.includes('fetch failed') || err.cause) {
+        logger.warn({ err: err.message }, 'Aggregation timed out for getEventTypeCounts, skipping fallback');
+        return {};
+      }
+      // Fallback to individual count queries only for non-timeout errors (e.g. aggregation not supported)
       logger.warn({ err }, 'Aggregation failed for getEventTypeCounts, falling back to individual queries');
       const types = ['firewall', 'threat', 'dhcp', 'dns', 'dns_filter', 'wifi', 'admin', 'device', 'client', 'vpn', 'system'];
       const counts = {};
@@ -648,7 +673,17 @@ class WardsonDbBackend extends StorageBackend {
 
   // --- Stats / Aggregation ---
 
+  _isCollectionEmpty() {
+    // Synchronous check using cached doc count — never blocks on WardSONDB.
+    // Updated by initialize(), insertEvents(), and healthCheck().
+    return this._cachedDocCount === 0;
+  }
+
   async getOverviewStats(since) {
+    // Short-circuit on empty database to avoid hammering WardSONDB
+    if (await this._isCollectionEmpty()) {
+      return { total: 0, byType: {}, firewall: { allowed: 0, blocked: 0, threats: 0 } };
+    }
     // Bitmap-optimized: parallel count queries instead of composite $group aggregation.
     // Each query hits bitmap scan (event_type, network.action) for <1ms response times.
     // The old composite $group forced full doc loads at scale, causing 30s+ timeouts.
@@ -714,6 +749,9 @@ class WardsonDbBackend extends StorageBackend {
   }
 
   async getTimeline(since, bucketFormat, eventType, bucketSize) {
+    // Short-circuit on empty database — avoids hundreds of count queries
+    if (await this._isCollectionEmpty()) return [];
+
     // Determine bucket interval in milliseconds
     const bucketMs = {
       '5m': 5 * 60000,
@@ -808,6 +846,7 @@ class WardsonDbBackend extends StorageBackend {
   }
 
   async getTopTalkers(since, direction, limit, excludePrivate) {
+    if (await this._isCollectionEmpty()) return [];
     const ipField = direction === 'dst' ? 'network.dst_ip' : 'network.src_ip';
     // Over-fetch if filtering private IPs, then trim client-side
     const fetchLimit = excludePrivate ? limit * 5 : limit;
@@ -839,6 +878,7 @@ class WardsonDbBackend extends StorageBackend {
   }
 
   async getTopBlocked(since, direction, limit, excludePrivate) {
+    if (await this._isCollectionEmpty()) return [];
     const ipField = direction === 'dst' ? 'network.dst_ip' : 'network.src_ip';
     const fetchLimit = excludePrivate ? limit * 5 : limit;
     const pipeline = [
@@ -870,6 +910,7 @@ class WardsonDbBackend extends StorageBackend {
   }
 
   async getTopPorts(since, limit) {
+    if (await this._isCollectionEmpty()) return [];
     const pipeline = [
       { '$match': { received_at: { '$gte': since }, 'network.dst_port': { '$exists': true } } },
       { '$group': {
@@ -889,6 +930,7 @@ class WardsonDbBackend extends StorageBackend {
   }
 
   async getTopClients(since, limit) {
+    if (await this._isCollectionEmpty()) return [];
     // Client MAC is spread across wifi.client_mac, dhcp.mac, client.mac
     // Without $or in aggregation _id, query wifi events as proxy
     const pipeline = [
@@ -914,6 +956,7 @@ class WardsonDbBackend extends StorageBackend {
   }
 
   async getTopThreats(since, limit) {
+    if (await this._isCollectionEmpty()) return [];
     const pipeline = [
       { '$match': { event_type: 'threat', 'ids.signature': { '$exists': true }, received_at: { '$gte': since } } },
       { '$group': {
@@ -935,6 +978,9 @@ class WardsonDbBackend extends StorageBackend {
   }
 
   async getThreatIntel(since, limit) {
+    if (await this._isCollectionEmpty()) {
+      return { summary: { totalEnriched: 0, withAbuseScore: 0, highThreat: 0, countries: 0 }, periodSummary: { enriched: 0, flagged: 0, highThreat: 0, countries: 0 }, ips: [] };
+    }
     // Enrichment not embedded in events yet — use cache collection for summary
     const cacheResult = await this._post(`/${this.cacheCollection}/query`, {
       filter: { is_private: false },
@@ -1016,6 +1062,7 @@ class WardsonDbBackend extends StorageBackend {
   }
 
   async getGeoEvents(since, limit) {
+    if (await this._isCollectionEmpty()) return [];
     // Use cache data + aggregation to get geo events
     const cacheResult = await this._post(`/${this.cacheCollection}/query`, {
       filter: { is_private: false, geo_lat: { '$exists': true } },
@@ -1057,6 +1104,7 @@ class WardsonDbBackend extends StorageBackend {
   }
 
   async getRecentGeoEvents(limit) {
+    if (await this._isCollectionEmpty()) return [];
     // Get recent events and join with cache for geo data
     const result = await this._post(`/${this.eventsCollection}/query`, {
       filter: { 'network.src_ip': { '$exists': true } },

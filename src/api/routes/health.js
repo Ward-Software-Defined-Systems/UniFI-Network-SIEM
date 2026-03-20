@@ -19,7 +19,7 @@ function withTimeout(promise, ms, fallback) {
   ]);
 }
 
-const HEALTH_TIMEOUT_MS = 30000; // Timeout for backend health queries (generous for remote/VPN + large datasets)
+const HEALTH_TIMEOUT_MS = 8000; // Timeout for backend health queries — must be shorter than the 10s poll interval to prevent overlap
 
 router.get('/', async (req, res) => {
   try {
@@ -42,38 +42,47 @@ router.get('/', async (req, res) => {
     const wrap = (p) => useTimeout ? withTimeout(p, HEALTH_TIMEOUT_MS, TIMEOUT) : p;
 
     if (backendName === 'WardSONDB') {
-      // Optimized path for WardSONDB: reuse data from healthCheck() to avoid
-      // expensive full-scan queries (getEventCount, getLastEventTime).
-      // healthCheck() already calls /_health, /_stats, and /{collection}/storage
-      // which provide totalDocuments, newestDoc, and oldestDoc in O(1).
-      const [healthCheck, eventsToday, eventTypeCounts] = await Promise.all([
-        wrap(backend.healthCheck()),
-        wrap(backend.getEventCountToday()),
-        wrap(backend.getEventTypeCounts()),
-      ]);
-
-      const timedOut = [healthCheck, eventsToday, eventTypeCounts].some(r => r === TIMEOUT);
+      // Sequential approach for WardSONDB: run healthCheck() FIRST (O(1) calls to
+      // /_health, /_stats, /events/storage), then decide whether to query further.
+      // This prevents connection pile-ups when the DB is empty, unreachable, or overloaded.
+      const healthCheck = await wrap(backend.healthCheck());
       const hc = healthCheck !== TIMEOUT ? healthCheck : null;
-      const writePressure = hc?.writePressure || (timedOut ? 'high' : null);
-      // Only show rebuilding during grace period (post-reset) or if health check
-      // itself timed out (truly overloaded). WardSONDB's write_pressure can remain
-      // "high" after compaction even with zero writes — don't treat that as rebuilding.
-      const isRebuilding = !!(graceStatus || (!hc && timedOut));
+      const docCount = hc?.details?.eventsStorage?.docCount ?? hc?.details?.totalDocuments ?? null;
+      const isEmpty = docCount === 0;
+      const healthTimedOut = healthCheck === TIMEOUT;
+
+      const writePressure = hc?.writePressure || (healthTimedOut ? 'high' : null);
+      // Never show rebuilding on an empty database — nothing to rebuild.
+      // Don't show it on timeout alone if DB is empty (we know from prior cache).
+      const isRebuilding = !isEmpty && !!(graceStatus || (!hc && healthTimedOut));
 
       // Derive eventsTotal and lastEventAt from healthCheck data (O(1) lookups)
       const eventsTotal = hc?.details?.eventsStorage?.docCount ?? null;
       const lastEventAt = hc?.details?.eventsStorage?.newestDoc ?? null;
+
+      // Only fetch extra stats if DB is non-empty AND healthCheck succeeded.
+      // On empty DB or timeout, skip to avoid cascading connection pile-ups.
+      let eventsToday = isEmpty ? 0 : null;
+      let eventTypeCounts = isEmpty ? {} : {};
+      if (!isEmpty && !healthTimedOut) {
+        const [todayResult, typeResult] = await Promise.all([
+          wrap(backend.getEventCountToday()),
+          wrap(backend.getEventTypeCounts()),
+        ]);
+        eventsToday = todayResult !== TIMEOUT ? todayResult : null;
+        eventTypeCounts = typeResult !== TIMEOUT ? typeResult : {};
+      }
 
       return res.json({
         status: 'ok',
         backend: backendName,
         uptime: Math.floor((Date.now() - startTime) / 1000),
         eventsTotal,
-        eventsToday: eventsToday !== TIMEOUT ? eventsToday : null,
+        eventsToday,
         dbSizeMB: null,
         totalDocuments: hc?.details?.totalDocuments || null,
         lastEventAt,
-        eventTypeCounts: eventTypeCounts !== TIMEOUT ? eventTypeCounts : {},
+        eventTypeCounts,
         enrichment: {
           geoip: isGeoIpAvailable(),
           abuseipdb: isAbuseIpDbConfigured(),
