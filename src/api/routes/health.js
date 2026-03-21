@@ -51,10 +51,11 @@ router.get('/', async (req, res) => {
       const isEmpty = docCount === 0;
       const healthTimedOut = healthCheck === TIMEOUT;
 
-      const writePressure = hc?.writePressure || (healthTimedOut ? 'high' : null);
-      // Never show rebuilding on an empty database — nothing to rebuild.
-      // Don't show it on timeout alone if DB is empty (we know from prior cache).
-      const isRebuilding = !isEmpty && !!(graceStatus || (!hc && healthTimedOut));
+      const writePressure = hc?.writePressure || null;
+      // Only show rebuilding when WardSONDB reports high write pressure or during
+      // the post-reset grace period. Query timeouts alone should not trigger the banner —
+      // the dashboard can render with partial data.
+      const isRebuilding = !isEmpty && !!(graceStatus || writePressure === 'high');
 
       // Derive eventsTotal and lastEventAt from healthCheck data (O(1) lookups)
       const eventsTotal = hc?.details?.eventsStorage?.docCount ?? null;

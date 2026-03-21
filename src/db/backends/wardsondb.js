@@ -114,19 +114,18 @@ class WardsonDbBackend extends StorageBackend {
     if (indexCount >= 9) {
       logger.info({ indexCount }, 'WardSONDB indexes already exist, skipping deferred creation');
     } else {
-      // Start background index creation — pauses ingestion, creates indexes, then resumes
+      // Start background index creation — write-pressure gated, no ingestion pause
       this._startDeferredIndexCreation();
     }
-
-    this._ingestPaused = false; // Flag to pause ingestion during index creation
 
     // Cache initial doc count — used to short-circuit stats on empty DB
     // Use /_stats (fast) instead of /collection/storage (can hang)
     try {
       const stats = await this._get('/_stats');
-      this._cachedDocCount = stats.data?.total_documents || 0;
+      const totalDocs = stats.data?.total_documents;
+      this._cachedDocCount = (typeof totalDocs === 'number') ? totalDocs : null;
     } catch {
-      this._cachedDocCount = -1; // Unknown
+      this._cachedDocCount = null; // Unknown — don't short-circuit to empty results
     }
 
     logger.info({ backend: 'wardsondb', docCount: this._cachedDocCount }, 'Storage backend initialized');
@@ -147,35 +146,37 @@ class WardsonDbBackend extends StorageBackend {
   }
 
   _startDeferredIndexCreation() {
-    const INITIAL_DELAY = 15000; // Wait 15s after startup for initial ingest burst to settle
     const INDEX_DELAY = 5000; // 5 seconds between each index creation
 
-    logger.info('WardSONDB deferred index creation — will pause ingestion and create indexes in 15 seconds');
+    logger.info('WardSONDB starting background index creation (write-pressure gated)');
 
-    this._deferredIndexTimeout = setTimeout(async () => {
+    // Fire-and-forget — do not await
+    this._createIndexesSequentially(INDEX_DELAY).catch(err => {
+      logger.error({ err: err.message }, 'WardSONDB background index creation failed');
+    });
+  }
+
+  async _waitForLowWritePressure() {
+    const POLL_INTERVAL = 30000; // 30s between retries when write_pressure is high
+    while (true) {
       try {
-        // Pause ingestion
-        this._ingestPaused = true;
-        logger.info('WardSONDB ingestion paused for index creation');
-
-        // Brief wait for in-flight inserts to complete
-        await new Promise(r => setTimeout(r, 2000));
-
-        await this._createIndexesSequentially(INDEX_DELAY);
+        const health = await this._request('GET', '/_health', null, 0, 5000);
+        if (health.data?.write_pressure !== 'high') return;
+        logger.info('WardSONDB write_pressure is high — waiting 30s before next index');
       } catch (err) {
-        logger.error({ err: err.message }, 'WardSONDB deferred index creation failed');
-      } finally {
-        // Always resume ingestion
-        this._ingestPaused = false;
-        logger.info('WardSONDB ingestion resumed');
+        logger.debug({ err: err.message }, 'WardSONDB /_health check failed during index creation, retrying');
       }
-    }, INITIAL_DELAY);
+      await new Promise(r => setTimeout(r, POLL_INTERVAL));
+    }
   }
 
   async _createIndexesSequentially(delayMs) {
     const indexes = this._getRequiredIndexes();
 
     for (const idx of indexes) {
+      // Wait for write pressure to be normal before creating each index
+      await this._waitForLowWritePressure();
+
       try {
         const body = { name: idx.name };
         if (idx.fields) body.fields = idx.fields;
@@ -194,7 +195,7 @@ class WardsonDbBackend extends StorageBackend {
       }
     }
 
-    logger.info('WardSONDB deferred index creation complete — all indexes ready');
+    logger.info('WardSONDB index creation complete — all indexes ready');
   }
 
   async _ensureCollection(name) {
@@ -208,10 +209,7 @@ class WardsonDbBackend extends StorageBackend {
   }
 
   async close() {
-    if (this._deferredIndexTimeout) {
-      clearTimeout(this._deferredIndexTimeout);
-      this._deferredIndexTimeout = null;
-    }
+    // No cleanup needed — background index creation is fire-and-forget
   }
 
   async healthCheck() {
@@ -223,8 +221,8 @@ class WardsonDbBackend extends StorageBackend {
       const health = await this._request('GET', '/_health', null, 0, 5000);
       const stats = await this._request('GET', '/_stats', null, 0, 5000);
 
-      // Update cached doc count from stats
-      const totalDocs = stats.data.total_documents || 0;
+      // Update cached doc count from stats — preserve last known good value if /_stats returns unexpected shape
+      const totalDocs = typeof stats.data.total_documents === 'number' ? stats.data.total_documents : this._cachedDocCount;
       this._cachedDocCount = totalDocs;
 
       return {
@@ -468,12 +466,6 @@ class WardsonDbBackend extends StorageBackend {
   // --- Write Operations ---
 
   async insertEvents(events) {
-    // Drop events while ingestion is paused (during index creation)
-    if (this._ingestPaused) {
-      logger.debug({ dropped: events.length }, 'WardSONDB ingestion paused — dropping batch');
-      return events.length; // Report as inserted to avoid retry storms
-    }
-
     const documents = events.map(e => this._eventToDocument(e));
 
     // Batch in chunks of 500 (WardSONDB optimal batch size)
@@ -485,7 +477,7 @@ class WardsonDbBackend extends StorageBackend {
       const result = await this._post(`/${this.eventsCollection}/docs/_bulk`, { documents: chunk });
       totalInserted += result.data.inserted;
       // Update cached doc count so empty-DB short-circuit clears on first ingest
-      if (totalInserted > 0 && this._cachedDocCount === 0) this._cachedDocCount = totalInserted;
+      if (totalInserted > 0 && (this._cachedDocCount === 0 || this._cachedDocCount === null)) this._cachedDocCount = totalInserted;
       if (result.data.errors?.length > 0) {
         logger.warn({ errors: result.data.errors.length }, 'WardSONDB bulk insert had errors');
       }

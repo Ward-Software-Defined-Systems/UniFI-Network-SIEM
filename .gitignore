@@ -22,15 +22,15 @@ frontend/dist/
 .DS_Store
 Thumbs.db
 
-# Internal docs (not for repo)
-ARCHITECTURE.md
-
 # Claude Code
 .claude/
 CLAUDE.md
+# Internal docs (not for repo)
+ARCHITECTURE.md
 PRE-FLIGHT-CHECK.md
 UNIFI-API-RESEARCH.md
 UniFi-SIEM-Research.md
+SPEC_SIEM_wardsondb_backend_fixes.md
 
 # Editor
 *.swp
