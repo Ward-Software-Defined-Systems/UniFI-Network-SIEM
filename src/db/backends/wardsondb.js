@@ -130,7 +130,7 @@ class WardsonDbBackend extends StorageBackend {
       this._cachedDocCount = null; // Unknown — don't short-circuit to empty results
     }
 
-    logger.info({ backend: 'wardsondb', docCount: this._cachedDocCount }, 'Storage backend initialized');
+    logger.info({ backend: 'wardsondb', docCount: this._cachedDocCount, queryTimeoutMs: this.queryTimeoutMs, healthTimeoutMs: this.healthTimeoutMs }, 'Storage backend initialized');
   }
 
   _getRequiredIndexes() {
