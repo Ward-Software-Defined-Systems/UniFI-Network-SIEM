@@ -184,9 +184,7 @@ For full functionality, three logging sources on the UniFi Console should be con
 | `LOG_RAW_MESSAGES` | false | Store raw syslog text in DB |
 | `INSERT_BATCH_SIZE` | 50 | Batch insert threshold |
 | `INSERT_BATCH_INTERVAL_MS` | 500 | Batch insert flush interval |
-| `WARDSONDB_QUERY_TIMEOUT_MS` | 30000 | WardSONDB query/write timeout (ms) |
 | `WARDSONDB_HEALTH_TIMEOUT_MS` | 5000 | WardSONDB health check timeout (ms) |
-| `WARDSONDB_HUNT_TIMEOUT_MS` | 60000 | WardSONDB threat hunt query timeout (ms) |
 
 > **⚠️ Important:** Settings and configuration are always stored in the local SQLite database (`data/events.db`), regardless of which storage backend is active. Do not delete this file even when using WardSONDB or OpenSearch — it contains your backend configuration, API keys, and other settings needed to boot the application. Changing the storage backend requires a SIEM restart to take effect.
 

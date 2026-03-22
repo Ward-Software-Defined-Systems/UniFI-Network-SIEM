@@ -23,9 +23,7 @@ class WardsonDbBackend extends StorageBackend {
     this.verifyCerts = config.verifyCerts !== false; // default true
     this.eventsCollection = 'events';
     this.cacheCollection = 'enrichment_cache';
-    this.queryTimeoutMs = config.queryTimeoutMs || 30000;
     this.healthTimeoutMs = config.healthTimeoutMs || 5000;
-    this.huntTimeoutMs = config.huntTimeoutMs || 60000;
 
     // If TLS with self-signed certs, disable Node's TLS verification globally
     // Node's native fetch doesn't support per-request agent/dispatcher options
@@ -51,6 +49,11 @@ class WardsonDbBackend extends StorageBackend {
   }
 
   // --- HTTP Client ---
+  // Timeouts: query/aggregation duration is governed by WardSONDB's server-side
+  // --query-timeout flag (default 30s). To support long-running Threat Hunt queries,
+  // launch WardSONDB with --query-timeout 120 or higher.
+  // Health checks use _healthRequest() with AbortSignal.timeout(healthTimeoutMs).
+  // _request() has no client-side timeout — this is intentional.
 
   async _request(method, path, body = null, retries = 3) {
     const url = `${this.baseUrl}${path}`;
@@ -138,7 +141,7 @@ class WardsonDbBackend extends StorageBackend {
       this._cachedDocCount = null; // Unknown — don't short-circuit to empty results
     }
 
-    logger.info({ backend: 'wardsondb', docCount: this._cachedDocCount, queryTimeoutMs: this.queryTimeoutMs, healthTimeoutMs: this.healthTimeoutMs, huntTimeoutMs: this.huntTimeoutMs }, 'Storage backend initialized');
+    logger.info({ backend: 'wardsondb', docCount: this._cachedDocCount, healthTimeoutMs: this.healthTimeoutMs }, 'Storage backend initialized');
   }
 
   _getRequiredIndexes() {

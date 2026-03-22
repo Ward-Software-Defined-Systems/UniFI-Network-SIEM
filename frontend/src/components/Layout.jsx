@@ -92,31 +92,34 @@ export default function Layout({ activeView, onViewChange, children }) {
         )}
       </div>
 
-      {/* Main content */}
+      {/* Main content — children always mounted so in-flight queries survive the overlay */}
       <div className="flex-1 flex flex-col overflow-hidden">
-        {health?.rebuilding && !dismissRebuilding ? (
-          <div className="flex-1 flex items-center justify-center">
-            <div className="text-center space-y-3">
-              <div className="animate-spin w-8 h-8 border-2 border-blue-500 border-t-transparent rounded-full mx-auto" />
-              <h2 className="text-lg font-medium text-gray-200">
-                {health.writePressure === 'high' ? 'Database Under Heavy Load' : 'Rebuilding Database'}
-              </h2>
-              <p className="text-sm text-gray-500">
-                {health.writePressure === 'high'
-                  ? 'Write pressure is high — compaction in progress. Dashboard will resume automatically when the database stabilizes.'
-                  : 'Indexes are being rebuilt. Dashboard will resume automatically.'}
-              </p>
-              <p className="text-xs text-gray-600">Events are still being ingested during this time.</p>
-              <button
-                onClick={() => setDismissRebuilding(true)}
-                className="mt-2 px-4 py-1.5 text-xs bg-gray-800 border border-gray-700 text-gray-400 rounded hover:bg-gray-700 hover:text-gray-200 transition-colors"
-              >
-                Dismiss — Load Dashboard Anyway
-              </button>
-            </div>
-          </div>
-        ) : children}
+        {children}
       </div>
+
+      {/* Heavy load overlay — sits on top of content, does not unmount it */}
+      {health?.rebuilding && !dismissRebuilding && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-gray-950/80 backdrop-blur-sm">
+          <div className="text-center space-y-3">
+            <div className="animate-spin w-8 h-8 border-2 border-blue-500 border-t-transparent rounded-full mx-auto" />
+            <h2 className="text-lg font-medium text-gray-200">
+              {health.writePressure === 'high' ? 'Database Under Heavy Load' : 'Rebuilding Database'}
+            </h2>
+            <p className="text-sm text-gray-500">
+              {health.writePressure === 'high'
+                ? 'Write pressure is high — compaction in progress. Dashboard will resume automatically when the database stabilizes.'
+                : 'Indexes are being rebuilt. Dashboard will resume automatically.'}
+            </p>
+            <p className="text-xs text-gray-600">Events are still being ingested during this time.</p>
+            <button
+              onClick={() => setDismissRebuilding(true)}
+              className="mt-2 px-4 py-1.5 text-xs bg-gray-800 border border-gray-700 text-gray-400 rounded hover:bg-gray-700 hover:text-gray-200 transition-colors"
+            >
+              Dismiss — Load Dashboard Anyway
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
