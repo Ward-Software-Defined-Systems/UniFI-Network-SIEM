@@ -54,17 +54,15 @@ class WardsonDbBackend extends StorageBackend {
 
   async _request(method, path, body = null, retries = 3, timeoutMs = this.queryTimeoutMs) {
     const url = `${this.baseUrl}${path}`;
-    const opts = {
-      method,
-      headers: { 'Content-Type': 'application/json' },
-      signal: AbortSignal.timeout(timeoutMs),
-    };
-
-    if (this.apiKey) opts.headers['Authorization'] = `Bearer ${this.apiKey}`;
-    if (body) opts.body = JSON.stringify(body);
+    const headers = { 'Content-Type': 'application/json' };
+    if (this.apiKey) headers['Authorization'] = `Bearer ${this.apiKey}`;
+    const bodyStr = body ? JSON.stringify(body) : null;
 
     for (let attempt = 0; attempt <= retries; attempt++) {
       try {
+        // Create a fresh AbortSignal per attempt — a shared signal would starve retries
+        const opts = { method, headers, signal: AbortSignal.timeout(timeoutMs) };
+        if (bodyStr) opts.body = bodyStr;
         const resp = await fetch(url, opts);
         const json = await resp.json();
 
