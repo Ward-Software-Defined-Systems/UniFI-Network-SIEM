@@ -99,7 +99,7 @@ export default function Layout({ activeView, onViewChange, children }) {
 
       {/* Heavy load overlay — sits on top of content, does not unmount it */}
       {health?.rebuilding && !dismissRebuilding && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-gray-950/80 backdrop-blur-sm">
+        <div className="fixed inset-0 z-[9999] flex items-center justify-center bg-gray-950/80 backdrop-blur-sm">
           <div className="text-center space-y-3">
             <div className="animate-spin w-8 h-8 border-2 border-blue-500 border-t-transparent rounded-full mx-auto" />
             <h2 className="text-lg font-medium text-gray-200">
