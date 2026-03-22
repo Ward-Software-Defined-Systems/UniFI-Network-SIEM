@@ -25,6 +25,7 @@ class WardsonDbBackend extends StorageBackend {
     this.cacheCollection = 'enrichment_cache';
     this.queryTimeoutMs = config.queryTimeoutMs || 30000;
     this.healthTimeoutMs = config.healthTimeoutMs || 5000;
+    this.huntTimeoutMs = config.huntTimeoutMs || 60000;
 
     // If TLS with self-signed certs, disable Node's TLS verification globally
     // Node's native fetch doesn't support per-request agent/dispatcher options
@@ -130,7 +131,7 @@ class WardsonDbBackend extends StorageBackend {
       this._cachedDocCount = null; // Unknown — don't short-circuit to empty results
     }
 
-    logger.info({ backend: 'wardsondb', docCount: this._cachedDocCount, queryTimeoutMs: this.queryTimeoutMs, healthTimeoutMs: this.healthTimeoutMs }, 'Storage backend initialized');
+    logger.info({ backend: 'wardsondb', docCount: this._cachedDocCount, queryTimeoutMs: this.queryTimeoutMs, healthTimeoutMs: this.healthTimeoutMs, huntTimeoutMs: this.huntTimeoutMs }, 'Storage backend initialized');
   }
 
   _getRequiredIndexes() {
