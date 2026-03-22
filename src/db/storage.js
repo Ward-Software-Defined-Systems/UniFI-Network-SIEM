@@ -37,6 +37,7 @@ async function initialize() {
     try {
       activeBackend = createBackend(engineId, {
         ...engineConfig,
+        ...config.wardsondb,
         abuseIpDbCacheHours: config.enrichment.abuseIpDbCacheHours,
       });
       await activeBackend.initialize();

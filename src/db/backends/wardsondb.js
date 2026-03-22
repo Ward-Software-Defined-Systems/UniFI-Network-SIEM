@@ -23,6 +23,8 @@ class WardsonDbBackend extends StorageBackend {
     this.verifyCerts = config.verifyCerts !== false; // default true
     this.eventsCollection = 'events';
     this.cacheCollection = 'enrichment_cache';
+    this.queryTimeoutMs = config.queryTimeoutMs || 30000;
+    this.healthTimeoutMs = config.healthTimeoutMs || 5000;
 
     // If TLS with self-signed certs, disable Node's TLS verification globally
     // Node's native fetch doesn't support per-request agent/dispatcher options
@@ -49,7 +51,7 @@ class WardsonDbBackend extends StorageBackend {
 
   // --- HTTP Client ---
 
-  async _request(method, path, body = null, retries = 3, timeoutMs = 30000) {
+  async _request(method, path, body = null, retries = 3, timeoutMs = this.queryTimeoutMs) {
     const url = `${this.baseUrl}${path}`;
     const opts = {
       method,
@@ -160,7 +162,7 @@ class WardsonDbBackend extends StorageBackend {
     const POLL_INTERVAL = 30000; // 30s between retries when write_pressure is high
     while (true) {
       try {
-        const health = await this._request('GET', '/_health', null, 0, 5000);
+        const health = await this._request('GET', '/_health', null, 0, this.healthTimeoutMs);
         if (health.data?.write_pressure !== 'high') return;
         logger.info('WardSONDB write_pressure is high — waiting 30s before next index');
       } catch (err) {
@@ -218,8 +220,8 @@ class WardsonDbBackend extends StorageBackend {
       // Only call /_health and /_stats (both are fast O(1) endpoints).
       // SKIP /{collection}/storage — it can hang/block on WardSONDB (known issue with
       // empty or freshly-indexed collections). Use /_stats.total_documents instead.
-      const health = await this._request('GET', '/_health', null, 0, 5000);
-      const stats = await this._request('GET', '/_stats', null, 0, 5000);
+      const health = await this._request('GET', '/_health', null, 0, this.healthTimeoutMs);
+      const stats = await this._request('GET', '/_stats', null, 0, this.healthTimeoutMs);
 
       // Update cached doc count from stats — preserve last known good value if /_stats returns unexpected shape
       const totalDocs = typeof stats.data.total_documents === 'number' ? stats.data.total_documents : this._cachedDocCount;

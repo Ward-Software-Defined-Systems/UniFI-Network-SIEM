@@ -24,6 +24,11 @@ const config = {
     insertBatchIntervalMs: parseInt(process.env.INSERT_BATCH_INTERVAL_MS || '500', 10),
     wsBroadcastThrottleMs: parseInt(process.env.WS_BROADCAST_THROTTLE_MS || '100', 10),
   },
+  wardsondb: {
+    queryTimeoutMs: parseInt(process.env.WARDSONDB_QUERY_TIMEOUT_MS || '30000', 10),
+    healthTimeoutMs: parseInt(process.env.WARDSONDB_HEALTH_TIMEOUT_MS || '5000', 10),
+    huntTimeoutMs: parseInt(process.env.WARDSONDB_HUNT_TIMEOUT_MS || '60000', 10),
+  },
   logging: {
     level: process.env.LOG_LEVEL || 'info',
     logRawMessages: process.env.LOG_RAW_MESSAGES === 'true',

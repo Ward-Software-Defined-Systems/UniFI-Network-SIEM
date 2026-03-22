@@ -19,7 +19,8 @@ function withTimeout(promise, ms, fallback) {
   ]);
 }
 
-const HEALTH_TIMEOUT_MS = 8000; // Timeout for backend health queries — must be shorter than the 10s poll interval to prevent overlap
+// Must be longer than the backend's own health timeout to avoid the wrapper timing out first
+const HEALTH_TIMEOUT_MS = config.wardsondb.healthTimeoutMs + 3000;
 
 router.get('/', async (req, res) => {
   try {
