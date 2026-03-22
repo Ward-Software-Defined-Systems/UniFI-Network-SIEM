@@ -52,17 +52,15 @@ class WardsonDbBackend extends StorageBackend {
 
   // --- HTTP Client ---
 
-  async _request(method, path, body = null, retries = 3, timeoutMs = this.queryTimeoutMs) {
+  async _request(method, path, body = null, retries = 3) {
     const url = `${this.baseUrl}${path}`;
     const headers = { 'Content-Type': 'application/json' };
     if (this.apiKey) headers['Authorization'] = `Bearer ${this.apiKey}`;
-    const bodyStr = body ? JSON.stringify(body) : null;
+    const opts = { method, headers };
+    if (body) opts.body = JSON.stringify(body);
 
     for (let attempt = 0; attempt <= retries; attempt++) {
       try {
-        // Create a fresh AbortSignal per attempt — a shared signal would starve retries
-        const opts = { method, headers, signal: AbortSignal.timeout(timeoutMs) };
-        if (bodyStr) opts.body = bodyStr;
         const resp = await fetch(url, opts);
         const json = await resp.json();
 
@@ -80,8 +78,8 @@ class WardsonDbBackend extends StorageBackend {
 
         return json;
       } catch (err) {
-        // Retry on network errors (ETIMEDOUT, ECONNREFUSED, fetch failed)
-        if (attempt < retries && (err.cause || err.message?.includes('fetch failed'))) {
+        // Retry on network errors (ECONNREFUSED, fetch failed) — not slow queries
+        if (attempt < retries && err.message?.includes('fetch failed')) {
           logger.debug({ err: err.message, attempt, path }, 'WardSONDB request failed, retrying');
           await new Promise(r => setTimeout(r, 500 * (attempt + 1)));
           continue;
@@ -89,6 +87,17 @@ class WardsonDbBackend extends StorageBackend {
         throw err;
       }
     }
+  }
+
+  /** Health/stats check with a short timeout — should fail fast, no retries */
+  async _healthRequest(path) {
+    const url = `${this.baseUrl}${path}`;
+    const headers = { 'Content-Type': 'application/json' };
+    if (this.apiKey) headers['Authorization'] = `Bearer ${this.apiKey}`;
+    const resp = await fetch(url, { method: 'GET', headers, signal: AbortSignal.timeout(this.healthTimeoutMs) });
+    const json = await resp.json();
+    if (!json.ok) throw new Error(`WardSONDB ${json.error?.code}: ${json.error?.message}`);
+    return json;
   }
 
   async _get(path) { return this._request('GET', path); }
@@ -161,7 +170,7 @@ class WardsonDbBackend extends StorageBackend {
     const POLL_INTERVAL = 30000; // 30s between retries when write_pressure is high
     while (true) {
       try {
-        const health = await this._request('GET', '/_health', null, 0, this.healthTimeoutMs);
+        const health = await this._healthRequest('/_health');
         if (health.data?.write_pressure !== 'high') return;
         logger.info('WardSONDB write_pressure is high — waiting 30s before next index');
       } catch (err) {
@@ -219,8 +228,8 @@ class WardsonDbBackend extends StorageBackend {
       // Only call /_health and /_stats (both are fast O(1) endpoints).
       // SKIP /{collection}/storage — it can hang/block on WardSONDB (known issue with
       // empty or freshly-indexed collections). Use /_stats.total_documents instead.
-      const health = await this._request('GET', '/_health', null, 0, this.healthTimeoutMs);
-      const stats = await this._request('GET', '/_stats', null, 0, this.healthTimeoutMs);
+      const health = await this._healthRequest('/_health');
+      const stats = await this._healthRequest('/_stats');
 
       // Update cached doc count from stats — preserve last known good value if /_stats returns unexpected shape
       const totalDocs = typeof stats.data.total_documents === 'number' ? stats.data.total_documents : this._cachedDocCount;

@@ -191,8 +191,8 @@ async function gatherLocalIntelWardsonDB(target) {
   const col = 'events';
   const cacheCol = 'enrichment_cache';
 
-  // Threat hunt queries can be heavy (timeline pages through up to 100K docs) — use longer timeout
-  const post = (path, body) => backend._request('POST', path, body, 3, backend.huntTimeoutMs);
+  // Threat hunt queries can be heavy — no client-side timeout, let WardSONDB handle it
+  const post = (path, body) => backend._request('POST', path, body, 3);
 
   // All queries run in parallel for speed
   const ipFilter = { '$or': [{ 'network.src_ip': target }, { 'network.dst_ip': target }] };
