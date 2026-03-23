@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { Activity, BarChart3, Crosshair, Globe, Heart, Settings, Shield } from 'lucide-react';
 import { getHealth } from '../lib/api';
 import { formatNumber } from '../lib/format';
@@ -15,6 +15,7 @@ const NAV_ITEMS = [
 export default function Layout({ activeView, onViewChange, rebuilding: appRebuilding, setRebuilding, children }) {
   const [health, setHealth] = useState(null);
   const [dismissRebuilding, setDismissRebuilding] = useState(false);
+  const seenRebuilding = useRef(false);
 
   // Either App-level (immediate on confirm) or health-poll (server-reported) can trigger
   const showRebuilding = appRebuilding || health?.rebuilding;
@@ -27,8 +28,12 @@ export default function Layout({ activeView, onViewChange, rebuilding: appRebuil
   useEffect(() => {
     const fetchHealth = () => getHealth().then((h) => {
       setHealth(h);
-      // Clear App-level rebuilding flag when health comes back clean
-      if (!h.rebuilding && h.writePressure !== 'high') {
+      // Track when server confirms rebuild mode before allowing clear
+      if (h.rebuilding) {
+        seenRebuilding.current = true;
+      }
+      if (seenRebuilding.current && !h.rebuilding && h.writePressure !== 'high') {
+        seenRebuilding.current = false;
         setRebuilding?.(false);
       }
     }).catch(() => {});
