@@ -102,6 +102,8 @@ function getResetGraceStatus() {
 }
 
 router.post('/reset-db', async (req, res) => {
+  // Pause syslog ingestion to avoid write contention during reset
+  req.app.locals.pauseSyslog?.();
   try {
     const backend = storage.getBackend();
     await backend.resetData();
@@ -109,6 +111,8 @@ router.post('/reset-db', async (req, res) => {
     res.json({ ok: true, gracePeriod: RESET_GRACE_SECONDS });
   } catch (err) {
     res.status(500).json({ error: 'Failed to reset database' });
+  } finally {
+    req.app.locals.resumeSyslog?.();
   }
 });
 

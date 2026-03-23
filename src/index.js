@@ -1,7 +1,7 @@
 const config = require('./config');
 const logger = require('./utils/logger');
 const storage = require('./db/storage');
-const { createSyslogServer } = require('./collector/syslog-server');
+const { createSyslogServer, pause: pauseSyslog, resume: resumeSyslog } = require('./collector/syslog-server');
 const { createServer } = require('./api/server');
 const { broadcastEvent } = require('./api/websocket');
 const { initGeoIp } = require('./enrichment/geoip');
@@ -115,7 +115,9 @@ async function main() {
   });
 
   // Start HTTP + WebSocket server
-  createServer();
+  const { app } = createServer();
+  app.locals.pauseSyslog = pauseSyslog;
+  app.locals.resumeSyslog = resumeSyslog;
 
   // Start syslog collector
   createSyslogServer(config.syslog.port, (event) => {

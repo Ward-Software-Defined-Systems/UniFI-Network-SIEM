@@ -2,10 +2,13 @@ const dgram = require('dgram');
 const logger = require('../utils/logger');
 const { parseMessage } = require('./parsers');
 
+let paused = false;
+
 function createSyslogServer(port, onEvent) {
   const server = dgram.createSocket('udp4');
 
   server.on('message', (msg, rinfo) => {
+    if (paused) return;
     const raw = msg.toString('utf8').trim();
     if (!raw) return;
 
@@ -31,4 +34,14 @@ function createSyslogServer(port, onEvent) {
   return server;
 }
 
-module.exports = { createSyslogServer };
+function pause() {
+  paused = true;
+  logger.info('Syslog ingestion paused');
+}
+
+function resume() {
+  paused = false;
+  logger.info('Syslog ingestion resumed');
+}
+
+module.exports = { createSyslogServer, pause, resume };
