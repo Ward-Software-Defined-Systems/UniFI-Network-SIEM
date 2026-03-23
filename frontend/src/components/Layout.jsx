@@ -12,7 +12,7 @@ const NAV_ITEMS = [
   { id: 'settings', label: 'Settings', icon: Settings },
 ];
 
-export default function Layout({ activeView, onViewChange, rebuilding: appRebuilding, children }) {
+export default function Layout({ activeView, onViewChange, rebuilding: appRebuilding, setRebuilding, children }) {
   const [health, setHealth] = useState(null);
   const [dismissRebuilding, setDismissRebuilding] = useState(false);
 
@@ -25,7 +25,13 @@ export default function Layout({ activeView, onViewChange, rebuilding: appRebuil
   }, [showRebuilding]);
 
   useEffect(() => {
-    const fetchHealth = () => getHealth().then(setHealth).catch(() => {});
+    const fetchHealth = () => getHealth().then((h) => {
+      setHealth(h);
+      // Clear App-level rebuilding flag when health comes back clean
+      if (!h.rebuilding && h.writePressure !== 'high') {
+        setRebuilding?.(false);
+      }
+    }).catch(() => {});
     fetchHealth();
     const interval = setInterval(fetchHealth, 10000);
     return () => clearInterval(interval);

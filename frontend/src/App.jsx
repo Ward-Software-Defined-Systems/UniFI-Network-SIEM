@@ -19,7 +19,7 @@ export default function App() {
   const refreshProps = { refreshRate, setRefreshRate, paused, setPaused };
 
   return (
-    <Layout activeView={view} onViewChange={setView} rebuilding={rebuilding}>
+    <Layout activeView={view} onViewChange={setView} rebuilding={rebuilding} setRebuilding={setRebuilding}>
       {view === 'live' && <LiveStream />}
       {view === 'dashboard' && <Dashboard period={period} setPeriod={setPeriod} {...refreshProps} />}
       {view === 'map' && <LiveMap period={period} setPeriod={setPeriod} {...refreshProps} />}
