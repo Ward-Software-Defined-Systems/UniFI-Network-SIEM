@@ -128,8 +128,9 @@ class WardsonDbBackend extends StorageBackend {
       logger.info({ indexCount }, 'WardSONDB indexes already exist, skipping deferred creation');
       this.indexesReady = Promise.resolve();
     } else {
-      // Start background index creation — write-pressure gated, no ingestion pause
+      // Start background index creation — write-pressure check skipped during init
       // indexesReady resolves when all indexes are created (or on failure, to avoid stalling ingestion)
+      this._isInitializing = true;
       this.indexesReady = new Promise(resolve => { this._resolveIndexesReady = resolve; });
       this._startDeferredIndexCreation();
     }
@@ -168,14 +169,18 @@ class WardsonDbBackend extends StorageBackend {
 
     // Fire-and-forget — do not await. Resolves indexesReady on completion or failure.
     this._createIndexesSequentially(INDEX_DELAY).then(() => {
+      this._isInitializing = false;
       this._resolveIndexesReady?.();
     }).catch(err => {
       logger.error({ err: err.message }, 'WardSONDB background index creation failed');
+      this._isInitializing = false;
       this._resolveIndexesReady?.(); // Always resolve to avoid stalling ingestion
     });
   }
 
   async _waitForLowWritePressure() {
+    // During initialization, ingestion is paused — no compaction risk, skip the check
+    if (this._isInitializing) return;
     const POLL_INTERVAL = 30000; // 30s between retries when write_pressure is high
     while (true) {
       try {
@@ -1274,7 +1279,8 @@ class WardsonDbBackend extends StorageBackend {
     await this._ensureCollection(this.eventsCollection);
     await this._ensureCollection(this.cacheCollection);
     this._cachedDocCount = 0;
-    // Re-create indexes on the fresh collection
+    // Re-create indexes on the fresh collection — skip write-pressure check during init
+    this._isInitializing = true;
     this.indexesReady = new Promise(resolve => { this._resolveIndexesReady = resolve; });
     this._startDeferredIndexCreation();
   }
