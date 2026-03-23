@@ -8,6 +8,10 @@ class StorageBackend {
   constructor(name, config = {}) {
     this.name = name;
     this.config = config;
+    // Promise that resolves when indexes are built and the backend is ready
+    // for production ingestion. Must be set during initialize() before returning.
+    // Backends with no deferred index work should set this to Promise.resolve().
+    this.indexesReady = Promise.resolve();
   }
 
   /** Initialize connection/resources. Called once on startup. */

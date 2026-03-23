@@ -102,11 +102,17 @@ function getResetGraceStatus() {
 }
 
 router.post('/reset-db', async (req, res) => {
-  // Pause syslog ingestion to avoid write contention during reset
+  // Pause syslog ingestion to avoid write contention during reset + index creation
   req.app.locals.pauseSyslog?.();
   try {
     const backend = storage.getBackend();
     await backend.resetData();
+    // Wait for indexes to be fully built before resuming ingestion (WardSONDB).
+    // SQLite resolves immediately. 5-minute safety ceiling prevents permanent pause.
+    await Promise.race([
+      backend.indexesReady,
+      new Promise(resolve => setTimeout(resolve, 300_000)),
+    ]);
     lastResetAt = Date.now();
     res.json({ ok: true, gracePeriod: RESET_GRACE_SECONDS });
   } catch (err) {
