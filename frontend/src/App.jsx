@@ -14,17 +14,18 @@ export default function App() {
   const [period, setPeriod] = useState('1h');
   const [refreshRate, setRefreshRate] = useState(DEFAULT_REFRESH);
   const [paused, setPaused] = useState(true);
+  const [rebuilding, setRebuilding] = useState(false);
 
   const refreshProps = { refreshRate, setRefreshRate, paused, setPaused };
 
   return (
-    <Layout activeView={view} onViewChange={setView}>
+    <Layout activeView={view} onViewChange={setView} rebuilding={rebuilding}>
       {view === 'live' && <LiveStream />}
       {view === 'dashboard' && <Dashboard period={period} setPeriod={setPeriod} {...refreshProps} />}
       {view === 'map' && <LiveMap period={period} setPeriod={setPeriod} {...refreshProps} />}
       {view === 'intel' && <ThreatIntel period={period} setPeriod={setPeriod} {...refreshProps} />}
       {view === 'hunt' && <ThreatHunt />}
-      {view === 'settings' && <Settings />}
+      {view === 'settings' && <Settings setRebuilding={setRebuilding} />}
     </Layout>
   );
 }

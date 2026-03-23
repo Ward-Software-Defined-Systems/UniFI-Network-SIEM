@@ -12,14 +12,17 @@ const NAV_ITEMS = [
   { id: 'settings', label: 'Settings', icon: Settings },
 ];
 
-export default function Layout({ activeView, onViewChange, children }) {
+export default function Layout({ activeView, onViewChange, rebuilding: appRebuilding, children }) {
   const [health, setHealth] = useState(null);
   const [dismissRebuilding, setDismissRebuilding] = useState(false);
 
+  // Either App-level (immediate on confirm) or health-poll (server-reported) can trigger
+  const showRebuilding = appRebuilding || health?.rebuilding;
+
   // Reset dismiss flag when rebuilding clears
   useEffect(() => {
-    if (!health?.rebuilding && dismissRebuilding) setDismissRebuilding(false);
-  }, [health?.rebuilding]);
+    if (!showRebuilding && dismissRebuilding) setDismissRebuilding(false);
+  }, [showRebuilding]);
 
   useEffect(() => {
     const fetchHealth = () => getHealth().then(setHealth).catch(() => {});
@@ -97,8 +100,8 @@ export default function Layout({ activeView, onViewChange, children }) {
         {children}
       </div>
 
-      {/* Heavy load overlay — sits on top of content, does not unmount it */}
-      {health?.rebuilding && !dismissRebuilding && (
+      {/* Heavy load / rebuilding overlay — sits on top of content, does not unmount it */}
+      {showRebuilding && !dismissRebuilding && (
         <div className="fixed inset-0 z-[9999] flex items-center justify-center bg-gray-950/80 backdrop-blur-sm">
           <div className="text-center space-y-3">
             <div className="animate-spin w-8 h-8 border-2 border-blue-500 border-t-transparent rounded-full mx-auto" />

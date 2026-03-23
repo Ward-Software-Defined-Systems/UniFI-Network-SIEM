@@ -163,7 +163,7 @@ class WardsonDbBackend extends StorageBackend {
   }
 
   _startDeferredIndexCreation() {
-    const INDEX_DELAY = 5000; // 5 seconds between each index creation
+    const INDEX_DELAY = 1000; // 1 second between each index creation
 
     logger.info('WardSONDB starting background index creation (write-pressure gated)');
 
@@ -181,7 +181,7 @@ class WardsonDbBackend extends StorageBackend {
   async _waitForLowWritePressure() {
     // During initialization, ingestion is paused — no compaction risk, skip the check
     if (this._isInitializing) return;
-    const POLL_INTERVAL = 30000; // 30s between retries when write_pressure is high
+    const POLL_INTERVAL = 10000; // 10s between retries when write_pressure is high
     while (true) {
       try {
         const health = await this._healthRequest('/_health');

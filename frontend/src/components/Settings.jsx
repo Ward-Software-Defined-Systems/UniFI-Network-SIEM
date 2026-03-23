@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { getHealth, fetchApi } from '../lib/api';
 import { CheckCircle, XCircle, Database, Server, Zap, ExternalLink } from 'lucide-react';
 
-export default function Settings() {
+export default function Settings({ setRebuilding }) {
   const [health, setHealth] = useState(null);
   const [abuseKey, setAbuseKey] = useState('');
   const [hasExistingKey, setHasExistingKey] = useState(false);
@@ -323,13 +323,17 @@ export default function Settings() {
           <div className="flex items-center gap-3">
             <button
               onClick={async () => {
+                setRebuilding?.(true);
                 try {
                   await fetch('/api/settings/reset-db', { method: 'POST' });
                   setResetDone(true);
                   setConfirmReset(false);
                   getHealth().then(setHealth).catch(() => {});
                   setTimeout(() => setResetDone(false), 5000);
-                } catch {}
+                  // Do NOT setRebuilding(false) on success — the health poll clears it
+                } catch {
+                  setRebuilding?.(false);
+                }
               }}
               className="px-4 py-2 text-sm bg-red-600 text-white rounded hover:bg-red-500 transition-colors"
             >
