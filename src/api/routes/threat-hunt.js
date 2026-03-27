@@ -66,7 +66,7 @@ router.put('/settings', (req, res) => {
   }
 });
 
-// POST /api/threat-hunt/investigate
+// POST /api/threat-hunt/investigate (non-streaming fallback)
 router.post('/investigate', async (req, res) => {
   loadSettings();
   const { target } = req.body;
@@ -97,6 +97,65 @@ router.post('/investigate', async (req, res) => {
   } catch (err) {
     logger.warn({ err, target }, 'Threat hunt investigation failed');
     res.status(500).json({ error: err.message || 'Investigation failed' });
+  }
+});
+
+// POST /api/threat-hunt/investigate-stream (SSE streaming)
+router.post('/investigate-stream', async (req, res) => {
+  loadSettings();
+  const { target } = req.body;
+  if (!target) return res.status(400).json({ error: 'Target IP or hostname required' });
+
+  const key = getActiveKey();
+  if (!key) return res.status(400).json({ error: `No API key configured for ${huntSettings.provider}` });
+
+  // SSE headers
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+
+  const sendEvent = (event, data) => {
+    res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  };
+
+  try {
+    const intel = await gatherLocalIntel(target);
+    const external = await gatherExternalIntel(target);
+    const timestamp = new Date().toISOString();
+
+    // Send metadata immediately so frontend can render intel panels
+    sendEvent('metadata', {
+      target,
+      provider: huntSettings.provider,
+      intel,
+      external,
+      timestamp,
+    });
+
+    const prompt = buildInvestigationPrompt(target, intel, external);
+    const provider = huntSettings.provider;
+
+    switch (provider) {
+      case 'anthropic':
+        await callAnthropicStream(prompt, key, sendEvent);
+        break;
+      case 'openai':
+        await callOpenAIStream(prompt, key, sendEvent);
+        break;
+      case 'gemini':
+        await callGeminiStream(prompt, key, sendEvent);
+        break;
+      default:
+        sendEvent('error', { error: `Unknown provider: ${provider}` });
+    }
+
+    sendEvent('done', {});
+    res.end();
+  } catch (err) {
+    logger.warn({ err, target }, 'Threat hunt streaming investigation failed');
+    sendEvent('error', { error: err.message || 'Investigation failed' });
+    res.end();
   }
 });
 
@@ -494,7 +553,8 @@ async function callAnthropic(prompt, key) {
     },
     body: JSON.stringify({
       model: 'claude-opus-4-6',
-      max_tokens: 4096,
+      max_tokens: 128000,
+      thinking: { type: 'adaptive', display: 'summarized' },
       messages: [{ role: 'user', content: prompt }],
     }),
   });
@@ -505,7 +565,9 @@ async function callAnthropic(prompt, key) {
   }
 
   const data = await res.json();
-  return data.content?.[0]?.text || 'No response from Anthropic';
+  // With thinking enabled, find the text content block (skip thinking blocks)
+  const textBlock = data.content?.find(b => b.type === 'text');
+  return textBlock?.text || 'No response from Anthropic';
 }
 
 async function callOpenAI(prompt, key) {
@@ -517,7 +579,7 @@ async function callOpenAI(prompt, key) {
     },
     body: JSON.stringify({
       model: 'gpt-5.4',
-      max_tokens: 4096,
+      max_tokens: 128000,
       messages: [{ role: 'user', content: prompt }],
     }),
   });
@@ -537,7 +599,7 @@ async function callGemini(prompt, key) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       contents: [{ parts: [{ text: prompt }] }],
-      generationConfig: { maxOutputTokens: 4096 },
+      generationConfig: { maxOutputTokens: 65536 },
     }),
   });
 
@@ -548,6 +610,125 @@ async function callGemini(prompt, key) {
 
   const data = await res.json();
   return data.candidates?.[0]?.content?.parts?.[0]?.text || 'No response from Gemini';
+}
+
+// --- Streaming provider functions ---
+
+// Helper: parse SSE lines from a ReadableStream
+async function* parseSSEStream(body) {
+  const decoder = new TextDecoder();
+  let buffer = '';
+  for await (const chunk of body) {
+    buffer += decoder.decode(chunk, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop(); // keep incomplete line in buffer
+    let eventType = null;
+    for (const line of lines) {
+      if (line.startsWith('event: ')) {
+        eventType = line.slice(7).trim();
+      } else if (line.startsWith('data: ')) {
+        const data = line.slice(6);
+        try {
+          yield { event: eventType, data: JSON.parse(data) };
+        } catch {
+          yield { event: eventType, data };
+        }
+        eventType = null;
+      }
+    }
+  }
+}
+
+async function callAnthropicStream(prompt, key, sendEvent) {
+  const res = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': key,
+      'anthropic-version': '2023-06-01',
+    },
+    body: JSON.stringify({
+      model: 'claude-opus-4-6',
+      max_tokens: 128000,
+      thinking: { type: 'adaptive', display: 'summarized' },
+      stream: true,
+      messages: [{ role: 'user', content: prompt }],
+    }),
+  });
+
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`Anthropic API error ${res.status}: ${err}`);
+  }
+
+  for await (const { data } of parseSSEStream(res.body)) {
+    if (!data || typeof data !== 'object') continue;
+
+    if (data.type === 'content_block_start') {
+      if (data.content_block?.type === 'thinking') {
+        sendEvent('thinking_start', {});
+      } else if (data.content_block?.type === 'text') {
+        sendEvent('text_start', {});
+      }
+    } else if (data.type === 'content_block_delta') {
+      if (data.delta?.type === 'thinking_delta') {
+        sendEvent('thinking', { text: data.delta.thinking });
+      } else if (data.delta?.type === 'text_delta') {
+        sendEvent('chunk', { text: data.delta.text });
+      }
+      // skip signature_delta — not needed for single-turn
+    }
+  }
+}
+
+async function callOpenAIStream(prompt, key, sendEvent) {
+  const res = await fetch('https://api.openai.com/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${key}`,
+    },
+    body: JSON.stringify({
+      model: 'gpt-5.4',
+      max_tokens: 128000,
+      stream: true,
+      messages: [{ role: 'user', content: prompt }],
+    }),
+  });
+
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`OpenAI API error ${res.status}: ${err}`);
+  }
+
+  for await (const { data } of parseSSEStream(res.body)) {
+    if (data === '[DONE]') break;
+    if (!data || typeof data !== 'object') continue;
+    const text = data.choices?.[0]?.delta?.content;
+    if (text) sendEvent('chunk', { text });
+  }
+}
+
+async function callGeminiStream(prompt, key, sendEvent) {
+  const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-pro:streamGenerateContent?alt=sse&key=${key}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: { maxOutputTokens: 65536 },
+    }),
+  });
+
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`Gemini API error ${res.status}: ${err}`);
+  }
+
+  for await (const { data } of parseSSEStream(res.body)) {
+    if (!data || typeof data !== 'object') continue;
+    const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (text) sendEvent('chunk', { text });
+  }
 }
 
 module.exports = router;

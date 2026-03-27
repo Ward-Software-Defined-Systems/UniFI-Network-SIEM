@@ -335,23 +335,34 @@ class SqliteBackend extends StorageBackend {
   }
 
   async getTimeline(since, bucketFormat, eventType, bucketSize) {
-    const ALLOWED_BUCKET_FORMATS = [
-      '%Y-%m-%dT%H:%M:00Z',
-      '%Y-%m-%dT%H:00:00Z',
-      '%Y-%m-%dT00:00:00Z',
-    ];
-    if (!ALLOWED_BUCKET_FORMATS.includes(bucketFormat)) {
-      throw new Error(`Invalid bucket format: ${bucketFormat}`);
+    // Derive bucket interval and strftime format from bucketSize (ignores bucketFormat)
+    const bucketMs = { '5m': 300000, '15m': 900000, '1h': 3600000, '1d': 86400000 }[bucketSize || '1h'] || 3600000;
+    const formatMap = { '5m': '%Y-%m-%dT%H:%M', '15m': '%Y-%m-%dT%H:%M', '1h': '%Y-%m-%dT%H', '1d': '%Y-%m-%d' };
+    const sqlFormat = formatMap[bucketSize || '1h'] || '%Y-%m-%dT%H';
+
+    // Pre-generate zero-filled bucket map aligned to bucket boundaries
+    const startTime = new Date(Math.floor(new Date(since).getTime() / bucketMs) * bucketMs);
+    const endTime = new Date(Math.floor(Date.now() / bucketMs) * bucketMs);
+    const numBuckets = Math.floor((endTime - startTime) / bucketMs) + 1;
+
+    const buckets = new Map();
+    for (let i = 0; i < numBuckets; i++) {
+      const ts = new Date(startTime.getTime() + i * bucketMs).toISOString();
+      buckets.set(ts, eventType === 'firewall'
+        ? { ts, allowed: 0, blocked: 0 }
+        : { ts, firewall: 0, threat: 0, dhcp: 0, dns_filter: 0, wifi: 0, admin: 0, system: 0, total: 0 });
     }
+
+    // Single GROUP BY query — efficient, then merge into pre-generated buckets
     let sql;
     if (eventType === 'firewall') {
-      sql = `SELECT strftime('${bucketFormat}', received_at) as ts,
+      sql = `SELECT strftime('${sqlFormat}', received_at) as ts,
               SUM(CASE WHEN action='allow' THEN 1 ELSE 0 END) as allowed,
               SUM(CASE WHEN action='block' THEN 1 ELSE 0 END) as blocked
              FROM events WHERE event_type='firewall' AND received_at >= ?
              GROUP BY ts ORDER BY ts`;
     } else {
-      sql = `SELECT strftime('${bucketFormat}', received_at) as ts,
+      sql = `SELECT strftime('${sqlFormat}', received_at) as ts,
               SUM(CASE WHEN event_type='firewall' THEN 1 ELSE 0 END) as firewall,
               SUM(CASE WHEN event_type='threat' THEN 1 ELSE 0 END) as threat,
               SUM(CASE WHEN event_type='dhcp' THEN 1 ELSE 0 END) as dhcp,
@@ -363,7 +374,30 @@ class SqliteBackend extends StorageBackend {
              FROM events WHERE received_at >= ?
              GROUP BY ts ORDER BY ts`;
     }
-    return this.db.prepare(sql).all(since);
+
+    const rows = this.db.prepare(sql).all(since);
+    for (const row of rows) {
+      const aligned = new Date(Math.floor(new Date(row.ts).getTime() / bucketMs) * bucketMs);
+      const key = aligned.toISOString();
+      if (buckets.has(key)) {
+        const bucket = buckets.get(key);
+        if (eventType === 'firewall') {
+          bucket.allowed += row.allowed;
+          bucket.blocked += row.blocked;
+        } else {
+          bucket.firewall += row.firewall;
+          bucket.threat += row.threat;
+          bucket.dhcp += row.dhcp;
+          bucket.dns_filter += row.dns_filter;
+          bucket.wifi += row.wifi;
+          bucket.admin += row.admin;
+          bucket.system += row.system;
+          bucket.total += row.total;
+        }
+      }
+    }
+
+    return Array.from(buckets.values());
   }
 
   async getTopTalkers(since, direction, limit, excludePrivate) {

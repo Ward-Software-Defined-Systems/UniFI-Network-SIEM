@@ -289,6 +289,26 @@
   to { transform: rotate(360deg); }
 }
 
+.thinking-indicator {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.75rem 1rem;
+  color: #a78bfa;
+  font-size: 0.9rem;
+  font-style: italic;
+}
+
+.thinking-spinner {
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  border: 2px solid rgba(167, 139, 250, 0.3);
+  border-top-color: #a78bfa;
+  border-radius: 50%;
+  animation: spin 0.6s linear infinite;
+}
+
 .input-hint {
   font-size: 0.75rem;
   color: #64748b;

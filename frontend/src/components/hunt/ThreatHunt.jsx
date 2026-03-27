@@ -32,6 +32,7 @@ export default function ThreatHunt() {
   const [settingsSaved, setSettingsSaved] = useState(false);
   const [target, setTarget] = useState('');
   const [investigating, setInvestigating] = useState(false);
+  const [thinking, setThinking] = useState(false);
   const [result, setResult] = useState(null);
   const [error, setError] = useState(null);
   const [history, setHistory] = useState([]);
@@ -77,28 +78,82 @@ export default function ThreatHunt() {
   const investigate = async () => {
     if (!target.trim()) return;
     setInvestigating(true);
+    setThinking(false);
     setError(null);
     setResult(null);
 
     try {
-      const res = await fetch('/api/threat-hunt/investigate', {
+      const res = await fetch('/api/threat-hunt/investigate-stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ target: target.trim() }),
       });
 
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Investigation failed');
+      if (!res.ok) {
+        const data = await res.json();
+        throw new Error(data.error || 'Investigation failed');
+      }
 
-      setResult(data);
-      setHistory(prev => [{ target: data.target, timestamp: data.timestamp, provider: data.provider }, ...prev.slice(0, 19)]);
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let analysis = '';
+      let eventType = null;
 
-      // Scroll to results
-      setTimeout(() => resultRef.current?.scrollIntoView({ behavior: 'smooth' }), 100);
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop(); // keep incomplete line
+
+        for (const line of lines) {
+          if (line.startsWith('event: ')) {
+            eventType = line.slice(7).trim();
+          } else if (line.startsWith('data: ')) {
+            let data;
+            try { data = JSON.parse(line.slice(6)); } catch { continue; }
+
+            switch (eventType) {
+              case 'metadata':
+                setResult({ ...data, analysis: '' });
+                setTimeout(() => resultRef.current?.scrollIntoView({ behavior: 'smooth' }), 100);
+                break;
+              case 'thinking_start':
+                setThinking(true);
+                break;
+              case 'thinking':
+                // Thinking text received — indicator is already showing
+                break;
+              case 'text_start':
+                setThinking(false);
+                break;
+              case 'chunk':
+                analysis += data.text || '';
+                setResult(prev => prev ? { ...prev, analysis } : prev);
+                break;
+              case 'error':
+                throw new Error(data.error || 'Stream error');
+              case 'done':
+                break;
+            }
+            eventType = null;
+          }
+        }
+      }
+
+      setResult(prev => {
+        if (prev) {
+          setHistory(h => [{ target: prev.target, timestamp: prev.timestamp, provider: prev.provider }, ...h.slice(0, 19)]);
+        }
+        return prev;
+      });
     } catch (err) {
       setError(err.message);
     } finally {
       setInvestigating(false);
+      setThinking(false);
     }
   };
 
@@ -426,10 +481,20 @@ export default function ThreatHunt() {
               🤖 AI Threat Assessment
               <span className="provider-tag">{API_PROVIDERS.find(p => p.id === result.provider)?.icon} {result.provider}</span>
             </h3>
-            <div className="analysis-content" dangerouslySetInnerHTML={{ __html: markdownToHtml(result.analysis) }} />
-            <div className="analysis-meta">
-              <span>Generated: {new Date(result.timestamp).toLocaleString()}</span>
-            </div>
+            {thinking && (
+              <div className="thinking-indicator">
+                <span className="thinking-spinner"></span>
+                Thinking...
+              </div>
+            )}
+            {result.analysis && (
+              <div className="analysis-content" dangerouslySetInnerHTML={{ __html: markdownToHtml(result.analysis) }} />
+            )}
+            {!investigating && result.analysis && (
+              <div className="analysis-meta">
+                <span>Generated: {new Date(result.timestamp).toLocaleString()}</span>
+              </div>
+            )}
           </div>
           </div>{/* end printRef */}
         </div>
