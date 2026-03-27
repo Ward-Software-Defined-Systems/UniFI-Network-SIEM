@@ -376,8 +376,14 @@ class SqliteBackend extends StorageBackend {
     }
 
     const rows = this.db.prepare(sql).all(since);
+    // Pad truncated strftime output to parseable ISO 8601
+    // '%Y-%m-%dT%H' → '2026-03-27T10' needs ':00' to parse; '%Y-%m-%d' is fine as-is
+    const padTs = (ts) => {
+      if (ts.length === 13) return ts + ':00';  // YYYY-MM-DDTHH
+      return ts;
+    };
     for (const row of rows) {
-      const aligned = new Date(Math.floor(new Date(row.ts).getTime() / bucketMs) * bucketMs);
+      const aligned = new Date(Math.floor(new Date(padTs(row.ts)).getTime() / bucketMs) * bucketMs);
       const key = aligned.toISOString();
       if (buckets.has(key)) {
         const bucket = buckets.get(key);
