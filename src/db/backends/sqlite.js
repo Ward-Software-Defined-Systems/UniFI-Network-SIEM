@@ -376,10 +376,12 @@ class SqliteBackend extends StorageBackend {
     }
 
     const rows = this.db.prepare(sql).all(since);
-    // Pad truncated strftime output to parseable ISO 8601
-    // '%Y-%m-%dT%H' → '2026-03-27T10' needs ':00' to parse; '%Y-%m-%d' is fine as-is
+    // Pad truncated strftime output to parseable ISO 8601 UTC
+    // strftime output is UTC but lacks 'Z', so new Date() would parse as local time
     const padTs = (ts) => {
-      if (ts.length === 13) return ts + ':00';  // YYYY-MM-DDTHH
+      if (ts.length === 13) return ts + ':00Z';  // YYYY-MM-DDTHH → +':00Z'
+      if (ts.length === 16) return ts + 'Z';     // YYYY-MM-DDTHH:MM → +'Z'
+      if (ts.length === 10) return ts + 'T00:00Z'; // YYYY-MM-DD → +'T00:00Z'
       return ts;
     };
     for (const row of rows) {

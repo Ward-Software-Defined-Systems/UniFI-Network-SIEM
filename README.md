@@ -17,7 +17,7 @@ A self-contained, **AI-powered** Node.js application that collects syslog from U
 - **GeoIP & threat enrichment** — MaxMind GeoLite2 for geolocation, AbuseIPDB for threat scoring, reverse DNS — all async with caching
 - **Country flags & abuse badges** — 🇺🇸 emoji flags with country codes on external IPs; color-coded abuse score badges across all views
 - **Threat Intel** — sortable/filterable table of enriched IPs with abuse scores, event counts, and locations; period-filtered summary cards alongside all-time totals
-- **Threat Hunt (Beta)** — AI-powered threat actor investigation. Enter any IP to get a full profile: local SIEM activity (events, ports, timeline, IDS signatures, related /24 IPs), external intel (rDNS, WHOIS/ASN), and a structured AI threat assessment with PDF export. Supports Anthropic (Opus 4.6), OpenAI (GPT-5.4), and Google (Gemini 3.1 Pro) with on-page API key management. *Currently tested with Anthropic only — OpenAI and Google integrations are implemented but untested.*
+- **Threat Hunt (Beta)** — AI-powered threat actor investigation with SSE streaming. Enter any IP to get a full profile: local SIEM activity (events, ports, timeline, IDS signatures, related /24 IPs), external intel (rDNS, WHOIS/ASN), and a structured AI threat assessment streamed token-by-token with PDF export. Supports Anthropic (Opus 4.6 with adaptive thinking, 128K output), OpenAI (GPT-5.4, 128K output), and Google (Gemini 3.1 Pro, 65K output) with on-page API key management. *Currently tested with Anthropic only — OpenAI and Google integrations are implemented but untested.*
 - **HTTPS by default** — auto-generated self-signed TLS certificate
 - **Pluggable storage backends** — SQLite (built-in default), WardSONDB (Beta), OpenSearch (Beta — Coming Soon)
 - **SQLite storage** — WAL mode, batched inserts, automatic retention cleanup, worker thread enrichment. Existing databases self-heal on restart: legacy indexes are automatically dropped and replaced with optimized compound indexes (no manual reset needed)
@@ -165,7 +165,8 @@ For full functionality, three logging sources on the UniFi Console should be con
 | `POST /api/settings/reset-db` | Clear all events and enrichment cache |
 | `GET /api/threat-hunt/settings` | Threat Hunt AI provider settings |
 | `PUT /api/threat-hunt/settings` | Update AI provider/keys |
-| `POST /api/threat-hunt/investigate` | Run AI-powered threat investigation on an IP |
+| `POST /api/threat-hunt/investigate` | Run AI-powered threat investigation on an IP (non-streaming) |
+| `POST /api/threat-hunt/investigate-stream` | SSE streaming AI investigation (primary endpoint) |
 | `WSS /ws/events` | Live event stream with filtering |
 
 ## Configuration (.env)
@@ -279,7 +280,7 @@ The app runs HTTPS by default with an auto-generated self-signed certificate. Be
 - **esbuild ≤ 0.24.2 (moderate)** — allows any website to send requests to the Vite dev server and read responses ([GHSA-67mh-4wv8-2f99](https://github.com/advisories/GHSA-67mh-4wv8-2f99)). This is a dev-only dependency used during frontend development — it does not affect production builds or the deployed SIEM. Fix requires upgrading Vite to 7.x (breaking change).
 
 **Already mitigated:**
-- **SQL injection** — all queries use parameterized prepared statements. The one exception (`getTimeline()` strftime format string) is validated against an allowlist before interpolation
+- **SQL injection** — all queries use parameterized prepared statements. The `getTimeline()` strftime format string is derived from a fixed internal lookup (not from caller input), eliminating the previous injection surface
 - **XSS** — React auto-escapes all rendered content including untrusted syslog data
 - **API key exposure** — AbuseIPDB key is redacted in API responses (last 4 chars only)
 - **Transport security** — HTTPS/WSS enabled by default with auto-generated TLS certificate
@@ -298,7 +299,7 @@ The app runs HTTPS by default with an auto-generated self-signed certificate. Be
 
 - [x] Abuse score badges on IPs in tables
 - [x] Country flags on external IPs
-- [ ] Threat Hunting view — AI-powered investigation workspace for profiling threat actors (IP timeline, associated events, geo history, abuse reports, related IPs). Integrates with Gemini, OpenAI, or Anthropic APIs for automated threat analysis and natural language investigation queries
+- [x] Threat Hunting view — AI-powered investigation with SSE streaming, adaptive thinking (Anthropic), 128K token output, and structured threat assessments with PDF export
 - [ ] CSV export
 - [ ] Dark/light mode toggle
 - [x] Performance optimization — enrichment backfill moved to worker thread for non-blocking operation
