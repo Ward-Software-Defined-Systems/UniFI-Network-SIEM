@@ -20,7 +20,7 @@ A self-contained, **AI-powered** Node.js application that collects syslog from U
 - **Threat Hunt (Beta)** — AI-powered threat actor investigation. Enter any IP to get a full profile: local SIEM activity (events, ports, timeline, IDS signatures, related /24 IPs), external intel (rDNS, WHOIS/ASN), and a structured AI threat assessment with PDF export. Supports Anthropic (Opus 4.6), OpenAI (GPT-5.4), and Google (Gemini 3.1 Pro) with on-page API key management. *Currently tested with Anthropic only — OpenAI and Google integrations are implemented but untested.*
 - **HTTPS by default** — auto-generated self-signed TLS certificate
 - **Pluggable storage backends** — SQLite (built-in default), WardSONDB (Beta), OpenSearch (Beta — Coming Soon)
-- **SQLite storage** — WAL mode, batched inserts, automatic retention cleanup, worker thread enrichment
+- **SQLite storage** — WAL mode, batched inserts, automatic retention cleanup, worker thread enrichment. Existing databases self-heal on restart: legacy indexes are automatically dropped and replaced with optimized compound indexes (no manual reset needed)
 - **Zero external services** — everything runs in one process
 
 ## Screenshots
@@ -279,7 +279,7 @@ The app runs HTTPS by default with an auto-generated self-signed certificate. Be
 - **esbuild ≤ 0.24.2 (moderate)** — allows any website to send requests to the Vite dev server and read responses ([GHSA-67mh-4wv8-2f99](https://github.com/advisories/GHSA-67mh-4wv8-2f99)). This is a dev-only dependency used during frontend development — it does not affect production builds or the deployed SIEM. Fix requires upgrading Vite to 7.x (breaking change).
 
 **Already mitigated:**
-- **SQL injection** — all queries use parameterized prepared statements
+- **SQL injection** — all queries use parameterized prepared statements. The one exception (`getTimeline()` strftime format string) is validated against an allowlist before interpolation
 - **XSS** — React auto-escapes all rendered content including untrusted syslog data
 - **API key exposure** — AbuseIPDB key is redacted in API responses (last 4 chars only)
 - **Transport security** — HTTPS/WSS enabled by default with auto-generated TLS certificate

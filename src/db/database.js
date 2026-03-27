@@ -111,9 +111,14 @@ function initSchema(db) {
       dst_hostname TEXT
     );
 
-    CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events(timestamp);
+    DROP INDEX IF EXISTS idx_events_timestamp;
+    DROP INDEX IF EXISTS idx_events_type_timestamp;
+
+    CREATE INDEX IF NOT EXISTS idx_events_received_at ON events(received_at);
     CREATE INDEX IF NOT EXISTS idx_events_event_type ON events(event_type);
-    CREATE INDEX IF NOT EXISTS idx_events_type_timestamp ON events(event_type, timestamp);
+    CREATE INDEX IF NOT EXISTS idx_events_type_received_at ON events(event_type, received_at);
+    CREATE INDEX IF NOT EXISTS idx_events_action_received_at ON events(action, received_at);
+    CREATE INDEX IF NOT EXISTS idx_events_type_action ON events(event_type, action);
     CREATE INDEX IF NOT EXISTS idx_events_action ON events(action);
     CREATE INDEX IF NOT EXISTS idx_events_src_ip ON events(src_ip);
     CREATE INDEX IF NOT EXISTS idx_events_dst_ip ON events(dst_ip);

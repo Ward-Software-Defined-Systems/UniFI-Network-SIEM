@@ -3,14 +3,6 @@ const storage = require('../../db/storage');
 
 const router = express.Router();
 
-function periodToInterval(period) {
-  const map = {
-    '1h': '-1 hour', '6h': '-6 hours', '24h': '-24 hours',
-    '7d': '-7 days', '30d': '-30 days',
-  };
-  return map[period] || '-24 hours';
-}
-
 function bucketToFormat(bucket) {
   const map = {
     '5m': '%Y-%m-%dT%H:%M:00Z',

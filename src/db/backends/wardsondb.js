@@ -784,13 +784,9 @@ class WardsonDbBackend extends StorageBackend {
     const endTime = new Date(Math.floor(nowDate.getTime() / bucketMs) * bucketMs);
     const numBuckets = Math.floor((endTime - startTime) / bucketMs) + 1;
 
-    // Cap at reasonable number to avoid too many queries
-    const maxBuckets = 200;
-    const actualBuckets = Math.min(numBuckets, maxBuckets);
-
     // Generate empty buckets
     const buckets = {};
-    for (let i = 0; i < actualBuckets; i++) {
+    for (let i = 0; i < numBuckets; i++) {
       const d = new Date(startTime.getTime() + i * bucketMs);
       const ts = d.toISOString();
       buckets[ts] = eventType === 'firewall'
