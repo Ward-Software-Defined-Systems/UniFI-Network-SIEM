@@ -58,6 +58,9 @@ function createServer() {
 
   const tlsOpts = ensureCerts();
   const server = https.createServer(tlsOpts, app);
+  server.timeout = 300000;         // 5 min — matches DB reset safety ceiling; large SQLite aggregations need headroom
+  server.keepAliveTimeout = 65000; // 65s — above common proxy/LB defaults (60s) to avoid race conditions
+  server.headersTimeout = 70000;   // 70s — must exceed keepAliveTimeout per Node.js docs
   const wss = createWebSocketServer(server);
 
   server.listen(config.http.port, () => {
