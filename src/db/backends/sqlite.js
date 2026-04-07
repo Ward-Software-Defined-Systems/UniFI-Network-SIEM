@@ -5,6 +5,7 @@
  * This is the default, zero-dependency backend.
  */
 const Database = require('better-sqlite3');
+const { Worker } = require('worker_threads');
 const path = require('path');
 const fs = require('fs');
 const StorageBackend = require('./interface');
@@ -16,10 +17,15 @@ class SqliteBackend extends StorageBackend {
     this.db = null;
     this.insertStmt = null;
     this.insertManyTxn = null;
+    this._statsWorker = null;
+    this._pendingQueries = new Map();
+    this._queryIdCounter = 0;
+    this._dbPath = null;
   }
 
   async initialize() {
     const dbPath = path.resolve(this.config.path || './data/events.db');
+    this._dbPath = dbPath;
     const dir = path.dirname(dbPath);
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
@@ -32,14 +38,87 @@ class SqliteBackend extends StorageBackend {
     this.db.pragma('busy_timeout = 5000');
 
     this._initSchema();
+    this._initStatsWorker();
     logger.info({ path: dbPath, backend: 'sqlite' }, 'Storage backend initialized');
   }
 
   async close() {
+    if (this._statsWorker) {
+      this._statsWorker.postMessage({ type: 'shutdown' });
+      this._statsWorker = null;
+      for (const [id, pending] of this._pendingQueries) {
+        clearTimeout(pending.timer);
+        pending.reject(new Error('Stats worker shutting down'));
+      }
+      this._pendingQueries.clear();
+    }
     if (this.db) {
       this.db.close();
       this.db = null;
     }
+  }
+
+  // --- Stats Worker ---
+
+  _initStatsWorker() {
+    if (this._statsWorker) return;
+
+    this._statsWorker = new Worker(path.join(__dirname, '../db/stats-worker.js'), {
+      workerData: { dbPath: this._dbPath },
+    });
+
+    this._statsWorker.on('message', (msg) => {
+      if (msg.type === 'ready') {
+        logger.info('Stats worker thread started');
+        return;
+      }
+      const pending = this._pendingQueries.get(msg.id);
+      if (pending) {
+        this._pendingQueries.delete(msg.id);
+        clearTimeout(pending.timer);
+        if (msg.error) pending.reject(new Error(msg.error));
+        else pending.resolve(msg.result);
+      }
+    });
+
+    this._statsWorker.on('error', (err) => {
+      logger.error({ err }, 'Stats worker error');
+    });
+
+    this._statsWorker.on('exit', (code) => {
+      if (code !== 0) {
+        logger.warn({ code }, 'Stats worker exited unexpectedly, restarting...');
+        this._statsWorker = null;
+        for (const [id, pending] of this._pendingQueries) {
+          clearTimeout(pending.timer);
+          pending.reject(new Error('Stats worker crashed'));
+        }
+        this._pendingQueries.clear();
+        setTimeout(() => this._initStatsWorker(), 1000);
+      }
+    });
+  }
+
+  _queryAsync(sql, params = [], method = 'all') {
+    return new Promise((resolve, reject) => {
+      if (!this._statsWorker) {
+        // Fallback to main thread if worker not available
+        try {
+          const stmt = this.db.prepare(sql);
+          const result = method === 'get' ? stmt.get(...params) : stmt.all(...params);
+          return resolve(result);
+        } catch (err) { return reject(err); }
+      }
+
+      const id = String(++this._queryIdCounter);
+      const timer = setTimeout(() => {
+        this._pendingQueries.delete(id);
+        reject(new Error(`Stats query timed out after 120s: ${sql.slice(0, 80)}`));
+      }, 120000);
+
+      this._pendingQueries.set(id, { resolve, reject, timer });
+      this._statsWorker.postMessage({ id, sql, params, method });
+    });
   }
 
   async healthCheck() {
@@ -282,18 +361,20 @@ class SqliteBackend extends StorageBackend {
   }
 
   async getEventCount() {
-    return this.db.prepare('SELECT COUNT(*) as count FROM events').get().count;
+    const row = await this._queryAsync('SELECT COUNT(*) as count FROM events', [], 'get');
+    return row.count;
   }
 
   async getEventCountToday() {
     const now = new Date();
     const localMidnight = new Date(now.getFullYear(), now.getMonth(), now.getDate());
     const midnightISO = localMidnight.toISOString();
-    return this.db.prepare("SELECT COUNT(*) as count FROM events WHERE received_at >= ?").get(midnightISO).count;
+    const row = await this._queryAsync("SELECT COUNT(*) as count FROM events WHERE received_at >= ?", [midnightISO], 'get');
+    return row.count;
   }
 
   async getLastEventTime() {
-    const row = this.db.prepare('SELECT received_at FROM events ORDER BY id DESC LIMIT 1').get();
+    const row = await this._queryAsync('SELECT received_at FROM events ORDER BY id DESC LIMIT 1', [], 'get');
     return row ? row.received_at : null;
   }
 
@@ -302,7 +383,7 @@ class SqliteBackend extends StorageBackend {
     const params = [];
     if (since) { sql += ' WHERE received_at >= ?'; params.push(since); }
     sql += ' GROUP BY event_type';
-    const rows = this.db.prepare(sql).all(...params);
+    const rows = await this._queryAsync(sql, params);
     const counts = {};
     for (const row of rows) counts[row.event_type] = row.count;
     return counts;
@@ -324,14 +405,18 @@ class SqliteBackend extends StorageBackend {
   }
 
   async getOverviewStats(since) {
-    const total = this.db.prepare('SELECT COUNT(*) as c FROM events WHERE received_at >= ?').get(since).c;
-    const byType = await this.getEventTypeCounts(since);
-    const firewall = {
-      allowed: this.db.prepare("SELECT COUNT(*) as c FROM events WHERE event_type='firewall' AND action='allow' AND received_at >= ?").get(since).c,
-      blocked: this.db.prepare("SELECT COUNT(*) as c FROM events WHERE event_type='firewall' AND action='block' AND received_at >= ?").get(since).c,
-      threats: this.db.prepare("SELECT COUNT(*) as c FROM events WHERE event_type='threat' AND received_at >= ?").get(since).c,
+    const [totalRow, byType, allowedRow, blockedRow, threatsRow] = await Promise.all([
+      this._queryAsync('SELECT COUNT(*) as c FROM events WHERE received_at >= ?', [since], 'get'),
+      this.getEventTypeCounts(since),
+      this._queryAsync("SELECT COUNT(*) as c FROM events WHERE event_type='firewall' AND action='allow' AND received_at >= ?", [since], 'get'),
+      this._queryAsync("SELECT COUNT(*) as c FROM events WHERE event_type='firewall' AND action='block' AND received_at >= ?", [since], 'get'),
+      this._queryAsync("SELECT COUNT(*) as c FROM events WHERE event_type='threat' AND received_at >= ?", [since], 'get'),
+    ]);
+    return {
+      total: totalRow.c,
+      byType,
+      firewall: { allowed: allowedRow.c, blocked: blockedRow.c, threats: threatsRow.c },
     };
-    return { total, byType, firewall };
   }
 
   async getTimeline(since, bucketFormat, eventType, bucketSize) {
@@ -375,7 +460,7 @@ class SqliteBackend extends StorageBackend {
              GROUP BY ts ORDER BY ts`;
     }
 
-    const rows = this.db.prepare(sql).all(since);
+    const rows = await this._queryAsync(sql, [since]);
     // Pad truncated strftime output to parseable ISO 8601 UTC
     // strftime output is UTC but lacks 'Z', so new Date() would parse as local time
     const padTs = (ts) => {
@@ -413,12 +498,12 @@ class SqliteBackend extends StorageBackend {
     const geoCol = direction === 'dst' ? 'dst_geo_country' : 'src_geo_country';
     const hostCol = direction === 'dst' ? 'dst_hostname' : 'src_hostname';
     const privFilter = excludePrivate ? `AND ${this._privateIpFilter(col)}` : '';
-    return this.db.prepare(`
+    return this._queryAsync(`
       SELECT ${col} as ip, COUNT(*) as count, MAX(received_at) as lastSeen,
              ${geoCol} as country, ${hostCol} as hostname
       FROM events WHERE ${col} IS NOT NULL AND received_at >= ? ${privFilter}
       GROUP BY ${col} ORDER BY count DESC LIMIT ?
-    `).all(since, limit);
+    `, [since, limit]);
   }
 
   async getTopBlocked(since, direction, limit, excludePrivate) {
@@ -427,99 +512,139 @@ class SqliteBackend extends StorageBackend {
     const abuseCol = direction === 'dst' ? 'dst_abuse_score' : 'src_abuse_score';
     const hostCol = direction === 'dst' ? 'dst_hostname' : 'src_hostname';
     const privFilter = excludePrivate ? `AND ${this._privateIpFilter(col)}` : '';
-    return this.db.prepare(`
+    return this._queryAsync(`
       SELECT ${col} as ip, COUNT(*) as count, MAX(received_at) as lastSeen,
              ${geoCol} as country, ${abuseCol} as abuseScore, ${hostCol} as hostname
       FROM events WHERE action='block' AND ${col} IS NOT NULL AND received_at >= ? ${privFilter}
       GROUP BY ${col} ORDER BY count DESC LIMIT ?
-    `).all(since, limit);
+    `, [since, limit]);
   }
 
   async getTopPorts(since, limit) {
-    return this.db.prepare(`
+    return this._queryAsync(`
       SELECT dst_port as port, protocol, COUNT(*) as count
       FROM events WHERE dst_port IS NOT NULL AND received_at >= ?
       GROUP BY dst_port, protocol ORDER BY count DESC LIMIT ?
-    `).all(since, limit);
+    `, [since, limit]);
   }
 
   async getTopClients(since, limit) {
-    return this.db.prepare(`
-      SELECT
-        COALESCE(client_mac, wifi_client_mac, dhcp_mac) as mac,
-        MAX(client_alias) as alias,
-        MAX(COALESCE(client_ip, dhcp_ip, src_ip)) as ip,
-        COUNT(*) as eventCount,
-        SUM(CASE WHEN event_type='wifi' THEN 1 ELSE 0 END) as wifiEvents,
-        SUM(CASE WHEN event_type='dhcp' THEN 1 ELSE 0 END) as dhcpEvents,
-        SUM(CASE WHEN event_type='firewall' THEN 1 ELSE 0 END) as firewallEvents
-      FROM events
-      WHERE COALESCE(client_mac, wifi_client_mac, dhcp_mac) IS NOT NULL AND received_at >= ?
-      GROUP BY mac ORDER BY eventCount DESC LIMIT ?
-    `).all(since, limit);
+    // 3 separate indexed queries instead of COALESCE full scan, then merge in JS
+    const [clientRows, wifiRows, dhcpRows] = await Promise.all([
+      this._queryAsync(`
+        SELECT client_mac as mac, MAX(client_alias) as alias, MAX(client_ip) as ip,
+          COUNT(*) as eventCount,
+          SUM(CASE WHEN event_type='wifi' THEN 1 ELSE 0 END) as wifiEvents,
+          SUM(CASE WHEN event_type='dhcp' THEN 1 ELSE 0 END) as dhcpEvents,
+          SUM(CASE WHEN event_type='firewall' THEN 1 ELSE 0 END) as firewallEvents
+        FROM events WHERE client_mac IS NOT NULL AND received_at >= ?
+        GROUP BY client_mac
+      `, [since]),
+      this._queryAsync(`
+        SELECT wifi_client_mac as mac, MAX(client_alias) as alias, MAX(src_ip) as ip,
+          COUNT(*) as eventCount,
+          SUM(CASE WHEN event_type='wifi' THEN 1 ELSE 0 END) as wifiEvents,
+          SUM(CASE WHEN event_type='dhcp' THEN 1 ELSE 0 END) as dhcpEvents,
+          SUM(CASE WHEN event_type='firewall' THEN 1 ELSE 0 END) as firewallEvents
+        FROM events WHERE wifi_client_mac IS NOT NULL AND received_at >= ?
+        GROUP BY wifi_client_mac
+      `, [since]),
+      this._queryAsync(`
+        SELECT dhcp_mac as mac, MAX(COALESCE(dhcp_hostname, client_alias)) as alias, MAX(dhcp_ip) as ip,
+          COUNT(*) as eventCount,
+          SUM(CASE WHEN event_type='wifi' THEN 1 ELSE 0 END) as wifiEvents,
+          SUM(CASE WHEN event_type='dhcp' THEN 1 ELSE 0 END) as dhcpEvents,
+          SUM(CASE WHEN event_type='firewall' THEN 1 ELSE 0 END) as firewallEvents
+        FROM events WHERE dhcp_mac IS NOT NULL AND received_at >= ?
+        GROUP BY dhcp_mac
+      `, [since]),
+    ]);
+
+    // Merge by MAC: deduplicate, sum counts, keep best alias/ip
+    const merged = new Map();
+    for (const row of [...clientRows, ...wifiRows, ...dhcpRows]) {
+      const existing = merged.get(row.mac);
+      if (existing) {
+        existing.eventCount += row.eventCount;
+        existing.wifiEvents += row.wifiEvents;
+        existing.dhcpEvents += row.dhcpEvents;
+        existing.firewallEvents += row.firewallEvents;
+        if (!existing.alias && row.alias) existing.alias = row.alias;
+        if (!existing.ip && row.ip) existing.ip = row.ip;
+      } else {
+        merged.set(row.mac, { ...row });
+      }
+    }
+
+    return Array.from(merged.values())
+      .sort((a, b) => b.eventCount - a.eventCount)
+      .slice(0, limit);
   }
 
   async getTopThreats(since, limit) {
-    return this.db.prepare(`
+    return this._queryAsync(`
       SELECT ids_signature as signature, ids_classification as classification,
              COUNT(*) as count, MAX(received_at) as lastSeen
       FROM events WHERE event_type='threat' AND ids_signature IS NOT NULL AND received_at >= ?
       GROUP BY ids_signature ORDER BY count DESC LIMIT ?
-    `).all(since, limit);
+    `, [since, limit]);
   }
 
   async getThreatIntel(since, limit) {
-    const rows = this.db.prepare(`
-      SELECT ip, country, city, lat, lon, abuse_score, hostname,
-        SUM(count) as event_count, SUM(blocked) as blocked_count,
-        SUM(threats) as threat_count, MAX(lastSeen) as lastSeen
-      FROM (
-        SELECT src_ip as ip, src_geo_country as country, src_geo_city as city,
-               src_geo_lat as lat, src_geo_lon as lon, src_abuse_score as abuse_score,
-               src_hostname as hostname, COUNT(*) as count,
-               SUM(CASE WHEN action='block' THEN 1 ELSE 0 END) as blocked,
-               SUM(CASE WHEN event_type='threat' THEN 1 ELSE 0 END) as threats,
-               MAX(received_at) as lastSeen
-        FROM events
-        WHERE src_ip IS NOT NULL AND (src_geo_country IS NOT NULL OR src_abuse_score IS NOT NULL) AND received_at >= ?
-        GROUP BY src_ip
-        UNION ALL
-        SELECT dst_ip, dst_geo_country, dst_geo_city, dst_geo_lat, dst_geo_lon, dst_abuse_score,
-               dst_hostname, COUNT(*),
-               SUM(CASE WHEN action='block' THEN 1 ELSE 0 END),
-               SUM(CASE WHEN event_type='threat' THEN 1 ELSE 0 END),
-               MAX(received_at)
-        FROM events
-        WHERE dst_ip IS NOT NULL AND (dst_geo_country IS NOT NULL OR dst_abuse_score IS NOT NULL) AND received_at >= ?
-        GROUP BY dst_ip
-      )
-      GROUP BY ip ORDER BY event_count DESC, abuse_score DESC LIMIT ?
-    `).all(since, since, limit);
-
-    const summary = {
-      totalEnriched: this.db.prepare("SELECT COUNT(*) as c FROM ip_enrichment_cache WHERE is_private = 0").get().c,
-      withAbuseScore: this.db.prepare("SELECT COUNT(*) as c FROM ip_enrichment_cache WHERE abuse_score > 0 AND is_private = 0").get().c,
-      highThreat: this.db.prepare("SELECT COUNT(*) as c FROM ip_enrichment_cache WHERE abuse_score >= 50 AND is_private = 0").get().c,
-      countries: this.db.prepare("SELECT COUNT(DISTINCT geo_country) as c FROM ip_enrichment_cache WHERE geo_country IS NOT NULL AND is_private = 0").get().c,
-    };
-
-    const periodStats = this.db.prepare(`
-      SELECT
-        COUNT(DISTINCT ip) as enriched,
-        COUNT(DISTINCT CASE WHEN abuse_score > 0 THEN ip END) as flagged,
-        COUNT(DISTINCT CASE WHEN abuse_score >= 50 THEN ip END) as highThreat,
-        COUNT(DISTINCT country) as countries
-      FROM (
-        SELECT src_ip as ip, src_abuse_score as abuse_score, src_geo_country as country
-        FROM events WHERE src_ip IS NOT NULL AND (src_geo_country IS NOT NULL OR src_abuse_score IS NOT NULL) AND received_at >= ?
-        UNION
-        SELECT dst_ip, dst_abuse_score, dst_geo_country
-        FROM events WHERE dst_ip IS NOT NULL AND (dst_geo_country IS NOT NULL OR dst_abuse_score IS NOT NULL) AND received_at >= ?
-      )
-    `).get(since, since);
+    const [rows, totalEnriched, withAbuseScore, highThreat, countries, periodStats] = await Promise.all([
+      this._queryAsync(`
+        SELECT ip, country, city, lat, lon, abuse_score, hostname,
+          SUM(count) as event_count, SUM(blocked) as blocked_count,
+          SUM(threats) as threat_count, MAX(lastSeen) as lastSeen
+        FROM (
+          SELECT src_ip as ip, src_geo_country as country, src_geo_city as city,
+                 src_geo_lat as lat, src_geo_lon as lon, src_abuse_score as abuse_score,
+                 src_hostname as hostname, COUNT(*) as count,
+                 SUM(CASE WHEN action='block' THEN 1 ELSE 0 END) as blocked,
+                 SUM(CASE WHEN event_type='threat' THEN 1 ELSE 0 END) as threats,
+                 MAX(received_at) as lastSeen
+          FROM events
+          WHERE src_ip IS NOT NULL AND (src_geo_country IS NOT NULL OR src_abuse_score IS NOT NULL) AND received_at >= ?
+          GROUP BY src_ip
+          UNION ALL
+          SELECT dst_ip, dst_geo_country, dst_geo_city, dst_geo_lat, dst_geo_lon, dst_abuse_score,
+                 dst_hostname, COUNT(*),
+                 SUM(CASE WHEN action='block' THEN 1 ELSE 0 END),
+                 SUM(CASE WHEN event_type='threat' THEN 1 ELSE 0 END),
+                 MAX(received_at)
+          FROM events
+          WHERE dst_ip IS NOT NULL AND (dst_geo_country IS NOT NULL OR dst_abuse_score IS NOT NULL) AND received_at >= ?
+          GROUP BY dst_ip
+        )
+        GROUP BY ip ORDER BY event_count DESC, abuse_score DESC LIMIT ?
+      `, [since, since, limit]),
+      this._queryAsync("SELECT COUNT(*) as c FROM ip_enrichment_cache WHERE is_private = 0", [], 'get'),
+      this._queryAsync("SELECT COUNT(*) as c FROM ip_enrichment_cache WHERE abuse_score > 0 AND is_private = 0", [], 'get'),
+      this._queryAsync("SELECT COUNT(*) as c FROM ip_enrichment_cache WHERE abuse_score >= 50 AND is_private = 0", [], 'get'),
+      this._queryAsync("SELECT COUNT(DISTINCT geo_country) as c FROM ip_enrichment_cache WHERE geo_country IS NOT NULL AND is_private = 0", [], 'get'),
+      this._queryAsync(`
+        SELECT
+          COUNT(DISTINCT ip) as enriched,
+          COUNT(DISTINCT CASE WHEN abuse_score > 0 THEN ip END) as flagged,
+          COUNT(DISTINCT CASE WHEN abuse_score >= 50 THEN ip END) as highThreat,
+          COUNT(DISTINCT country) as countries
+        FROM (
+          SELECT src_ip as ip, src_abuse_score as abuse_score, src_geo_country as country
+          FROM events WHERE src_ip IS NOT NULL AND (src_geo_country IS NOT NULL OR src_abuse_score IS NOT NULL) AND received_at >= ?
+          UNION
+          SELECT dst_ip, dst_abuse_score, dst_geo_country
+          FROM events WHERE dst_ip IS NOT NULL AND (dst_geo_country IS NOT NULL OR dst_abuse_score IS NOT NULL) AND received_at >= ?
+        )
+      `, [since, since], 'get'),
+    ]);
 
     return {
-      summary,
+      summary: {
+        totalEnriched: totalEnriched.c,
+        withAbuseScore: withAbuseScore.c,
+        highThreat: highThreat.c,
+        countries: countries.c,
+      },
       periodSummary: {
         enriched: periodStats.enriched,
         flagged: periodStats.flagged,
@@ -532,33 +657,33 @@ class SqliteBackend extends StorageBackend {
 
   async getGeoEvents(since, limit) {
     const half = Math.ceil(limit / 2);
-    const srcRows = this.db.prepare(`
-      SELECT src_ip as ip, src_geo_country as country, src_geo_city as city,
-        src_geo_lat as lat, src_geo_lon as lon, src_abuse_score as abuseScore,
-        COUNT(*) as count,
-        SUM(CASE WHEN action='block' THEN 1 ELSE 0 END) as blocked,
-        SUM(CASE WHEN event_type='threat' THEN 1 ELSE 0 END) as threats,
-        MAX(received_at) as lastSeen, 'src' as direction
-      FROM events WHERE src_geo_lat IS NOT NULL AND src_geo_lon IS NOT NULL AND received_at >= ?
-      GROUP BY src_ip ORDER BY count DESC LIMIT ?
-    `).all(since, half);
-
-    const dstRows = this.db.prepare(`
-      SELECT dst_ip as ip, dst_geo_country as country, dst_geo_city as city,
-        dst_geo_lat as lat, dst_geo_lon as lon, dst_abuse_score as abuseScore,
-        COUNT(*) as count,
-        SUM(CASE WHEN action='block' THEN 1 ELSE 0 END) as blocked,
-        SUM(CASE WHEN event_type='threat' THEN 1 ELSE 0 END) as threats,
-        MAX(received_at) as lastSeen, 'dst' as direction
-      FROM events WHERE dst_geo_lat IS NOT NULL AND dst_geo_lon IS NOT NULL AND received_at >= ?
-      GROUP BY dst_ip ORDER BY count DESC LIMIT ?
-    `).all(since, half);
-
+    const [srcRows, dstRows] = await Promise.all([
+      this._queryAsync(`
+        SELECT src_ip as ip, src_geo_country as country, src_geo_city as city,
+          src_geo_lat as lat, src_geo_lon as lon, src_abuse_score as abuseScore,
+          COUNT(*) as count,
+          SUM(CASE WHEN action='block' THEN 1 ELSE 0 END) as blocked,
+          SUM(CASE WHEN event_type='threat' THEN 1 ELSE 0 END) as threats,
+          MAX(received_at) as lastSeen, 'src' as direction
+        FROM events WHERE src_geo_lat IS NOT NULL AND src_geo_lon IS NOT NULL AND received_at >= ?
+        GROUP BY src_ip ORDER BY count DESC LIMIT ?
+      `, [since, half]),
+      this._queryAsync(`
+        SELECT dst_ip as ip, dst_geo_country as country, dst_geo_city as city,
+          dst_geo_lat as lat, dst_geo_lon as lon, dst_abuse_score as abuseScore,
+          COUNT(*) as count,
+          SUM(CASE WHEN action='block' THEN 1 ELSE 0 END) as blocked,
+          SUM(CASE WHEN event_type='threat' THEN 1 ELSE 0 END) as threats,
+          MAX(received_at) as lastSeen, 'dst' as direction
+        FROM events WHERE dst_geo_lat IS NOT NULL AND dst_geo_lon IS NOT NULL AND received_at >= ?
+        GROUP BY dst_ip ORDER BY count DESC LIMIT ?
+      `, [since, half]),
+    ]);
     return [...srcRows, ...dstRows];
   }
 
   async getRecentGeoEvents(limit) {
-    return this.db.prepare(`
+    return this._queryAsync(`
       SELECT id, event_type, action, received_at,
         src_ip, src_geo_lat, src_geo_lon, src_geo_country, src_geo_city, src_abuse_score,
         dst_ip, dst_geo_lat, dst_geo_lon, dst_geo_country, dst_geo_city, dst_abuse_score,
@@ -566,7 +691,7 @@ class SqliteBackend extends StorageBackend {
       FROM events
       WHERE (src_geo_lat IS NOT NULL OR dst_geo_lat IS NOT NULL)
       ORDER BY id DESC LIMIT ?
-    `).all(limit);
+    `, [limit]);
   }
 
   // --- Enrichment Cache ---
