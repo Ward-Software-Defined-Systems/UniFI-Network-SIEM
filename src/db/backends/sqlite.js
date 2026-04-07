@@ -63,7 +63,7 @@ class SqliteBackend extends StorageBackend {
   _initStatsWorker() {
     if (this._statsWorker) return;
 
-    this._statsWorker = new Worker(path.join(__dirname, '../db/stats-worker.js'), {
+    this._statsWorker = new Worker(path.join(__dirname, '../stats-worker.js'), {
       workerData: { dbPath: this._dbPath },
     });
 
