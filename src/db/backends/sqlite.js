@@ -811,51 +811,33 @@ class SqliteBackend extends StorageBackend {
   }
 
   async getThreatIntel(since, limit) {
-    const [rows, totalEnriched, withAbuseScore, highThreat, countries, periodStats] = await Promise.all([
+    const [ipRows, totalEnriched, withAbuseScore, highThreat, countries, periodStats] = await Promise.all([
+      // IP list from rollup (both directions combined) + cache join
       this._queryAsync(`
-        SELECT ip, country, city, lat, lon, abuse_score, hostname,
-          SUM(count) as event_count, SUM(blocked) as blocked_count,
-          SUM(threats) as threat_count, MAX(lastSeen) as lastSeen
-        FROM (
-          SELECT src_ip as ip, src_geo_country as country, src_geo_city as city,
-                 src_geo_lat as lat, src_geo_lon as lon, src_abuse_score as abuse_score,
-                 src_hostname as hostname, COUNT(*) as count,
-                 SUM(CASE WHEN action='block' THEN 1 ELSE 0 END) as blocked,
-                 SUM(CASE WHEN event_type='threat' THEN 1 ELSE 0 END) as threats,
-                 MAX(received_at) as lastSeen
-          FROM events
-          WHERE src_ip IS NOT NULL AND (src_geo_country IS NOT NULL OR src_abuse_score IS NOT NULL) AND received_at >= ?
-          GROUP BY src_ip
-          UNION ALL
-          SELECT dst_ip, dst_geo_country, dst_geo_city, dst_geo_lat, dst_geo_lon, dst_abuse_score,
-                 dst_hostname, COUNT(*),
-                 SUM(CASE WHEN action='block' THEN 1 ELSE 0 END),
-                 SUM(CASE WHEN event_type='threat' THEN 1 ELSE 0 END),
-                 MAX(received_at)
-          FROM events
-          WHERE dst_ip IS NOT NULL AND (dst_geo_country IS NOT NULL OR dst_abuse_score IS NOT NULL) AND received_at >= ?
-          GROUP BY dst_ip
-        )
-        GROUP BY ip ORDER BY event_count DESC, abuse_score DESC LIMIT ?
-      `, [since, since, limit]),
+        SELECT r.ip, SUM(r.event_count) as event_count, SUM(r.blocked_count) as blocked_count,
+               SUM(r.threat_count) as threat_count,
+               c.geo_country as country, c.geo_city as city, c.geo_lat as lat, c.geo_lon as lon,
+               c.abuse_score, c.hostname
+        FROM ip_stats_hourly r
+        JOIN ip_enrichment_cache c ON r.ip = c.ip AND c.is_private = 0
+        WHERE r.bucket >= ? AND (c.geo_country IS NOT NULL OR c.abuse_score IS NOT NULL)
+        GROUP BY r.ip ORDER BY event_count DESC, c.abuse_score DESC LIMIT ?
+      `, [since, limit]),
+      // Summary counts — already fast (cache table only)
       this._queryAsync("SELECT COUNT(*) as c FROM ip_enrichment_cache WHERE is_private = 0", [], 'get'),
       this._queryAsync("SELECT COUNT(*) as c FROM ip_enrichment_cache WHERE abuse_score > 0 AND is_private = 0", [], 'get'),
       this._queryAsync("SELECT COUNT(*) as c FROM ip_enrichment_cache WHERE abuse_score >= 50 AND is_private = 0", [], 'get'),
       this._queryAsync("SELECT COUNT(DISTINCT geo_country) as c FROM ip_enrichment_cache WHERE geo_country IS NOT NULL AND is_private = 0", [], 'get'),
+      // Period summary from rollup + cache join
       this._queryAsync(`
-        SELECT
-          COUNT(DISTINCT ip) as enriched,
-          COUNT(DISTINCT CASE WHEN abuse_score > 0 THEN ip END) as flagged,
-          COUNT(DISTINCT CASE WHEN abuse_score >= 50 THEN ip END) as highThreat,
-          COUNT(DISTINCT country) as countries
-        FROM (
-          SELECT src_ip as ip, src_abuse_score as abuse_score, src_geo_country as country
-          FROM events WHERE src_ip IS NOT NULL AND (src_geo_country IS NOT NULL OR src_abuse_score IS NOT NULL) AND received_at >= ?
-          UNION
-          SELECT dst_ip, dst_abuse_score, dst_geo_country
-          FROM events WHERE dst_ip IS NOT NULL AND (dst_geo_country IS NOT NULL OR dst_abuse_score IS NOT NULL) AND received_at >= ?
-        )
-      `, [since, since], 'get'),
+        SELECT COUNT(DISTINCT r.ip) as enriched,
+               COUNT(DISTINCT CASE WHEN c.abuse_score > 0 THEN r.ip END) as flagged,
+               COUNT(DISTINCT CASE WHEN c.abuse_score >= 50 THEN r.ip END) as highThreat,
+               COUNT(DISTINCT c.geo_country) as countries
+        FROM ip_stats_hourly r
+        JOIN ip_enrichment_cache c ON r.ip = c.ip AND c.is_private = 0
+        WHERE r.bucket >= ? AND (c.geo_country IS NOT NULL OR c.abuse_score IS NOT NULL)
+      `, [since], 'get'),
     ]);
 
     return {
@@ -871,34 +853,41 @@ class SqliteBackend extends StorageBackend {
         highThreat: periodStats.highThreat,
         countries: periodStats.countries,
       },
-      ips: rows,
+      ips: ipRows.map(r => ({
+        ip: r.ip, hostname: r.hostname, country: r.country, city: r.city,
+        lat: r.lat, lon: r.lon, abuse_score: r.abuse_score,
+        event_count: r.event_count, blocked_count: r.blocked_count,
+        threat_count: r.threat_count, lastSeen: null,
+      })),
     };
   }
 
   async getGeoEvents(since, limit) {
     const half = Math.ceil(limit / 2);
-    const [srcRows, dstRows] = await Promise.all([
+    // Over-fetch from rollup (3x) to account for IPs without geo data in cache
+    const [srcRollup, dstRollup] = await Promise.all([
       this._queryAsync(`
-        SELECT src_ip as ip, src_geo_country as country, src_geo_city as city,
-          src_geo_lat as lat, src_geo_lon as lon, src_abuse_score as abuseScore,
-          COUNT(*) as count,
-          SUM(CASE WHEN action='block' THEN 1 ELSE 0 END) as blocked,
-          SUM(CASE WHEN event_type='threat' THEN 1 ELSE 0 END) as threats,
-          MAX(received_at) as lastSeen, 'src' as direction
-        FROM events WHERE src_geo_lat IS NOT NULL AND src_geo_lon IS NOT NULL AND received_at >= ?
-        GROUP BY src_ip ORDER BY count DESC LIMIT ?
+        SELECT r.ip, SUM(r.event_count) as count, SUM(r.blocked_count) as blocked, SUM(r.threat_count) as threats,
+          c.geo_country as country, c.geo_city as city, c.geo_lat as lat, c.geo_lon as lon,
+          c.abuse_score as abuseScore
+        FROM ip_stats_hourly r
+        JOIN ip_enrichment_cache c ON r.ip = c.ip
+        WHERE r.direction = 'src' AND r.bucket >= ? AND c.geo_lat IS NOT NULL AND c.geo_lon IS NOT NULL
+        GROUP BY r.ip ORDER BY count DESC LIMIT ?
       `, [since, half]),
       this._queryAsync(`
-        SELECT dst_ip as ip, dst_geo_country as country, dst_geo_city as city,
-          dst_geo_lat as lat, dst_geo_lon as lon, dst_abuse_score as abuseScore,
-          COUNT(*) as count,
-          SUM(CASE WHEN action='block' THEN 1 ELSE 0 END) as blocked,
-          SUM(CASE WHEN event_type='threat' THEN 1 ELSE 0 END) as threats,
-          MAX(received_at) as lastSeen, 'dst' as direction
-        FROM events WHERE dst_geo_lat IS NOT NULL AND dst_geo_lon IS NOT NULL AND received_at >= ?
-        GROUP BY dst_ip ORDER BY count DESC LIMIT ?
+        SELECT r.ip, SUM(r.event_count) as count, SUM(r.blocked_count) as blocked, SUM(r.threat_count) as threats,
+          c.geo_country as country, c.geo_city as city, c.geo_lat as lat, c.geo_lon as lon,
+          c.abuse_score as abuseScore
+        FROM ip_stats_hourly r
+        JOIN ip_enrichment_cache c ON r.ip = c.ip
+        WHERE r.direction = 'dst' AND r.bucket >= ? AND c.geo_lat IS NOT NULL AND c.geo_lon IS NOT NULL
+        GROUP BY r.ip ORDER BY count DESC LIMIT ?
       `, [since, half]),
     ]);
+
+    const srcRows = srcRollup.map(r => ({ ...r, direction: 'src', lastSeen: null }));
+    const dstRows = dstRollup.map(r => ({ ...r, direction: 'dst', lastSeen: null }));
     return [...srcRows, ...dstRows];
   }
 
