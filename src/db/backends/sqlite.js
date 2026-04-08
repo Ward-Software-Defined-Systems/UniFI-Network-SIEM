@@ -304,7 +304,28 @@ class SqliteBackend extends StorageBackend {
       logger.info('Populating rollup tables from existing events (one-time migration)...');
       this._backfillRollups();
       logger.info('Rollup backfill complete');
+    } else if (hasRollups) {
+      // Re-backfill individual rollup tables that may be empty due to prior bugs
+      const hasSigStats = this.db.prepare('SELECT 1 FROM sig_stats_hourly LIMIT 1').get();
+      const hasThreats = this.db.prepare("SELECT 1 FROM events WHERE event_type='threat' LIMIT 1").get();
+      if (hasThreats && !hasSigStats) {
+        logger.info('Backfilling sig_stats_hourly (one-time fix)...');
+        this._backfillSigStats();
+        logger.info('sig_stats_hourly backfill complete');
+      }
     }
+  }
+
+  _backfillSigStats() {
+    this.db.exec(`
+      INSERT OR IGNORE INTO sig_stats_hourly (bucket, signature, classification, count)
+      SELECT
+        strftime('%Y-%m-%dT%H', received_at) || ':00:00.000Z' as bucket,
+        COALESCE(ids_signature, '(no signature)') as signature,
+        COALESCE(ids_classification, '') as classification, COUNT(*) as count
+      FROM events WHERE event_type='threat'
+      GROUP BY bucket, signature, classification
+    `);
   }
 
   _backfillRollups() {
