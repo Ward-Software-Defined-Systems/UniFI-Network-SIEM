@@ -970,7 +970,7 @@ class WardsonDbBackend extends StorageBackend {
   async getTopThreats(since, limit) {
     if (await this._isCollectionEmpty()) return [];
     const pipeline = [
-      { '$match': { event_type: 'threat', 'ids.signature': { '$exists': true }, received_at: { '$gte': since } } },
+      { '$match': { event_type: 'threat', received_at: { '$gte': since } } },
       { '$group': {
         '_id': 'ids.signature',
         'count': { '$count': {} },
