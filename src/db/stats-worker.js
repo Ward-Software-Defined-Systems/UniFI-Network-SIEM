@@ -11,8 +11,6 @@ const path = require('path');
 const dbPath = path.resolve(workerData.dbPath);
 const db = new Database(dbPath, { readonly: true });
 
-db.pragma('journal_mode = WAL');
-db.pragma('synchronous = NORMAL');
 db.pragma('cache_size = -128000');  // 128MB — read-heavy, matches main thread
 db.pragma('busy_timeout = 30000');  // 30s — wait for write locks from main thread / enrichment worker
 

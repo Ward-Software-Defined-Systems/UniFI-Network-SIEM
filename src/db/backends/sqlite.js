@@ -35,7 +35,7 @@ class SqliteBackend extends StorageBackend {
     this.db.pragma('journal_mode = WAL');
     this.db.pragma('synchronous = NORMAL');
     this.db.pragma('cache_size = -128000');
-    this.db.pragma('busy_timeout = 5000');
+    this.db.pragma('busy_timeout = 30000');
 
     this._initSchema();
     this._initStatsWorker();

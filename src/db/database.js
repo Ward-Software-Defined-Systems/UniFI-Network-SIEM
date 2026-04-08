@@ -21,7 +21,7 @@ function getDb() {
   db.pragma('journal_mode = WAL');
   db.pragma('synchronous = NORMAL');
   db.pragma('cache_size = -128000');
-  db.pragma('busy_timeout = 5000');
+  db.pragma('busy_timeout = 30000');
 
   initSchema(db);
   logger.info({ path: dbPath }, 'SQLite database initialized');
