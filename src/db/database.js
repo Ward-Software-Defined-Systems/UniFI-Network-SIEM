@@ -146,6 +146,51 @@ function initSchema(db) {
       key TEXT PRIMARY KEY,
       value TEXT
     );
+
+    -- Rollup tables for pre-aggregated stats
+    CREATE TABLE IF NOT EXISTS event_stats_5m (
+      bucket TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      action TEXT NOT NULL DEFAULT '',
+      count INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (bucket, event_type, action)
+    );
+
+    CREATE TABLE IF NOT EXISTS ip_stats_hourly (
+      bucket TEXT NOT NULL,
+      ip TEXT NOT NULL,
+      direction TEXT NOT NULL,
+      event_count INTEGER NOT NULL DEFAULT 0,
+      blocked_count INTEGER NOT NULL DEFAULT 0,
+      threat_count INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (bucket, ip, direction)
+    );
+
+    CREATE TABLE IF NOT EXISTS port_stats_hourly (
+      bucket TEXT NOT NULL,
+      port INTEGER NOT NULL,
+      protocol TEXT NOT NULL DEFAULT '',
+      count INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (bucket, port, protocol)
+    );
+
+    CREATE TABLE IF NOT EXISTS sig_stats_hourly (
+      bucket TEXT NOT NULL,
+      signature TEXT NOT NULL,
+      classification TEXT NOT NULL DEFAULT '',
+      count INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (bucket, signature, classification)
+    );
+
+    CREATE TABLE IF NOT EXISTS client_stats_hourly (
+      bucket TEXT NOT NULL,
+      mac TEXT NOT NULL,
+      event_count INTEGER NOT NULL DEFAULT 0,
+      wifi_count INTEGER NOT NULL DEFAULT 0,
+      dhcp_count INTEGER NOT NULL DEFAULT 0,
+      firewall_count INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (bucket, mac)
+    );
   `);
 }
 

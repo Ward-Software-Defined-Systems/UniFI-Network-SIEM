@@ -113,8 +113,8 @@ class SqliteBackend extends StorageBackend {
       const id = String(++this._queryIdCounter);
       const timer = setTimeout(() => {
         this._pendingQueries.delete(id);
-        reject(new Error(`Stats query timed out after 120s: ${sql.slice(0, 80)}`));
-      }, 120000);
+        reject(new Error(`Stats query timed out after 300s: ${sql.slice(0, 80)}`));
+      }, 300000);
 
       this._pendingQueries.set(id, { resolve, reject, timer });
       this._statsWorker.postMessage({ id, sql, params, method });
@@ -250,6 +250,145 @@ class SqliteBackend extends StorageBackend {
         key TEXT PRIMARY KEY,
         value TEXT
       );
+
+      -- Rollup tables for pre-aggregated stats
+      CREATE TABLE IF NOT EXISTS event_stats_5m (
+        bucket TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        action TEXT NOT NULL DEFAULT '',
+        count INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (bucket, event_type, action)
+      );
+
+      CREATE TABLE IF NOT EXISTS ip_stats_hourly (
+        bucket TEXT NOT NULL,
+        ip TEXT NOT NULL,
+        direction TEXT NOT NULL,
+        event_count INTEGER NOT NULL DEFAULT 0,
+        blocked_count INTEGER NOT NULL DEFAULT 0,
+        threat_count INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (bucket, ip, direction)
+      );
+
+      CREATE TABLE IF NOT EXISTS port_stats_hourly (
+        bucket TEXT NOT NULL,
+        port INTEGER NOT NULL,
+        protocol TEXT NOT NULL DEFAULT '',
+        count INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (bucket, port, protocol)
+      );
+
+      CREATE TABLE IF NOT EXISTS sig_stats_hourly (
+        bucket TEXT NOT NULL,
+        signature TEXT NOT NULL,
+        classification TEXT NOT NULL DEFAULT '',
+        count INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (bucket, signature, classification)
+      );
+
+      CREATE TABLE IF NOT EXISTS client_stats_hourly (
+        bucket TEXT NOT NULL,
+        mac TEXT NOT NULL,
+        event_count INTEGER NOT NULL DEFAULT 0,
+        wifi_count INTEGER NOT NULL DEFAULT 0,
+        dhcp_count INTEGER NOT NULL DEFAULT 0,
+        firewall_count INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (bucket, mac)
+      );
+    `);
+
+    // One-time rollup backfill if tables are empty but events exist
+    const hasEvents = this.db.prepare('SELECT 1 FROM events LIMIT 1').get();
+    const hasRollups = this.db.prepare('SELECT 1 FROM event_stats_5m LIMIT 1').get();
+    if (hasEvents && !hasRollups) {
+      logger.info('Populating rollup tables from existing events (one-time migration)...');
+      this._backfillRollups();
+      logger.info('Rollup backfill complete');
+    }
+  }
+
+  _backfillRollups() {
+    // Populate event_stats_5m from events
+    this.db.exec(`
+      INSERT OR IGNORE INTO event_stats_5m (bucket, event_type, action, count)
+      SELECT
+        strftime('%Y-%m-%dT%H:', received_at) || CASE
+          WHEN CAST(strftime('%M', received_at) AS INTEGER) / 5 * 5 < 10
+          THEN '0' || (CAST(strftime('%M', received_at) AS INTEGER) / 5 * 5)
+          ELSE '' || (CAST(strftime('%M', received_at) AS INTEGER) / 5 * 5)
+        END || ':00.000Z' as bucket,
+        event_type,
+        COALESCE(action, '') as action,
+        COUNT(*) as count
+      FROM events
+      GROUP BY bucket, event_type, action
+    `);
+
+    // Populate ip_stats_hourly from events (src direction)
+    this.db.exec(`
+      INSERT OR IGNORE INTO ip_stats_hourly (bucket, ip, direction, event_count, blocked_count, threat_count)
+      SELECT
+        strftime('%Y-%m-%dT%H:00:00.000Z', received_at) as bucket,
+        src_ip as ip, 'src' as direction,
+        COUNT(*) as event_count,
+        SUM(CASE WHEN action='block' THEN 1 ELSE 0 END) as blocked_count,
+        SUM(CASE WHEN event_type='threat' THEN 1 ELSE 0 END) as threat_count
+      FROM events WHERE src_ip IS NOT NULL
+      GROUP BY bucket, src_ip
+    `);
+    // dst direction
+    this.db.exec(`
+      INSERT OR IGNORE INTO ip_stats_hourly (bucket, ip, direction, event_count, blocked_count, threat_count)
+      SELECT
+        strftime('%Y-%m-%dT%H:00:00.000Z', received_at) as bucket,
+        dst_ip as ip, 'dst' as direction,
+        COUNT(*) as event_count,
+        SUM(CASE WHEN action='block' THEN 1 ELSE 0 END) as blocked_count,
+        SUM(CASE WHEN event_type='threat' THEN 1 ELSE 0 END) as threat_count
+      FROM events WHERE dst_ip IS NOT NULL
+      GROUP BY bucket, dst_ip
+    `);
+
+    // Populate port_stats_hourly
+    this.db.exec(`
+      INSERT OR IGNORE INTO port_stats_hourly (bucket, port, protocol, count)
+      SELECT
+        strftime('%Y-%m-%dT%H:00:00.000Z', received_at) as bucket,
+        dst_port as port, COALESCE(protocol, '') as protocol, COUNT(*) as count
+      FROM events WHERE dst_port IS NOT NULL
+      GROUP BY bucket, dst_port, protocol
+    `);
+
+    // Populate sig_stats_hourly
+    this.db.exec(`
+      INSERT OR IGNORE INTO sig_stats_hourly (bucket, signature, classification, count)
+      SELECT
+        strftime('%Y-%m-%dT%H:00:00.000Z', received_at) as bucket,
+        ids_signature as signature, COALESCE(ids_classification, '') as classification, COUNT(*) as count
+      FROM events WHERE event_type='threat' AND ids_signature IS NOT NULL
+      GROUP BY bucket, ids_signature, ids_classification
+    `);
+
+    // Populate client_stats_hourly
+    this.db.exec(`
+      INSERT OR IGNORE INTO client_stats_hourly (bucket, mac, event_count, wifi_count, dhcp_count, firewall_count)
+      SELECT
+        strftime('%Y-%m-%dT%H:00:00.000Z', received_at) as bucket,
+        mac, SUM(c) as event_count,
+        SUM(CASE WHEN et='wifi' THEN c ELSE 0 END) as wifi_count,
+        SUM(CASE WHEN et='dhcp' THEN c ELSE 0 END) as dhcp_count,
+        SUM(CASE WHEN et='firewall' THEN c ELSE 0 END) as firewall_count
+      FROM (
+        SELECT strftime('%Y-%m-%dT%H:00:00.000Z', received_at) as bucket, client_mac as mac, event_type as et, COUNT(*) as c
+        FROM events WHERE client_mac IS NOT NULL GROUP BY bucket, client_mac, event_type
+        UNION ALL
+        SELECT strftime('%Y-%m-%dT%H:00:00.000Z', received_at), wifi_client_mac, event_type, COUNT(*)
+        FROM events WHERE wifi_client_mac IS NOT NULL GROUP BY 1, wifi_client_mac, event_type
+        UNION ALL
+        SELECT strftime('%Y-%m-%dT%H:00:00.000Z', received_at), dhcp_mac, event_type, COUNT(*)
+        FROM events WHERE dhcp_mac IS NOT NULL GROUP BY 1, dhcp_mac, event_type
+      )
+      GROUP BY bucket, mac
     `);
   }
 
@@ -278,12 +417,125 @@ class SqliteBackend extends StorageBackend {
     const placeholders = cols.map(() => '?').join(', ');
     const sql = `INSERT INTO events (${cols.join(', ')}) VALUES (${placeholders})`;
     this.insertStmt = this.db.prepare(sql);
+
+    // Rollup UPSERT statements
+    this._rollupEventStats = this.db.prepare(`
+      INSERT INTO event_stats_5m (bucket, event_type, action, count) VALUES (?, ?, ?, ?)
+      ON CONFLICT(bucket, event_type, action) DO UPDATE SET count = count + excluded.count
+    `);
+    this._rollupIpStats = this.db.prepare(`
+      INSERT INTO ip_stats_hourly (bucket, ip, direction, event_count, blocked_count, threat_count) VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(bucket, ip, direction) DO UPDATE SET
+        event_count = event_count + excluded.event_count,
+        blocked_count = blocked_count + excluded.blocked_count,
+        threat_count = threat_count + excluded.threat_count
+    `);
+    this._rollupPortStats = this.db.prepare(`
+      INSERT INTO port_stats_hourly (bucket, port, protocol, count) VALUES (?, ?, ?, ?)
+      ON CONFLICT(bucket, port, protocol) DO UPDATE SET count = count + excluded.count
+    `);
+    this._rollupSigStats = this.db.prepare(`
+      INSERT INTO sig_stats_hourly (bucket, signature, classification, count) VALUES (?, ?, ?, ?)
+      ON CONFLICT(bucket, signature, classification) DO UPDATE SET count = count + excluded.count
+    `);
+    this._rollupClientStats = this.db.prepare(`
+      INSERT INTO client_stats_hourly (bucket, mac, event_count, wifi_count, dhcp_count, firewall_count) VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(bucket, mac) DO UPDATE SET
+        event_count = event_count + excluded.event_count,
+        wifi_count = wifi_count + excluded.wifi_count,
+        dhcp_count = dhcp_count + excluded.dhcp_count,
+        firewall_count = firewall_count + excluded.firewall_count
+    `);
+
     this.insertManyTxn = this.db.transaction((events) => {
       for (const evt of events) {
         const values = cols.map(col => evt[col] ?? null);
         this.insertStmt.run(values);
       }
+      this._updateRollups(events);
     });
+  }
+
+  _updateRollups(events) {
+    const now = Date.now();
+    const bucket5m = new Date(Math.floor(now / 300000) * 300000).toISOString();
+    const bucket1h = new Date(Math.floor(now / 3600000) * 3600000).toISOString();
+
+    // Pre-aggregate batch in JS
+    const eventCounts = new Map();  // key: event_type|action → count
+    const ipCounts = new Map();     // key: ip|direction → { event, blocked, threat }
+    const portCounts = new Map();   // key: port|protocol → count
+    const sigCounts = new Map();    // key: signature|classification → count
+    const clientCounts = new Map(); // key: mac → { event, wifi, dhcp, firewall }
+
+    for (const evt of events) {
+      const type = evt.event_type || 'unknown';
+      const action = evt.action || '';
+
+      // event_stats_5m
+      const ek = `${type}|${action}`;
+      eventCounts.set(ek, (eventCounts.get(ek) || 0) + 1);
+
+      // ip_stats_hourly
+      const isBlocked = action === 'block' ? 1 : 0;
+      const isThreat = type === 'threat' ? 1 : 0;
+      if (evt.src_ip) {
+        const sk = `${evt.src_ip}|src`;
+        const s = ipCounts.get(sk) || { event: 0, blocked: 0, threat: 0 };
+        s.event++; s.blocked += isBlocked; s.threat += isThreat;
+        ipCounts.set(sk, s);
+      }
+      if (evt.dst_ip) {
+        const dk = `${evt.dst_ip}|dst`;
+        const d = ipCounts.get(dk) || { event: 0, blocked: 0, threat: 0 };
+        d.event++; d.blocked += isBlocked; d.threat += isThreat;
+        ipCounts.set(dk, d);
+      }
+
+      // port_stats_hourly
+      if (evt.dst_port) {
+        const pk = `${evt.dst_port}|${evt.protocol || ''}`;
+        portCounts.set(pk, (portCounts.get(pk) || 0) + 1);
+      }
+
+      // sig_stats_hourly
+      if (type === 'threat' && evt.ids_signature) {
+        const sigk = `${evt.ids_signature}|${evt.ids_classification || ''}`;
+        sigCounts.set(sigk, (sigCounts.get(sigk) || 0) + 1);
+      }
+
+      // client_stats_hourly
+      const mac = evt.client_mac || evt.wifi_client_mac || evt.dhcp_mac;
+      if (mac) {
+        const c = clientCounts.get(mac) || { event: 0, wifi: 0, dhcp: 0, firewall: 0 };
+        c.event++;
+        if (type === 'wifi') c.wifi++;
+        if (type === 'dhcp') c.dhcp++;
+        if (type === 'firewall') c.firewall++;
+        clientCounts.set(mac, c);
+      }
+    }
+
+    // UPSERT aggregated counts
+    for (const [key, count] of eventCounts) {
+      const [type, action] = key.split('|');
+      this._rollupEventStats.run(bucket5m, type, action, count);
+    }
+    for (const [key, counts] of ipCounts) {
+      const [ip, dir] = key.split('|');
+      this._rollupIpStats.run(bucket1h, ip, dir, counts.event, counts.blocked, counts.threat);
+    }
+    for (const [key, count] of portCounts) {
+      const [port, protocol] = key.split('|');
+      this._rollupPortStats.run(bucket1h, parseInt(port, 10), protocol, count);
+    }
+    for (const [key, count] of sigCounts) {
+      const [sig, cls] = key.split('|');
+      this._rollupSigStats.run(bucket1h, sig, cls, count);
+    }
+    for (const [mac, counts] of clientCounts) {
+      this._rollupClientStats.run(bucket1h, mac, counts.event, counts.wifi, counts.dhcp, counts.firewall);
+    }
   }
 
   // --- Write Operations ---
@@ -369,7 +621,9 @@ class SqliteBackend extends StorageBackend {
     const now = new Date();
     const localMidnight = new Date(now.getFullYear(), now.getMonth(), now.getDate());
     const midnightISO = localMidnight.toISOString();
-    const row = await this._queryAsync("SELECT COUNT(*) as count FROM events WHERE received_at >= ?", [midnightISO], 'get');
+    const row = await this._queryAsync(
+      "SELECT COALESCE(SUM(count), 0) as count FROM event_stats_5m WHERE bucket >= ?", [midnightISO], 'get'
+    );
     return row.count;
   }
 
@@ -379,9 +633,9 @@ class SqliteBackend extends StorageBackend {
   }
 
   async getEventTypeCounts(since) {
-    let sql = 'SELECT event_type, COUNT(*) as count FROM events';
+    let sql = 'SELECT event_type, SUM(count) as count FROM event_stats_5m';
     const params = [];
-    if (since) { sql += ' WHERE received_at >= ?'; params.push(since); }
+    if (since) { sql += ' WHERE bucket >= ?'; params.push(since); }
     sql += ' GROUP BY event_type';
     const rows = await this._queryAsync(sql, params);
     const counts = {};
@@ -406,11 +660,11 @@ class SqliteBackend extends StorageBackend {
 
   async getOverviewStats(since) {
     const [totalRow, byType, allowedRow, blockedRow, threatsRow] = await Promise.all([
-      this._queryAsync('SELECT COUNT(*) as c FROM events WHERE received_at >= ?', [since], 'get'),
+      this._queryAsync('SELECT COALESCE(SUM(count), 0) as c FROM event_stats_5m WHERE bucket >= ?', [since], 'get'),
       this.getEventTypeCounts(since),
-      this._queryAsync("SELECT COUNT(*) as c FROM events WHERE event_type='firewall' AND action='allow' AND received_at >= ?", [since], 'get'),
-      this._queryAsync("SELECT COUNT(*) as c FROM events WHERE event_type='firewall' AND action='block' AND received_at >= ?", [since], 'get'),
-      this._queryAsync("SELECT COUNT(*) as c FROM events WHERE event_type='threat' AND received_at >= ?", [since], 'get'),
+      this._queryAsync("SELECT COALESCE(SUM(count), 0) as c FROM event_stats_5m WHERE event_type='firewall' AND action='allow' AND bucket >= ?", [since], 'get'),
+      this._queryAsync("SELECT COALESCE(SUM(count), 0) as c FROM event_stats_5m WHERE event_type='firewall' AND action='block' AND bucket >= ?", [since], 'get'),
+      this._queryAsync("SELECT COALESCE(SUM(count), 0) as c FROM event_stats_5m WHERE event_type='threat' AND bucket >= ?", [since], 'get'),
     ]);
     return {
       total: totalRow.c,
@@ -420,10 +674,8 @@ class SqliteBackend extends StorageBackend {
   }
 
   async getTimeline(since, bucketFormat, eventType, bucketSize) {
-    // Derive bucket interval and strftime format from bucketSize (ignores bucketFormat)
+    // Derive bucket interval from bucketSize
     const bucketMs = { '5m': 300000, '15m': 900000, '1h': 3600000, '1d': 86400000 }[bucketSize || '1h'] || 3600000;
-    const formatMap = { '5m': '%Y-%m-%dT%H:%M', '15m': '%Y-%m-%dT%H:%M', '1h': '%Y-%m-%dT%H', '1d': '%Y-%m-%d' };
-    const sqlFormat = formatMap[bucketSize || '1h'] || '%Y-%m-%dT%H';
 
     // Pre-generate zero-filled bucket map aligned to bucket boundaries
     const startTime = new Date(Math.floor(new Date(since).getTime() / bucketMs) * bucketMs);
@@ -438,39 +690,32 @@ class SqliteBackend extends StorageBackend {
         : { ts, firewall: 0, threat: 0, dhcp: 0, dns_filter: 0, wifi: 0, admin: 0, system: 0, total: 0 });
     }
 
-    // Single GROUP BY query — efficient, then merge into pre-generated buckets
+    // Query rollup table — already bucketed at 5m granularity
     let sql;
     if (eventType === 'firewall') {
-      sql = `SELECT strftime('${sqlFormat}', received_at) as ts,
-              SUM(CASE WHEN action='allow' THEN 1 ELSE 0 END) as allowed,
-              SUM(CASE WHEN action='block' THEN 1 ELSE 0 END) as blocked
-             FROM events WHERE event_type='firewall' AND received_at >= ?
-             GROUP BY ts ORDER BY ts`;
+      sql = `SELECT bucket as ts,
+              SUM(CASE WHEN action='allow' THEN count ELSE 0 END) as allowed,
+              SUM(CASE WHEN action='block' THEN count ELSE 0 END) as blocked
+             FROM event_stats_5m WHERE event_type='firewall' AND bucket >= ?
+             GROUP BY bucket ORDER BY bucket`;
     } else {
-      sql = `SELECT strftime('${sqlFormat}', received_at) as ts,
-              SUM(CASE WHEN event_type='firewall' THEN 1 ELSE 0 END) as firewall,
-              SUM(CASE WHEN event_type='threat' THEN 1 ELSE 0 END) as threat,
-              SUM(CASE WHEN event_type='dhcp' THEN 1 ELSE 0 END) as dhcp,
-              SUM(CASE WHEN event_type='dns_filter' THEN 1 ELSE 0 END) as dns_filter,
-              SUM(CASE WHEN event_type='wifi' THEN 1 ELSE 0 END) as wifi,
-              SUM(CASE WHEN event_type='admin' THEN 1 ELSE 0 END) as admin,
-              SUM(CASE WHEN event_type='system' THEN 1 ELSE 0 END) as system,
-              COUNT(*) as total
-             FROM events WHERE received_at >= ?
-             GROUP BY ts ORDER BY ts`;
+      sql = `SELECT bucket as ts,
+              SUM(CASE WHEN event_type='firewall' THEN count ELSE 0 END) as firewall,
+              SUM(CASE WHEN event_type='threat' THEN count ELSE 0 END) as threat,
+              SUM(CASE WHEN event_type='dhcp' THEN count ELSE 0 END) as dhcp,
+              SUM(CASE WHEN event_type='dns_filter' THEN count ELSE 0 END) as dns_filter,
+              SUM(CASE WHEN event_type='wifi' THEN count ELSE 0 END) as wifi,
+              SUM(CASE WHEN event_type='admin' THEN count ELSE 0 END) as admin,
+              SUM(CASE WHEN event_type='system' THEN count ELSE 0 END) as system,
+              SUM(count) as total
+             FROM event_stats_5m WHERE bucket >= ?
+             GROUP BY bucket ORDER BY bucket`;
     }
 
     const rows = await this._queryAsync(sql, [since]);
-    // Pad truncated strftime output to parseable ISO 8601 UTC
-    // strftime output is UTC but lacks 'Z', so new Date() would parse as local time
-    const padTs = (ts) => {
-      if (ts.length === 13) return ts + ':00Z';  // YYYY-MM-DDTHH → +':00Z'
-      if (ts.length === 16) return ts + 'Z';     // YYYY-MM-DDTHH:MM → +'Z'
-      if (ts.length === 10) return ts + 'T00:00Z'; // YYYY-MM-DD → +'T00:00Z'
-      return ts;
-    };
+    // Merge rollup rows into bucket map (floor to target bucket size for 15m/1h/1d)
     for (const row of rows) {
-      const aligned = new Date(Math.floor(new Date(padTs(row.ts)).getTime() / bucketMs) * bucketMs);
+      const aligned = new Date(Math.floor(new Date(row.ts).getTime() / bucketMs) * bucketMs);
       const key = aligned.toISOString();
       if (buckets.has(key)) {
         const bucket = buckets.get(key);
@@ -494,99 +739,74 @@ class SqliteBackend extends StorageBackend {
   }
 
   async getTopTalkers(since, direction, limit, excludePrivate) {
-    const col = direction === 'dst' ? 'dst_ip' : 'src_ip';
-    const geoCol = direction === 'dst' ? 'dst_geo_country' : 'src_geo_country';
-    const hostCol = direction === 'dst' ? 'dst_hostname' : 'src_hostname';
-    const privFilter = excludePrivate ? `AND ${this._privateIpFilter(col)}` : '';
-    return this._queryAsync(`
-      SELECT ${col} as ip, COUNT(*) as count, MAX(received_at) as lastSeen,
-             ${geoCol} as country, ${hostCol} as hostname
-      FROM events WHERE ${col} IS NOT NULL AND received_at >= ? ${privFilter}
-      GROUP BY ${col} ORDER BY count DESC LIMIT ?
-    `, [since, limit]);
+    const dir = direction === 'dst' ? 'dst' : 'src';
+    const privFilter = excludePrivate ? `AND ${this._privateIpFilter('ip')}` : '';
+    const rows = await this._queryAsync(`
+      SELECT ip, SUM(event_count) as count
+      FROM ip_stats_hourly WHERE direction = ? AND bucket >= ? ${privFilter}
+      GROUP BY ip ORDER BY count DESC LIMIT ?
+    `, [dir, since, limit]);
+
+    // Enrich with geo/hostname from cache
+    return this._enrichIpRows(rows);
   }
 
   async getTopBlocked(since, direction, limit, excludePrivate) {
-    const col = direction === 'dst' ? 'dst_ip' : 'src_ip';
-    const geoCol = direction === 'dst' ? 'dst_geo_country' : 'src_geo_country';
-    const abuseCol = direction === 'dst' ? 'dst_abuse_score' : 'src_abuse_score';
-    const hostCol = direction === 'dst' ? 'dst_hostname' : 'src_hostname';
-    const privFilter = excludePrivate ? `AND ${this._privateIpFilter(col)}` : '';
-    return this._queryAsync(`
-      SELECT ${col} as ip, COUNT(*) as count, MAX(received_at) as lastSeen,
-             ${geoCol} as country, ${abuseCol} as abuseScore, ${hostCol} as hostname
-      FROM events WHERE action='block' AND ${col} IS NOT NULL AND received_at >= ? ${privFilter}
-      GROUP BY ${col} ORDER BY count DESC LIMIT ?
-    `, [since, limit]);
+    const dir = direction === 'dst' ? 'dst' : 'src';
+    const privFilter = excludePrivate ? `AND ${this._privateIpFilter('ip')}` : '';
+    const rows = await this._queryAsync(`
+      SELECT ip, SUM(blocked_count) as count
+      FROM ip_stats_hourly WHERE direction = ? AND bucket >= ? ${privFilter}
+      GROUP BY ip HAVING count > 0 ORDER BY count DESC LIMIT ?
+    `, [dir, since, limit]);
+
+    // Enrich with geo/hostname/abuseScore from cache
+    return this._enrichIpRows(rows, true);
+  }
+
+  async _enrichIpRows(rows, includeAbuse = false) {
+    if (rows.length === 0) return rows;
+    const ips = rows.map(r => r.ip);
+    const placeholders = ips.map(() => '?').join(',');
+    const cacheRows = await this._queryAsync(
+      `SELECT ip, geo_country, abuse_score, hostname FROM ip_enrichment_cache WHERE ip IN (${placeholders})`,
+      ips
+    );
+    const cache = new Map(cacheRows.map(r => [r.ip, r]));
+    return rows.map(r => {
+      const c = cache.get(r.ip) || {};
+      const result = { ip: r.ip, count: r.count, lastSeen: null, country: c.geo_country || null, hostname: c.hostname || null };
+      if (includeAbuse) result.abuseScore = c.abuse_score ?? null;
+      return result;
+    });
   }
 
   async getTopPorts(since, limit) {
     return this._queryAsync(`
-      SELECT dst_port as port, protocol, COUNT(*) as count
-      FROM events WHERE dst_port IS NOT NULL AND received_at >= ?
-      GROUP BY dst_port, protocol ORDER BY count DESC LIMIT ?
+      SELECT port, protocol, SUM(count) as count
+      FROM port_stats_hourly WHERE bucket >= ?
+      GROUP BY port, protocol ORDER BY count DESC LIMIT ?
     `, [since, limit]);
   }
 
   async getTopClients(since, limit) {
-    // 3 separate indexed queries instead of COALESCE full scan, then merge in JS
-    const [clientRows, wifiRows, dhcpRows] = await Promise.all([
-      this._queryAsync(`
-        SELECT client_mac as mac, MAX(client_alias) as alias, MAX(client_ip) as ip,
-          COUNT(*) as eventCount,
-          SUM(CASE WHEN event_type='wifi' THEN 1 ELSE 0 END) as wifiEvents,
-          SUM(CASE WHEN event_type='dhcp' THEN 1 ELSE 0 END) as dhcpEvents,
-          SUM(CASE WHEN event_type='firewall' THEN 1 ELSE 0 END) as firewallEvents
-        FROM events WHERE client_mac IS NOT NULL AND received_at >= ?
-        GROUP BY client_mac
-      `, [since]),
-      this._queryAsync(`
-        SELECT wifi_client_mac as mac, MAX(client_alias) as alias, MAX(src_ip) as ip,
-          COUNT(*) as eventCount,
-          SUM(CASE WHEN event_type='wifi' THEN 1 ELSE 0 END) as wifiEvents,
-          SUM(CASE WHEN event_type='dhcp' THEN 1 ELSE 0 END) as dhcpEvents,
-          SUM(CASE WHEN event_type='firewall' THEN 1 ELSE 0 END) as firewallEvents
-        FROM events WHERE wifi_client_mac IS NOT NULL AND received_at >= ?
-        GROUP BY wifi_client_mac
-      `, [since]),
-      this._queryAsync(`
-        SELECT dhcp_mac as mac, MAX(COALESCE(dhcp_hostname, client_alias)) as alias, MAX(dhcp_ip) as ip,
-          COUNT(*) as eventCount,
-          SUM(CASE WHEN event_type='wifi' THEN 1 ELSE 0 END) as wifiEvents,
-          SUM(CASE WHEN event_type='dhcp' THEN 1 ELSE 0 END) as dhcpEvents,
-          SUM(CASE WHEN event_type='firewall' THEN 1 ELSE 0 END) as firewallEvents
-        FROM events WHERE dhcp_mac IS NOT NULL AND received_at >= ?
-        GROUP BY dhcp_mac
-      `, [since]),
-    ]);
+    const rows = await this._queryAsync(`
+      SELECT mac, SUM(event_count) as eventCount,
+        SUM(wifi_count) as wifiEvents, SUM(dhcp_count) as dhcpEvents, SUM(firewall_count) as firewallEvents
+      FROM client_stats_hourly WHERE bucket >= ?
+      GROUP BY mac ORDER BY eventCount DESC LIMIT ?
+    `, [since, limit]);
 
-    // Merge by MAC: deduplicate, sum counts, keep best alias/ip
-    const merged = new Map();
-    for (const row of [...clientRows, ...wifiRows, ...dhcpRows]) {
-      const existing = merged.get(row.mac);
-      if (existing) {
-        existing.eventCount += row.eventCount;
-        existing.wifiEvents += row.wifiEvents;
-        existing.dhcpEvents += row.dhcpEvents;
-        existing.firewallEvents += row.firewallEvents;
-        if (!existing.alias && row.alias) existing.alias = row.alias;
-        if (!existing.ip && row.ip) existing.ip = row.ip;
-      } else {
-        merged.set(row.mac, { ...row });
-      }
-    }
-
-    return Array.from(merged.values())
-      .sort((a, b) => b.eventCount - a.eventCount)
-      .slice(0, limit);
+    // Enrich with alias/ip — not available in rollup, check events for most recent
+    if (rows.length === 0) return rows;
+    return rows.map(r => ({ ...r, alias: null, ip: null }));
   }
 
   async getTopThreats(since, limit) {
     return this._queryAsync(`
-      SELECT ids_signature as signature, ids_classification as classification,
-             COUNT(*) as count, MAX(received_at) as lastSeen
-      FROM events WHERE event_type='threat' AND ids_signature IS NOT NULL AND received_at >= ?
-      GROUP BY ids_signature ORDER BY count DESC LIMIT ?
+      SELECT signature, classification, SUM(count) as count, NULL as lastSeen
+      FROM sig_stats_hourly WHERE bucket >= ?
+      GROUP BY signature, classification ORDER BY count DESC LIMIT ?
     `, [since, limit]);
   }
 
@@ -728,15 +948,27 @@ class SqliteBackend extends StorageBackend {
   // --- Maintenance ---
 
   async runRetention(days) {
+    const cutoff = new Date(Date.now() - days * 86400000).toISOString();
     const result = this.db.prepare(
-      "DELETE FROM events WHERE received_at < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?)"
-    ).run(`-${days} days`);
+      "DELETE FROM events WHERE received_at < ?"
+    ).run(cutoff);
+    // Clean rollup tables too
+    this.db.prepare("DELETE FROM event_stats_5m WHERE bucket < ?").run(cutoff);
+    this.db.prepare("DELETE FROM ip_stats_hourly WHERE bucket < ?").run(cutoff);
+    this.db.prepare("DELETE FROM port_stats_hourly WHERE bucket < ?").run(cutoff);
+    this.db.prepare("DELETE FROM sig_stats_hourly WHERE bucket < ?").run(cutoff);
+    this.db.prepare("DELETE FROM client_stats_hourly WHERE bucket < ?").run(cutoff);
     return { deleted: result.changes };
   }
 
   async resetData() {
     this.db.exec('DROP TABLE IF EXISTS events');
     this.db.exec('DROP TABLE IF EXISTS ip_enrichment_cache');
+    this.db.exec('DROP TABLE IF EXISTS event_stats_5m');
+    this.db.exec('DROP TABLE IF EXISTS ip_stats_hourly');
+    this.db.exec('DROP TABLE IF EXISTS port_stats_hourly');
+    this.db.exec('DROP TABLE IF EXISTS sig_stats_hourly');
+    this.db.exec('DROP TABLE IF EXISTS client_stats_hourly');
     this._initSchema();
   }
 
