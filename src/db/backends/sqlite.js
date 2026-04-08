@@ -359,14 +359,15 @@ class SqliteBackend extends StorageBackend {
       GROUP BY bucket, dst_port, protocol
     `);
 
-    // Populate sig_stats_hourly
+    // Populate sig_stats_hourly — include all threats, fallback signature for missing
     this.db.exec(`
       INSERT OR IGNORE INTO sig_stats_hourly (bucket, signature, classification, count)
       SELECT
         strftime('%Y-%m-%dT%H', received_at) || ':00:00.000Z' as bucket,
-        ids_signature as signature, COALESCE(ids_classification, '') as classification, COUNT(*) as count
-      FROM events WHERE event_type='threat' AND ids_signature IS NOT NULL
-      GROUP BY bucket, ids_signature, ids_classification
+        COALESCE(ids_signature, '(no signature)') as signature,
+        COALESCE(ids_classification, '') as classification, COUNT(*) as count
+      FROM events WHERE event_type='threat'
+      GROUP BY bucket, signature, classification
     `);
 
     // Populate client_stats_hourly
@@ -457,36 +458,39 @@ class SqliteBackend extends StorageBackend {
   }
 
   _updateRollups(events) {
-    const now = Date.now();
-    const bucket5m = new Date(Math.floor(now / 300000) * 300000).toISOString();
-    const bucket1h = new Date(Math.floor(now / 3600000) * 3600000).toISOString();
+    const nowMs = Date.now();
 
-    // Pre-aggregate batch in JS
-    const eventCounts = new Map();  // key: event_type|action → count
-    const ipCounts = new Map();     // key: ip|direction → { event, blocked, threat }
-    const portCounts = new Map();   // key: port|protocol → count
-    const sigCounts = new Map();    // key: signature|classification → count
-    const clientCounts = new Map(); // key: mac → { event, wifi, dhcp, firewall }
+    // Pre-aggregate batch in JS, keyed by per-event bucket
+    const eventCounts = new Map();  // key: bucket5m|event_type|action → count
+    const ipCounts = new Map();     // key: bucket1h|ip|direction → { event, blocked, threat }
+    const portCounts = new Map();   // key: bucket1h|port|protocol → count
+    const sigCounts = new Map();    // key: bucket1h|signature|classification → count
+    const clientCounts = new Map(); // key: bucket1h|mac → { event, wifi, dhcp, firewall }
 
     for (const evt of events) {
+      // Use event's received_at for bucket, fall back to now
+      const evtMs = evt.received_at ? new Date(evt.received_at).getTime() : nowMs;
+      const b5m = new Date(Math.floor(evtMs / 300000) * 300000).toISOString();
+      const b1h = new Date(Math.floor(evtMs / 3600000) * 3600000).toISOString();
+
       const type = evt.event_type || 'unknown';
       const action = evt.action || '';
 
       // event_stats_5m
-      const ek = `${type}|${action}`;
+      const ek = `${b5m}|${type}|${action}`;
       eventCounts.set(ek, (eventCounts.get(ek) || 0) + 1);
 
       // ip_stats_hourly
       const isBlocked = action === 'block' ? 1 : 0;
       const isThreat = type === 'threat' ? 1 : 0;
       if (evt.src_ip) {
-        const sk = `${evt.src_ip}|src`;
+        const sk = `${b1h}|${evt.src_ip}|src`;
         const s = ipCounts.get(sk) || { event: 0, blocked: 0, threat: 0 };
         s.event++; s.blocked += isBlocked; s.threat += isThreat;
         ipCounts.set(sk, s);
       }
       if (evt.dst_ip) {
-        const dk = `${evt.dst_ip}|dst`;
+        const dk = `${b1h}|${evt.dst_ip}|dst`;
         const d = ipCounts.get(dk) || { event: 0, blocked: 0, threat: 0 };
         d.event++; d.blocked += isBlocked; d.threat += isThreat;
         ipCounts.set(dk, d);
@@ -494,47 +498,51 @@ class SqliteBackend extends StorageBackend {
 
       // port_stats_hourly
       if (evt.dst_port) {
-        const pk = `${evt.dst_port}|${evt.protocol || ''}`;
+        const pk = `${b1h}|${evt.dst_port}|${evt.protocol || ''}`;
         portCounts.set(pk, (portCounts.get(pk) || 0) + 1);
       }
 
-      // sig_stats_hourly
-      if (type === 'threat' && evt.ids_signature) {
-        const sigk = `${evt.ids_signature}|${evt.ids_classification || ''}`;
+      // sig_stats_hourly — include all threats, fallback signature for missing
+      if (type === 'threat') {
+        const sig = evt.ids_signature || '(no signature)';
+        const cls = evt.ids_classification || '';
+        const sigk = `${b1h}|${sig}|${cls}`;
         sigCounts.set(sigk, (sigCounts.get(sigk) || 0) + 1);
       }
 
       // client_stats_hourly
       const mac = evt.client_mac || evt.wifi_client_mac || evt.dhcp_mac;
       if (mac) {
-        const c = clientCounts.get(mac) || { event: 0, wifi: 0, dhcp: 0, firewall: 0 };
+        const ck = `${b1h}|${mac}`;
+        const c = clientCounts.get(ck) || { event: 0, wifi: 0, dhcp: 0, firewall: 0 };
         c.event++;
         if (type === 'wifi') c.wifi++;
         if (type === 'dhcp') c.dhcp++;
         if (type === 'firewall') c.firewall++;
-        clientCounts.set(mac, c);
+        clientCounts.set(ck, c);
       }
     }
 
     // UPSERT aggregated counts
     for (const [key, count] of eventCounts) {
-      const [type, action] = key.split('|');
-      this._rollupEventStats.run(bucket5m, type, action, count);
+      const [bucket, type, action] = key.split('|');
+      this._rollupEventStats.run(bucket, type, action, count);
     }
     for (const [key, counts] of ipCounts) {
-      const [ip, dir] = key.split('|');
-      this._rollupIpStats.run(bucket1h, ip, dir, counts.event, counts.blocked, counts.threat);
+      const [bucket, ip, dir] = key.split('|');
+      this._rollupIpStats.run(bucket, ip, dir, counts.event, counts.blocked, counts.threat);
     }
     for (const [key, count] of portCounts) {
-      const [port, protocol] = key.split('|');
-      this._rollupPortStats.run(bucket1h, parseInt(port, 10), protocol, count);
+      const [bucket, port, protocol] = key.split('|');
+      this._rollupPortStats.run(bucket, parseInt(port, 10), protocol, count);
     }
     for (const [key, count] of sigCounts) {
-      const [sig, cls] = key.split('|');
-      this._rollupSigStats.run(bucket1h, sig, cls, count);
+      const [bucket, sig, cls] = key.split('|');
+      this._rollupSigStats.run(bucket, sig, cls, count);
     }
-    for (const [mac, counts] of clientCounts) {
-      this._rollupClientStats.run(bucket1h, mac, counts.event, counts.wifi, counts.dhcp, counts.firewall);
+    for (const [key, counts] of clientCounts) {
+      const [bucket, mac] = key.split('|');
+      this._rollupClientStats.run(bucket, mac, counts.event, counts.wifi, counts.dhcp, counts.firewall);
     }
   }
 
