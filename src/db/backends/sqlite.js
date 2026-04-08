@@ -328,7 +328,7 @@ class SqliteBackend extends StorageBackend {
     this.db.exec(`
       INSERT OR IGNORE INTO ip_stats_hourly (bucket, ip, direction, event_count, blocked_count, threat_count)
       SELECT
-        strftime('%Y-%m-%dT%H:00:00.000Z', received_at) as bucket,
+        strftime('%Y-%m-%dT%H', received_at) || ':00:00.000Z' as bucket,
         src_ip as ip, 'src' as direction,
         COUNT(*) as event_count,
         SUM(CASE WHEN action='block' THEN 1 ELSE 0 END) as blocked_count,
@@ -340,7 +340,7 @@ class SqliteBackend extends StorageBackend {
     this.db.exec(`
       INSERT OR IGNORE INTO ip_stats_hourly (bucket, ip, direction, event_count, blocked_count, threat_count)
       SELECT
-        strftime('%Y-%m-%dT%H:00:00.000Z', received_at) as bucket,
+        strftime('%Y-%m-%dT%H', received_at) || ':00:00.000Z' as bucket,
         dst_ip as ip, 'dst' as direction,
         COUNT(*) as event_count,
         SUM(CASE WHEN action='block' THEN 1 ELSE 0 END) as blocked_count,
@@ -353,7 +353,7 @@ class SqliteBackend extends StorageBackend {
     this.db.exec(`
       INSERT OR IGNORE INTO port_stats_hourly (bucket, port, protocol, count)
       SELECT
-        strftime('%Y-%m-%dT%H:00:00.000Z', received_at) as bucket,
+        strftime('%Y-%m-%dT%H', received_at) || ':00:00.000Z' as bucket,
         dst_port as port, COALESCE(protocol, '') as protocol, COUNT(*) as count
       FROM events WHERE dst_port IS NOT NULL
       GROUP BY bucket, dst_port, protocol
@@ -363,7 +363,7 @@ class SqliteBackend extends StorageBackend {
     this.db.exec(`
       INSERT OR IGNORE INTO sig_stats_hourly (bucket, signature, classification, count)
       SELECT
-        strftime('%Y-%m-%dT%H:00:00.000Z', received_at) as bucket,
+        strftime('%Y-%m-%dT%H', received_at) || ':00:00.000Z' as bucket,
         ids_signature as signature, COALESCE(ids_classification, '') as classification, COUNT(*) as count
       FROM events WHERE event_type='threat' AND ids_signature IS NOT NULL
       GROUP BY bucket, ids_signature, ids_classification
@@ -373,19 +373,19 @@ class SqliteBackend extends StorageBackend {
     this.db.exec(`
       INSERT OR IGNORE INTO client_stats_hourly (bucket, mac, event_count, wifi_count, dhcp_count, firewall_count)
       SELECT
-        strftime('%Y-%m-%dT%H:00:00.000Z', received_at) as bucket,
+        strftime('%Y-%m-%dT%H', received_at) || ':00:00.000Z' as bucket,
         mac, SUM(c) as event_count,
         SUM(CASE WHEN et='wifi' THEN c ELSE 0 END) as wifi_count,
         SUM(CASE WHEN et='dhcp' THEN c ELSE 0 END) as dhcp_count,
         SUM(CASE WHEN et='firewall' THEN c ELSE 0 END) as firewall_count
       FROM (
-        SELECT strftime('%Y-%m-%dT%H:00:00.000Z', received_at) as bucket, client_mac as mac, event_type as et, COUNT(*) as c
+        SELECT strftime('%Y-%m-%dT%H', received_at) || ':00:00.000Z' as bucket, client_mac as mac, event_type as et, COUNT(*) as c
         FROM events WHERE client_mac IS NOT NULL GROUP BY bucket, client_mac, event_type
         UNION ALL
-        SELECT strftime('%Y-%m-%dT%H:00:00.000Z', received_at), wifi_client_mac, event_type, COUNT(*)
+        SELECT strftime('%Y-%m-%dT%H', received_at) || ':00:00.000Z', wifi_client_mac, event_type, COUNT(*)
         FROM events WHERE wifi_client_mac IS NOT NULL GROUP BY 1, wifi_client_mac, event_type
         UNION ALL
-        SELECT strftime('%Y-%m-%dT%H:00:00.000Z', received_at), dhcp_mac, event_type, COUNT(*)
+        SELECT strftime('%Y-%m-%dT%H', received_at) || ':00:00.000Z', dhcp_mac, event_type, COUNT(*)
         FROM events WHERE dhcp_mac IS NOT NULL GROUP BY 1, dhcp_mac, event_type
       )
       GROUP BY bucket, mac
