@@ -9,6 +9,7 @@
     "test-syslog": "node scripts/test-syslog.js"
   },
   "dependencies": {
+    "@opensearch-project/opensearch": "^3.5.1",
     "better-sqlite3": "^11.9.1",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",

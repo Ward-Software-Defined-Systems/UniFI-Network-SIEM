@@ -5,7 +5,7 @@ const { createSyslogServer, pause: pauseSyslog, resume: resumeSyslog } = require
 const { createServer } = require('./api/server');
 const { broadcastEvent } = require('./api/websocket');
 const { initGeoIp } = require('./enrichment/geoip');
-const { enqueueEvent, backfillFromCache, shutdownWorker, setCacheAccessors } = require('./enrichment/enrichment-queue');
+const { enqueueEvent, backfillFromCache, shutdownWorker, setCacheAccessors, setUpdateEnrichment, setBatchUpdateEnrichment, queueEnrichmentUpdate } = require('./enrichment/enrichment-queue');
 
 // Batch queue for the active backend
 let queue = [];
@@ -89,7 +89,7 @@ async function main() {
     const backend = storage.getBackend();
     const memCache = new Map();
     // Pre-warm: load existing cache entries from backend
-    backend.getAllCachedEnrichments?.().then(entries => {
+    backend.getAllCachedEnrichment?.().then(entries => {
       for (const e of (entries || [])) {
         if (e.ip) memCache.set(e.ip, e);
       }
@@ -106,6 +106,39 @@ async function main() {
         backend.markPrivate(ip).catch(() => {});
       },
     );
+    // Wire up event enrichment updates for external backends
+    setUpdateEnrichment((ip, direction, data, limit) =>
+      backend.updateEnrichment(ip, direction, data, limit)
+    );
+    // Wire up batch update if the backend supports it (OpenSearch)
+    if (typeof backend.updateEnrichmentBatch === 'function') {
+      setBatchUpdateEnrichment((ips, direction, data) =>
+        backend.updateEnrichmentBatch(ips, direction, data)
+      );
+    }
+
+    // Deferred startup backfill for external backends (matches SQLite's 30s delay)
+    setTimeout(() => {
+      if (memCache.size === 0) return;
+      const { isPrivateIp } = require('./utils/ip-utils');
+      const entries = [...memCache.values()].filter(e =>
+        e.ip && !isPrivateIp(e.ip) && !e.is_private && (e.geo_country || e.abuse_score != null)
+      );
+      if (entries.length === 0) return;
+      logger.info({ ips: entries.length }, 'Starting enrichment backfill for external backend');
+      for (const e of entries) {
+        const data = {
+          geo_country: e.geo_country,
+          geo_city: e.geo_city,
+          geo_lat: e.geo_lat,
+          geo_lon: e.geo_lon,
+          abuse_score: e.abuse_score,
+          hostname: e.hostname,
+        };
+        queueEnrichmentUpdate(e.ip, 'src', data);
+        queueEnrichmentUpdate(e.ip, 'dst', data);
+      }
+    }, 30000);
   }
 
   // Set up broadcast + enrichment on each inserted event

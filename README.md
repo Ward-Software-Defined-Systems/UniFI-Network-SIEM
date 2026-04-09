@@ -4,7 +4,7 @@
 ![License](https://img.shields.io/badge/License-Apache_2.0-blue?style=flat-square)
 ![Node.js](https://img.shields.io/badge/Node.js-22_LTS+-green?style=flat-square)
 
-A self-contained, **AI-powered** Node.js application that collects syslog from UniFi consoles and gateways, parses all event types, stores them in SQLite, and serves a real-time security dashboard with built-in AI threat hunting.
+A self-contained, **AI-powered** Node.js application that collects syslog from UniFi consoles and gateways, parses all event types, stores them in SQLite (or OpenSearch/WardSONDB), and serves a real-time security dashboard with built-in AI threat hunting.
 
 ## Features
 
@@ -19,7 +19,7 @@ A self-contained, **AI-powered** Node.js application that collects syslog from U
 - **Threat Intel** — sortable/filterable table of enriched IPs with abuse scores, event counts, and locations; period-filtered summary cards alongside all-time totals
 - **Threat Hunt (Beta)** — AI-powered threat actor investigation with SSE streaming. Enter any IP to get a full profile: local SIEM activity (events, ports, timeline, IDS signatures, related /24 IPs), external intel (rDNS, WHOIS/ASN), and a structured AI threat assessment streamed token-by-token with PDF export. Supports Anthropic (Opus 4.6 with adaptive thinking, 128K output), OpenAI (GPT-5.4, 128K output), and Google (Gemini 3.1 Pro, 65K output) with on-page API key management. *Currently tested with Anthropic only — OpenAI and Google integrations are implemented but untested.*
 - **HTTPS by default** — auto-generated self-signed TLS certificate
-- **Pluggable storage backends** — SQLite (built-in default), WardSONDB (Beta), OpenSearch (Beta — Coming Soon)
+- **Pluggable storage backends** — SQLite (built-in default), WardSONDB (Beta), OpenSearch (Beta). OpenSearch runs via Docker with native aggregations (no rollup tables), batched enrichment backfill with `update_by_query`, and full Threat Hunt support
 - **SQLite storage** — WAL mode, batched inserts, automatic retention cleanup, worker thread enrichment. Materialized rollup tables (event_stats_5m, ip/port/sig/client_stats_hourly) are updated atomically on insert for sub-second dashboard stats at scale (tested to 8M+ events). A dedicated stats worker thread keeps the event loop responsive during queries. Existing databases self-heal on restart: legacy indexes are automatically dropped and replaced with optimized compound indexes, and rollup tables are backfilled from existing events on first upgrade
 - **Zero external services** — everything runs in one process
 
@@ -77,6 +77,21 @@ cd frontend && npm run dev   # Vite HMR (port 5173)
 ```
 
 Open https://localhost:3000 in your browser. Accept the self-signed certificate warning on first visit.
+
+### Using OpenSearch Backend (Optional)
+
+```bash
+# Start OpenSearch via Docker (HTTPS + self-signed cert, 4GB heap)
+./docker/opensearch/start.sh
+
+# Start SIEM with OpenSearch env vars
+OPENSEARCH_HOST=localhost OPENSEARCH_PORT=9200 \
+OPENSEARCH_USERNAME=admin OPENSEARCH_PASSWORD='S!em_Secure9200' \
+OPENSEARCH_USE_TLS=true OPENSEARCH_VERIFY_CERTS=false \
+npm run dev
+```
+
+Or select OpenSearch from Settings > Database Engine in the web UI and restart. Configuration is persisted — env vars are only needed for initial setup.
 
 ### Test with fake syslog
 
@@ -186,6 +201,14 @@ For full functionality, three logging sources on the UniFi Console should be con
 | `INSERT_BATCH_SIZE` | 50 | Batch insert threshold |
 | `INSERT_BATCH_INTERVAL_MS` | 500 | Batch insert flush interval |
 | `WARDSONDB_HEALTH_TIMEOUT_MS` | 5000 | WardSONDB health check timeout (ms) |
+| `OPENSEARCH_HOST` | localhost | OpenSearch host |
+| `OPENSEARCH_PORT` | 9200 | OpenSearch port |
+| `OPENSEARCH_USERNAME` | *(empty)* | Basic auth username (empty = no auth) |
+| `OPENSEARCH_PASSWORD` | *(empty)* | Basic auth password |
+| `OPENSEARCH_USE_TLS` | false | Enable HTTPS connection |
+| `OPENSEARCH_VERIFY_CERTS` | true | Verify TLS certificates (set false for self-signed) |
+| `OPENSEARCH_INDEX_PREFIX` | siem- | Prefix for OpenSearch index names |
+| `OPENSEARCH_BULK_SIZE` | 50 | Bulk insert batch size |
 
 > **⚠️ Important:** Settings and configuration are always stored in the local SQLite database (`data/events.db`), regardless of which storage backend is active. Do not delete this file even when using WardSONDB or OpenSearch — it contains your backend configuration, API keys, and other settings needed to boot the application. Changing the storage backend requires a SIEM restart to take effect.
 
@@ -220,7 +243,7 @@ src/
       index.js                 # Backend registry & factory
       sqlite.js                # SQLite backend (default)
       wardsondb.js             # WardSONDB backend (Beta)
-      opensearch.js            # OpenSearch backend (Beta — Coming Soon)
+      opensearch.js            # OpenSearch backend (Beta)
   api/
     server.js                  # Express + static serving
     websocket.js               # WebSocket live stream
@@ -305,6 +328,6 @@ The app runs HTTPS by default with an auto-generated self-signed certificate. Be
 - [x] Performance optimization — enrichment backfill moved to worker thread for non-blocking operation
 - [x] Storage backend abstraction — pluggable database engine (SQLite, WardSONDB, OpenSearch) selectable from Settings
 - [x] WardSONDB integration — high-performance Rust-based JSON document database with deferred index creation and write pressure detection
-- [ ] OpenSearch integration — enterprise search and analytics engine with built-in SIEM capabilities
+- [x] OpenSearch integration — distributed search/analytics engine via Docker with native aggregations, batched enrichment backfill, and full Threat Hunt support
 - [x] Query performance optimization — bitmap scan acceleration and compound range scans via WardSONDB at 3.45M+ events
 - [ ] launchd plist for macOS auto-start

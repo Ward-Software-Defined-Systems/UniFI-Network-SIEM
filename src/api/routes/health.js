@@ -20,7 +20,7 @@ function withTimeout(promise, ms, fallback) {
 }
 
 // Must be longer than the backend's own health timeout to avoid the wrapper timing out first
-const HEALTH_TIMEOUT_MS = config.wardsondb.healthTimeoutMs + 3000;
+const HEALTH_TIMEOUT_MS = Math.max(config.wardsondb.healthTimeoutMs, 5000) + 3000;
 
 router.get('/', async (req, res) => {
   try {
@@ -36,16 +36,16 @@ router.get('/', async (req, res) => {
       } catch {}
     }
 
-    // Wrap backend calls with a timeout for WardSONDB (prevents hang when DB is overloaded)
+    // Wrap backend calls with a timeout for networked backends (prevents hang when DB is overloaded)
     // SQLite is synchronous/fast — no timeout needed
-    const useTimeout = backendName === 'WardSONDB';
+    const isNetworkedBackend = backendName === 'WardSONDB' || backendName === 'OpenSearch';
     const TIMEOUT = '_TIMEOUT_';
-    const wrap = (p) => useTimeout ? withTimeout(p, HEALTH_TIMEOUT_MS, TIMEOUT) : p;
+    const wrap = (p) => isNetworkedBackend ? withTimeout(p, HEALTH_TIMEOUT_MS, TIMEOUT) : p;
 
-    if (backendName === 'WardSONDB') {
-      // Sequential approach for WardSONDB: run healthCheck() FIRST (O(1) calls to
-      // /_health, /_stats, /events/storage), then decide whether to query further.
-      // This prevents connection pile-ups when the DB is empty, unreachable, or overloaded.
+    if (isNetworkedBackend) {
+      // Sequential approach for networked backends: run healthCheck() FIRST, then
+      // decide whether to query further. This prevents connection pile-ups when the
+      // DB is empty, unreachable, or overloaded.
       const healthCheck = await wrap(backend.healthCheck());
       const hc = healthCheck !== TIMEOUT ? healthCheck : null;
       const docCount = hc?.details?.eventsStorage?.docCount ?? hc?.details?.totalDocuments ?? null;

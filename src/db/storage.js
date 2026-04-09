@@ -35,9 +35,12 @@ async function initialize() {
   } else {
     // External backend for data, SQLite for settings
     try {
+      const backendEnvConfig = engineId === 'opensearch' ? config.opensearch
+        : engineId === 'wardsondb' ? config.wardsondb
+        : {};
       activeBackend = createBackend(engineId, {
+        ...backendEnvConfig,
         ...engineConfig,
-        ...config.wardsondb,
         abuseIpDbCacheHours: config.enrichment.abuseIpDbCacheHours,
       });
       await activeBackend.initialize();

@@ -27,6 +27,16 @@ const config = {
   wardsondb: {
     healthTimeoutMs: parseInt(process.env.WARDSONDB_HEALTH_TIMEOUT_MS || '5000', 10),
   },
+  opensearch: {
+    host: process.env.OPENSEARCH_HOST || 'localhost',
+    port: parseInt(process.env.OPENSEARCH_PORT || '9200', 10),
+    username: process.env.OPENSEARCH_USERNAME || '',
+    password: process.env.OPENSEARCH_PASSWORD || '',
+    useTls: process.env.OPENSEARCH_USE_TLS === 'true',
+    verifyCerts: process.env.OPENSEARCH_VERIFY_CERTS !== 'false',
+    indexPrefix: process.env.OPENSEARCH_INDEX_PREFIX || 'siem-',
+    bulkSize: parseInt(process.env.OPENSEARCH_BULK_SIZE || '50', 10),
+  },
   logging: {
     level: process.env.LOG_LEVEL || 'info',
     logRawMessages: process.env.LOG_RAW_MESSAGES === 'true',

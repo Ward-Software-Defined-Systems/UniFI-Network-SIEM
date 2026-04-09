@@ -18,11 +18,88 @@ let worker = null;
 let _getCache = null;
 let _setCache = null;
 let _markPrivate = null;
+let _updateEnrichment = null;      // Single-IP update (backend.updateEnrichment)
+let _batchUpdateEnrichment = null; // Batch update (backend.updateEnrichmentBatch) — optional
+let _updateQueue = [];              // Serialized queue for update_by_query calls
+let _updateRunning = false;
+let _updateDrainTimer = null;
+let _shuttingDown = false;
+const UPDATE_BATCH_DELAY_MS = 500;  // Accumulate for 500ms before draining
+const UPDATE_BATCH_MAX_IPS = 50;    // Or drain when 50 IPs queued per direction
+const UPDATE_BATCH_DRAIN_LIMIT = 200; // Max items to drain per cycle (prevents mega-batches)
 
 function setCacheAccessors(getCached, setCached, markPriv) {
   _getCache = getCached;
   _setCache = setCached;
   _markPrivate = markPriv;
+}
+
+function setUpdateEnrichment(fn) {
+  _updateEnrichment = fn;
+}
+
+function setBatchUpdateEnrichment(fn) {
+  _batchUpdateEnrichment = fn;
+}
+
+/** Queue an enrichment update — batched drain groups IPs with same data */
+function queueEnrichmentUpdate(ip, direction, data) {
+  if (_shuttingDown) return;
+  if (!_updateEnrichment && !_batchUpdateEnrichment) return;
+  if (isPrivateIp(ip)) return;
+  _updateQueue.push({ ip, direction, data });
+
+  // Drain immediately if we have enough items, otherwise debounce
+  if (_updateQueue.length >= UPDATE_BATCH_MAX_IPS * 2) {
+    if (_updateDrainTimer) { clearTimeout(_updateDrainTimer); _updateDrainTimer = null; }
+    drainUpdateQueue();
+  } else if (!_updateDrainTimer && !_updateRunning) {
+    _updateDrainTimer = setTimeout(() => { _updateDrainTimer = null; drainUpdateQueue(); }, UPDATE_BATCH_DELAY_MS);
+  }
+}
+
+async function drainUpdateQueue() {
+  if (_updateRunning || _shuttingDown) return;
+  _updateRunning = true;
+
+  while (_updateQueue.length > 0 && !_shuttingDown) {
+    // Take a bounded chunk to prevent mega-batches
+    const batch = _updateQueue.splice(0, UPDATE_BATCH_DRAIN_LIMIT);
+
+    if (_batchUpdateEnrichment) {
+      // Group by direction + enrichment data for batch calls
+      const groups = new Map();
+      for (const item of batch) {
+        const key = `${item.direction}:${JSON.stringify(item.data)}`;
+        if (!groups.has(key)) {
+          groups.set(key, { direction: item.direction, data: item.data, ips: [] });
+        }
+        groups.get(key).ips.push(item.ip);
+      }
+
+      for (const group of groups.values()) {
+        try {
+          const result = await _batchUpdateEnrichment(group.ips, group.direction, group.data);
+          if (result.updated > 0) {
+            logger.debug({ ips: group.ips.length, direction: group.direction, updated: result.updated }, 'Batch enrichment update');
+          }
+        } catch (err) {
+          logger.warn({ err: err.message, ips: group.ips.length, direction: group.direction }, 'Batch enrichment update failed');
+        }
+      }
+    } else if (_updateEnrichment) {
+      // Fallback: serial per-IP updates
+      for (const { ip, direction, data } of batch) {
+        try {
+          await _updateEnrichment(ip, direction, data);
+        } catch (err) {
+          logger.warn({ err: err.message, ip, direction }, 'Enrichment update failed');
+        }
+      }
+    }
+  }
+
+  _updateRunning = false;
 }
 
 function initWorker() {
@@ -78,20 +155,21 @@ function enqueueIp(ip) {
   const cached = _getCache(ip);
   if (cached) {
     if (cached.geo_country || cached.abuse_score != null) {
-      // Delegate UPDATE to worker thread (SQLite) or skip (WardSONDB handles differently)
+      const data = {
+        geo_country: cached.geo_country,
+        geo_city: cached.geo_city,
+        geo_lat: cached.geo_lat,
+        geo_lon: cached.geo_lon,
+        abuse_score: cached.abuse_score,
+        hostname: cached.hostname,
+      };
       if (worker) {
-        sendToWorker({
-          type: 'update',
-          ip,
-          data: {
-            geo_country: cached.geo_country,
-            geo_city: cached.geo_city,
-            geo_lat: cached.geo_lat,
-            geo_lon: cached.geo_lon,
-            abuse_score: cached.abuse_score,
-            hostname: cached.hostname,
-          },
-        });
+        // SQLite: delegate to worker thread
+        sendToWorker({ type: 'update', ip, data });
+      } else if (_updateEnrichment) {
+        // External backends: queue serial update_by_query calls
+        queueEnrichmentUpdate(ip, 'src', data);
+        queueEnrichmentUpdate(ip, 'dst', data);
       }
     }
     if (cached.abuse_score == null && isAbuseIpDbAvailable()) {
@@ -175,9 +253,14 @@ async function enrichIp(ip) {
     // Cache the result
     if (_setCache) _setCache(ip, enrichment);
 
-    // Update existing events via worker (SQLite only)
+    // Update existing events with enrichment data
     if (worker) {
+      // SQLite: delegate to worker thread
       sendToWorker({ type: 'update', ip, data: enrichment });
+    } else if (_updateEnrichment) {
+      // External backends: queue serial update_by_query calls
+      queueEnrichmentUpdate(ip, 'src', enrichment);
+      queueEnrichmentUpdate(ip, 'dst', enrichment);
     }
 
     logger.debug({ ip, country: enrichment.geo_country, abuse: enrichment.abuse_score }, 'Enriched IP');
@@ -198,10 +281,14 @@ function backfillFromCache() {
 }
 
 function shutdownWorker() {
+  _shuttingDown = true;
+  // Clear pending update queue and drain timer
+  _updateQueue.length = 0;
+  if (_updateDrainTimer) { clearTimeout(_updateDrainTimer); _updateDrainTimer = null; }
   if (worker) {
     worker.postMessage({ type: 'shutdown' });
     worker = null;
   }
 }
 
-module.exports = { enqueueEvent, enqueueIp, getQueueSize, backfillFromCache, shutdownWorker, setCacheAccessors };
+module.exports = { enqueueEvent, enqueueIp, getQueueSize, backfillFromCache, shutdownWorker, setCacheAccessors, setUpdateEnrichment, setBatchUpdateEnrichment, queueEnrichmentUpdate };
