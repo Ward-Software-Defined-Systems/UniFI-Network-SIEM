@@ -2,16 +2,28 @@ import React from 'react';
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, Legend } from 'recharts';
 import { EVENT_TYPES } from '../../lib/constants';
 
-export default function Timeline({ data }) {
+export default function Timeline({ data, period }) {
   if (!data || data.length === 0) {
     return <div className="h-64 flex items-center justify-center text-gray-600">No data</div>;
   }
 
-  // Format timestamps for display
-  const formatted = data.map(d => ({
-    ...d,
-    label: d.ts ? new Date(d.ts).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false }) : '',
-  }));
+  // Format timestamps for display — include day for longer periods
+  const formatLabel = (ts) => {
+    if (!ts) return '';
+    const d = new Date(ts);
+    if (period === '30d') {
+      return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+    }
+    if (period === '7d') {
+      return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) + ' ' +
+             d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false });
+    }
+    return d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false });
+  };
+  const formatted = data.map(d => ({ ...d, label: formatLabel(d.ts) }));
+
+  // Recharts thins labels using minTickGap — wider gap for longer periods
+  const minTickGap = period === '30d' ? 60 : period === '7d' ? 80 : 30;
 
   // Determine which series are present
   const seriesKeys = Object.keys(data[0]).filter(k => k !== 'ts' && k !== 'label' && k !== 'total');
@@ -22,7 +34,7 @@ export default function Timeline({ data }) {
       <h3 className="text-sm font-medium text-gray-300 mb-3">Event Timeline</h3>
       <ResponsiveContainer width="100%" height={250}>
         <AreaChart data={formatted}>
-          <XAxis dataKey="label" tick={{ fontSize: 10, fill: '#6b7280' }} />
+          <XAxis dataKey="label" tick={{ fontSize: 10, fill: '#6b7280' }} interval="preserveStartEnd" minTickGap={minTickGap} />
           <YAxis tick={{ fontSize: 10, fill: '#6b7280' }} width={40} />
           <Tooltip
             contentStyle={{ backgroundColor: '#1f2937', border: '1px solid #374151', borderRadius: '8px' }}

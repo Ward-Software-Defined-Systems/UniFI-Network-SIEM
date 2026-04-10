@@ -117,7 +117,7 @@ export default function Dashboard({ period, setPeriod, refreshRate, setRefreshRa
       <PausedIndicator paused={paused} loading={loadProgress.loading} />
 
       <StatsCards overview={overview} />
-      <Timeline data={timeline} />
+      <Timeline data={timeline} period={period} />
 
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
         <TopTalkers data={topBlockedDst} title="Top Blocked Destinations" />

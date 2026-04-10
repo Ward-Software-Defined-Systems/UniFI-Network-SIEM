@@ -6,6 +6,8 @@
 
 A self-contained, **AI-powered** Node.js application that collects syslog from UniFi consoles and gateways, parses all event types, stores them in SQLite (or OpenSearch/WardSONDB), and serves a real-time security dashboard with built-in AI threat hunting.
 
+> **📊 Backend Recommendation for Scale:** OpenSearch is currently the recommended storage backend for deployments expecting 8M+ events. Its native aggregations (`date_histogram`, `terms`, `cardinality`) eliminate the rollup table overhead used by SQLite and provide sub-second dashboard queries at any scale. SQLite and WardSONDB remain fully supported and are appropriate for smaller deployments — performance optimizations for both are planned. See [Using OpenSearch Backend](#using-opensearch-backend-optional) below to get started.
+
 ## Features
 
 - **Syslog collector** — UDP listener for UniFi Traffic Logging and Activity Logging (CEF)
