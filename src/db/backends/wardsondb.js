@@ -943,28 +943,51 @@ class WardsonDbBackend extends StorageBackend {
 
   async getTopClients(since, limit) {
     if (await this._isCollectionEmpty()) return [];
-    // Client MAC is spread across wifi.client_mac, dhcp.mac, client.mac
-    // Without $or in aggregation _id, query wifi events as proxy
-    const pipeline = [
-      { '$match': { received_at: { '$gte': since }, 'wifi.client_mac': { '$exists': true } } },
+    // Client MAC is spread across wifi.client_mac, dhcp.mac, client.mac.
+    // WardSONDB can't $or on _id, so aggregate each field separately and merge.
+    const INTERNAL_LIMIT = 500;
+    const buildPipeline = (macField) => ([
+      { '$match': { received_at: { '$gte': since }, [macField]: { '$exists': true } } },
       { '$group': {
-        '_id': 'wifi.client_mac',
-        'eventCount': { '$count': {} },
+        '_id': { 'mac': macField, 'et': 'event_type' },
+        'count': { '$count': {} },
       }},
-      { '$sort': { 'eventCount': 'desc' } },
-      { '$limit': limit },
-    ];
+      { '$sort': { 'count': 'desc' } },
+      { '$limit': INTERNAL_LIMIT },
+    ]);
 
-    const result = await this._aggregate(pipeline);
-    return (result.data || []).map(r => ({
-      mac: r._id,
-      alias: null,
-      ip: null,
-      eventCount: r.eventCount,
-      wifiEvents: r.eventCount,
-      dhcpEvents: 0,
-      firewallEvents: 0,
-    }));
+    const [wifiRes, dhcpRes, clientRes] = await Promise.all([
+      this._aggregate(buildPipeline('wifi.client_mac')),
+      this._aggregate(buildPipeline('dhcp.mac')),
+      this._aggregate(buildPipeline('client.mac')),
+    ]);
+
+    const merged = new Map();
+    const accumulate = (rows) => {
+      for (const r of rows || []) {
+        const mac = r._id?.mac;
+        const et = r._id?.et;
+        const c = r.count || 0;
+        if (!mac) continue;
+        let entry = merged.get(mac);
+        if (!entry) {
+          entry = { eventCount: 0, wifiEvents: 0, dhcpEvents: 0, firewallEvents: 0 };
+          merged.set(mac, entry);
+        }
+        entry.eventCount += c;
+        if (et === 'wifi') entry.wifiEvents += c;
+        else if (et === 'dhcp') entry.dhcpEvents += c;
+        else if (et === 'firewall') entry.firewallEvents += c;
+      }
+    };
+    accumulate(wifiRes.data);
+    accumulate(dhcpRes.data);
+    accumulate(clientRes.data);
+
+    return Array.from(merged.entries())
+      .map(([mac, v]) => ({ mac, alias: null, ip: null, ...v }))
+      .sort((a, b) => b.eventCount - a.eventCount)
+      .slice(0, limit);
   }
 
   async getTopThreats(since, limit) {
