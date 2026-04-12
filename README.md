@@ -202,6 +202,9 @@ For full functionality, three logging sources on the UniFi Console should be con
 | `LOG_RAW_MESSAGES` | false | Store raw syslog text in DB |
 | `INSERT_BATCH_SIZE` | 50 | Batch insert threshold |
 | `INSERT_BATCH_INTERVAL_MS` | 500 | Batch insert flush interval |
+| `ENRICHMENT_CONCURRENCY` | 5 | Max parallel enrichment lookups |
+| `RDNS_TIMEOUT_MS` | 2000 | Reverse DNS lookup timeout (ms) |
+| `WS_BROADCAST_THROTTLE_MS` | 100 | WebSocket broadcast throttle interval (ms) |
 | `WARDSONDB_HEALTH_TIMEOUT_MS` | 5000 | WardSONDB health check timeout (ms) |
 | `OPENSEARCH_HOST` | localhost | OpenSearch host |
 | `OPENSEARCH_PORT` | 9200 | OpenSearch port |
@@ -219,6 +222,11 @@ For full functionality, three logging sources on the UniFi Console should be con
 ## Project Structure
 
 ```
+docker/
+  opensearch/
+    docker-compose.yml         # OpenSearch single-node + security plugin
+    start.sh                   # Boot helper (waits for HTTPS readiness)
+
 src/
   index.js                    # Entry point
   config.js                   # Environment config
@@ -239,7 +247,10 @@ src/
   db/
     database.js                # SQLite connection & schema
     events.js                  # Event CRUD & batch insert
+    cache.js                   # IP enrichment cache
     retention.js               # Periodic cleanup
+    storage.js                 # Active backend manager (singleton)
+    stats-worker.js            # Read-only stats worker thread
     backends/
       interface.js             # StorageBackend base class
       index.js                 # Backend registry & factory
@@ -250,19 +261,19 @@ src/
     server.js                  # Express + static serving
     websocket.js               # WebSocket live stream
     routes/                    # REST API routes
-  utils/                       # IP utils, port names, constants
-
   enrichment/
     geoip.js                   # MaxMind GeoLite2 lookup
     abuseipdb.js               # AbuseIPDB API client
     rdns.js                    # Reverse DNS lookup
     enrichment-queue.js        # Async enrichment coordinator
-    enrichment-worker.js       # Worker thread for UPDATE operations
-  db/cache.js                  # IP enrichment cache
+    enrichment-worker.js       # Worker thread for SQLite UPDATEs
+  utils/                       # IP utils, port names, constants
 
 frontend/                      # React + Vite + Tailwind
   src/
     components/
+      Layout.jsx               # App shell + navigation
+      Settings.jsx              # Settings view
       live/                    # Live stream view
       dashboard/               # Analytics dashboard
       map/                     # Live Map (Leaflet)
