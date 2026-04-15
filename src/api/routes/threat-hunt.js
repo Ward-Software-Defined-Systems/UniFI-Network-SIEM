@@ -6,15 +6,18 @@ const logger = require('../../utils/logger');
 
 const router = express.Router();
 
-// Period selector — same options as Dashboard / Live Map / Threat Intel
+// Period selector — same options as Dashboard / Live Map / Threat Intel.
+// When the request body omits `period` entirely the queries revert to main's
+// all-time behavior (no time filter). The UI always sends a period so this
+// only affects direct API callers.
 const PERIOD_MS = {
   '1h': 3600000, '6h': 21600000, '24h': 86400000,
   '7d': 604800000, '30d': 2592000000,
 };
-const DEFAULT_PERIOD = '24h';
 
 function getSince(period) {
-  const offset = PERIOD_MS[period] || PERIOD_MS[DEFAULT_PERIOD];
+  const offset = PERIOD_MS[period];
+  if (!offset) return null;
   return new Date(Date.now() - offset).toISOString();
 }
 
@@ -91,21 +94,21 @@ router.post('/investigate', async (req, res) => {
   if (!key) return res.status(400).json({ error: `No API key configured for ${huntSettings.provider}` });
 
   try {
-    const since = getSince(period || DEFAULT_PERIOD);
+    const since = period ? getSince(period) : null; // null = all-time
 
-    // Gather local intelligence (scoped to the requested period)
+    // Gather local intelligence (scoped to the period if provided, else all-time)
     const intel = await gatherLocalIntel(target, since);
 
     // Gather external intelligence (not time-scoped — rDNS / WHOIS)
     const external = await gatherExternalIntel(target);
 
     // Build prompt and call AI
-    const prompt = buildInvestigationPrompt(target, intel, external, period || DEFAULT_PERIOD);
+    const prompt = buildInvestigationPrompt(target, intel, external, period || null);
     const analysis = await callAI(prompt);
 
     res.json({
       target,
-      period: period || DEFAULT_PERIOD,
+      period: period || null,
       provider: huntSettings.provider,
       intel,
       external,
@@ -138,8 +141,7 @@ router.post('/investigate-stream', async (req, res) => {
   };
 
   try {
-    const periodKey = period || DEFAULT_PERIOD;
-    const since = getSince(periodKey);
+    const since = period ? getSince(period) : null; // null = all-time
     const intel = await gatherLocalIntel(target, since);
     const external = await gatherExternalIntel(target);
     const timestamp = new Date().toISOString();
@@ -147,14 +149,14 @@ router.post('/investigate-stream', async (req, res) => {
     // Send metadata immediately so frontend can render intel panels
     sendEvent('metadata', {
       target,
-      period: periodKey,
+      period: period || null,
       provider: huntSettings.provider,
       intel,
       external,
       timestamp,
     });
 
-    const prompt = buildInvestigationPrompt(target, intel, external, periodKey);
+    const prompt = buildInvestigationPrompt(target, intel, external, period || null);
     const provider = huntSettings.provider;
 
     switch (provider) {
@@ -207,42 +209,47 @@ async function gatherLocalIntel(target, since) {
 function gatherLocalIntelSQLite(target, since) {
   const db = getDb();
 
+  // `since` may be null (period omitted) — in that case skip the time filter
+  // entirely to match main's pre-period-selector behavior.
+  const t = since ? 'AND received_at >= ?' : '';
+  const tArg = since ? [since] : [];
+
   // Cache + related-IPs lookups are NOT time-scoped (cache is current-state).
   const cached = db.prepare('SELECT * FROM ip_enrichment_cache WHERE ip = ?').get(target);
   const totalEvents = db.prepare(
-    'SELECT COUNT(*) as c FROM events WHERE (src_ip = ? OR dst_ip = ?) AND received_at >= ?'
-  ).get(target, target, since).c;
+    `SELECT COUNT(*) as c FROM events WHERE (src_ip = ? OR dst_ip = ?) ${t}`
+  ).get(target, target, ...tArg).c;
   const byAction = db.prepare(`
     SELECT action, COUNT(*) as count FROM events
-    WHERE (src_ip = ? OR dst_ip = ?) AND action IS NOT NULL AND received_at >= ?
+    WHERE (src_ip = ? OR dst_ip = ?) AND action IS NOT NULL ${t}
     GROUP BY action ORDER BY count DESC
-  `).all(target, target, since);
+  `).all(target, target, ...tArg);
   const byType = db.prepare(`
     SELECT event_type, COUNT(*) as count FROM events
-    WHERE (src_ip = ? OR dst_ip = ?) AND received_at >= ?
+    WHERE (src_ip = ? OR dst_ip = ?) ${t}
     GROUP BY event_type ORDER BY count DESC
-  `).all(target, target, since);
+  `).all(target, target, ...tArg);
   const topPorts = db.prepare(`
     SELECT dst_port, protocol, COUNT(*) as count FROM events
-    WHERE src_ip = ? AND dst_port IS NOT NULL AND received_at >= ?
+    WHERE src_ip = ? AND dst_port IS NOT NULL ${t}
     GROUP BY dst_port, protocol ORDER BY count DESC LIMIT 20
-  `).all(target, since);
+  `).all(target, ...tArg);
   const topSrcPorts = db.prepare(`
     SELECT src_port, protocol, COUNT(*) as count FROM events
-    WHERE dst_ip = ? AND src_port IS NOT NULL AND received_at >= ?
+    WHERE dst_ip = ? AND src_port IS NOT NULL ${t}
     GROUP BY src_port, protocol ORDER BY count DESC LIMIT 10
-  `).all(target, since);
+  `).all(target, ...tArg);
   const timeline = db.prepare(`
     SELECT strftime('%Y-%m-%dT%H:00:00Z', received_at) as hour, COUNT(*) as count
-    FROM events WHERE (src_ip = ? OR dst_ip = ?) AND received_at >= ?
+    FROM events WHERE (src_ip = ? OR dst_ip = ?) ${t}
     GROUP BY hour ORDER BY hour
-  `).all(target, target, since);
+  `).all(target, target, ...tArg);
   const firstSeen = db.prepare(
-    'SELECT MIN(received_at) as t FROM events WHERE (src_ip = ? OR dst_ip = ?) AND received_at >= ?'
-  ).get(target, target, since).t;
+    `SELECT MIN(received_at) as t FROM events WHERE (src_ip = ? OR dst_ip = ?) ${t}`
+  ).get(target, target, ...tArg).t;
   const lastSeen = db.prepare(
-    'SELECT MAX(received_at) as t FROM events WHERE (src_ip = ? OR dst_ip = ?) AND received_at >= ?'
-  ).get(target, target, since).t;
+    `SELECT MAX(received_at) as t FROM events WHERE (src_ip = ? OR dst_ip = ?) ${t}`
+  ).get(target, target, ...tArg).t;
   const subnet = target.split('.').slice(0, 3).join('.');
   const relatedIPs = db.prepare(`
     SELECT ip, abuse_score, geo_country, hostname FROM ip_enrichment_cache
@@ -251,22 +258,22 @@ function gatherLocalIntelSQLite(target, since) {
   `).all(subnet + '.%', target);
   const signatures = db.prepare(`
     SELECT ids_signature, ids_classification, COUNT(*) as count
-    FROM events WHERE (src_ip = ? OR dst_ip = ?) AND ids_signature IS NOT NULL AND received_at >= ?
+    FROM events WHERE (src_ip = ? OR dst_ip = ?) AND ids_signature IS NOT NULL ${t}
     GROUP BY ids_signature ORDER BY count DESC LIMIT 10
-  `).all(target, target, since);
-  const targetsHit = db.prepare(`
-    SELECT COUNT(DISTINCT dst_ip) as c FROM events WHERE src_ip = ? AND received_at >= ?
-  `).get(target, since).c;
+  `).all(target, target, ...tArg);
+  const targetsHit = db.prepare(
+    `SELECT COUNT(DISTINCT dst_ip) as c FROM events WHERE src_ip = ? ${t}`
+  ).get(target, ...tArg).c;
   const topDestinations = db.prepare(`
     SELECT dst_ip as ip, COUNT(*) as count FROM events
-    WHERE src_ip = ? AND dst_ip IS NOT NULL AND received_at >= ?
+    WHERE src_ip = ? AND dst_ip IS NOT NULL ${t}
     GROUP BY dst_ip ORDER BY count DESC LIMIT 20
-  `).all(target, since);
+  `).all(target, ...tArg);
   const topSources = db.prepare(`
     SELECT src_ip as ip, COUNT(*) as count FROM events
-    WHERE dst_ip = ? AND src_ip IS NOT NULL AND received_at >= ?
+    WHERE dst_ip = ? AND src_ip IS NOT NULL ${t}
     GROUP BY src_ip ORDER BY count DESC LIMIT 20
-  `).all(target, since);
+  `).all(target, ...tArg);
 
   return { cached, totalEvents, byAction, byType, topPorts, topSrcPorts, timeline, firstSeen, lastSeen, relatedIPs, signatures, targetsHit, topDestinations, topSources };
 }
@@ -324,16 +331,18 @@ async function gatherLocalIntelWardsonDB(target, since) {
   const cacheCol = backend.cacheCollection;
   const post = (path, body) => backend._request('POST', path, body, 3);
 
-  // Resolve the partition set covering [since, now]
-  const untilISO = new Date().toISOString();
-  const partitions = backend._getPartitionsForRange(since, untilISO);
+  // Resolve the partition set. When `since` is null (no period provided),
+  // fan out across every known partition — matches main's all-time behavior.
+  const partitions = since
+    ? backend._getPartitionsForRange(since, new Date().toISOString())
+    : backend._partitionsNewestFirst();
 
-  // Partitions narrow the day-range, but within each partition we still need
-  // a received_at >= since clause so queries don't scan events outside the
-  // requested window (e.g. period=1h in today's partition would otherwise
-  // return all of today's events, not just the last hour).
-  const timeRange = { received_at: { '$gte': since } };
-  const withTime = (f) => ({ '$and': [f, timeRange] });
+  // When a period is provided, AND a received_at >= since clause into every
+  // $match so we don't scan events outside the window (partitions only narrow
+  // the day range; within a partition we still need the clause). When `since`
+  // is null, leave filters unmodified.
+  const timeRange = since ? { received_at: { '$gte': since } } : null;
+  const withTime = (f) => timeRange ? { '$and': [f, timeRange] } : f;
 
   // IP filter applied at $match (cheap pre-filter on indexed src/dst ip fields)
   const ipOr = { '$or': [{ 'network.src_ip': target }, { 'network.dst_ip': target }] };
@@ -387,7 +396,9 @@ async function gatherLocalIntelWardsonDB(target, since) {
     ]),
 
     fanOutAggregate(backend, partitions, [
-      { '$match': { '$and': [ipOr, { 'ids.signature': { '$exists': true } }, timeRange] } },
+      { '$match': {
+        '$and': [ipOr, { 'ids.signature': { '$exists': true } }, ...(timeRange ? [timeRange] : [])],
+      } },
       { '$group': { '_id': { sig: 'ids.signature', cls: 'ids.classification' }, count: { '$count': {} } } },
     ]),
 
@@ -533,9 +544,12 @@ async function gatherLocalIntelOpenSearch(target, since) {
   const eventsIndex = backend.eventsIndex;
   const cacheIndex = backend.cacheIndex;
 
-  const timeRange = { range: { received_at: { gte: since } } };
+  // `since` may be null (period omitted) — skip the range filter entirely
+  // to match main's pre-period-selector behavior.
+  const timeRange = since ? { range: { received_at: { gte: since } } } : null;
+  const withTime = (filters) => timeRange ? [...filters, timeRange] : filters;
   const ipShould = { bool: { should: [{ term: { src_ip: target } }, { term: { dst_ip: target } }], minimum_should_match: 1 } };
-  const ipFilter = { bool: { filter: [ipShould, timeRange] } };
+  const ipFilter = { bool: { filter: withTime([ipShould]) } };
 
   try {
     const [mainResult, portsResult, srcPortsResult, firstLastResult, sigsResult, targetsResult, topDstResult, topSrcResult, cachedResult] = await Promise.all([
@@ -553,14 +567,14 @@ async function gatherLocalIntelOpenSearch(target, since) {
       // Top destination ports (target as source)
       client.search({ index: eventsIndex, body: {
         size: 0,
-        query: { bool: { filter: [{ term: { src_ip: target } }, { exists: { field: 'dst_port' } }, timeRange] } },
+        query: { bool: { filter: withTime([{ term: { src_ip: target } }, { exists: { field: 'dst_port' } }]) } },
         aggs: { top_ports: { terms: { field: 'dst_port', size: 20 }, aggs: { proto: { terms: { field: 'protocol', size: 1 } } } } },
       }}).catch(() => ({ body: { aggregations: {} } })),
 
       // Top source ports (target as destination)
       client.search({ index: eventsIndex, body: {
         size: 0,
-        query: { bool: { filter: [{ term: { dst_ip: target } }, { exists: { field: 'src_port' } }, timeRange] } },
+        query: { bool: { filter: withTime([{ term: { dst_ip: target } }, { exists: { field: 'src_port' } }]) } },
         aggs: { top_ports: { terms: { field: 'src_port', size: 10 }, aggs: { proto: { terms: { field: 'protocol', size: 1 } } } } },
       }}).catch(() => ({ body: { aggregations: {} } })),
 
@@ -573,28 +587,28 @@ async function gatherLocalIntelOpenSearch(target, since) {
       // IDS signatures
       client.search({ index: eventsIndex, body: {
         size: 0,
-        query: { bool: { filter: [ipShould, { exists: { field: 'ids_signature' } }, timeRange] } },
+        query: { bool: { filter: withTime([ipShould, { exists: { field: 'ids_signature' } }]) } },
         aggs: { sigs: { terms: { field: 'ids_signature', size: 10 }, aggs: { cls: { terms: { field: 'ids_category', size: 1 } } } } },
       }}).catch(() => ({ body: { aggregations: {} } })),
 
       // Unique targets hit (cardinality)
       client.search({ index: eventsIndex, body: {
         size: 0,
-        query: { bool: { filter: [{ term: { src_ip: target } }, timeRange] } },
+        query: { bool: { filter: withTime([{ term: { src_ip: target } }]) } },
         aggs: { unique_dst: { cardinality: { field: 'dst_ip' } } },
       }}).catch(() => ({ body: { aggregations: {} } })),
 
       // Top destination IPs
       client.search({ index: eventsIndex, body: {
         size: 0,
-        query: { bool: { filter: [{ term: { src_ip: target } }, { exists: { field: 'dst_ip' } }, timeRange] } },
+        query: { bool: { filter: withTime([{ term: { src_ip: target } }, { exists: { field: 'dst_ip' } }]) } },
         aggs: { top: { terms: { field: 'dst_ip', size: 20 } } },
       }}).catch(() => ({ body: { aggregations: {} } })),
 
       // Top source IPs
       client.search({ index: eventsIndex, body: {
         size: 0,
-        query: { bool: { filter: [{ term: { dst_ip: target } }, { exists: { field: 'src_ip' } }, timeRange] } },
+        query: { bool: { filter: withTime([{ term: { dst_ip: target } }, { exists: { field: 'src_ip' } }]) } },
         aggs: { top: { terms: { field: 'src_ip', size: 20 } } },
       }}).catch(() => ({ body: { aggregations: {} } })),
 
