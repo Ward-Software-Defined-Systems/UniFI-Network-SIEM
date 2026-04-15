@@ -33,6 +33,7 @@ UniFi-SIEM-Research.md
 SPEC_SIEM_wardsondb_backend_fixes.md
 SIEM_OPENSEARCH_BACKEND_TASK.md
 SIEM_WARDSONDB_PARTITIONING_ROLLUPS_TASK.md
+WardSONDB_API.md
 
 # Editor
 *.swp

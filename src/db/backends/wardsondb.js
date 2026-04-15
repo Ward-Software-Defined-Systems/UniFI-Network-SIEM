@@ -1,19 +1,53 @@
 /**
  * WardSONDB Storage Backend
- * 
- * REST API client connecting to a WardSONDB server instance.
- * Events and enrichment cache stored as WardSONDB collections.
- * Settings remain in SQLite (needed to boot and select backend).
- * 
- * Phase 1 Limitations:
- * - No aggregation pipeline — dashboard stats that require GROUP BY
- *   (timeline, top talkers, top ports, etc.) use client-side fallbacks
- *   or return empty results until Phase 2 aggregation is available.
- * - No TTL — retention cleanup is a no-op until Phase 2.
- * - No _update_by_query — enrichment backfill updates docs individually.
+ *
+ * Architecture:
+ * - Events stored in daily partition collections: events-YYYY-MM-DD.
+ *   New partitions are created on demand when an event for a new day arrives.
+ *   Retention drops entire partition collections atomically.
+ * - Five pre-aggregated rollup collections mirror SQLite's rollup tables:
+ *     rollups-5m, rollups-ip-hourly, rollups-port-hourly,
+ *     rollups-sig-hourly, rollups-client-hourly.
+ *   Counts are accumulated in memory during insertEvents() and flushed every
+ *   5 seconds via a read-then-increment cycle.
+ * - Singleton enrichment_cache collection stores per-IP enrichment data.
+ * - Settings remain in SQLite (needed to boot and select the backend).
  */
 const StorageBackend = require('./interface');
 const logger = require('../../utils/logger');
+const { isPrivateIp } = require('../../utils/ip-utils');
+const { Agent, setGlobalDispatcher } = require('undici');
+
+const FLUSH_INTERVAL_MS = 5000;
+const PARTITION_PREFIX = 'events-';
+const PARTITION_NAME_RE = /^events-\d{4}-\d{2}-\d{2}$/;
+
+// Configure Node's global fetch dispatcher so our WardSONDB client uses a
+// connect timeout that matches a busy/saturated server's accept latency.
+// Without this, undici's default 10s connect timeout surfaces as spurious
+// `Connect Timeout Error`s when many concurrent requests (rollup flushes +
+// inserts + dashboard polls) queue up behind a busy WardSONDB instance.
+// This is applied once at module load and affects every fetch() in the
+// process. Values are read from environment via src/config.js so operators
+// can tune them without a code change.
+let _dispatcherConfigured = false;
+function _configureDispatcher(connectTimeoutMs, queryTimeoutMs) {
+  if (_dispatcherConfigured) return;
+  _dispatcherConfigured = true;
+  try {
+    setGlobalDispatcher(new Agent({
+      connect: { timeout: connectTimeoutMs },
+      // 0 means "no client-side timeout" — server's --query-timeout governs.
+      headersTimeout: queryTimeoutMs || 0,
+      bodyTimeout: queryTimeoutMs || 0,
+      keepAliveTimeout: 10_000,
+      keepAliveMaxTimeout: 600_000,
+    }));
+    logger.info({ connectTimeoutMs, queryTimeoutMs }, 'WardSONDB undici dispatcher configured');
+  } catch (err) {
+    logger.warn({ err: err.message }, 'Failed to configure undici dispatcher — using defaults');
+  }
+}
 
 class WardsonDbBackend extends StorageBackend {
   constructor(config = {}) {
@@ -21,12 +55,39 @@ class WardsonDbBackend extends StorageBackend {
     this.baseUrl = `http${config.useTls ? 's' : ''}://${config.host || 'localhost'}:${config.port || 8080}`;
     this.apiKey = config.apiKey || '';
     this.verifyCerts = config.verifyCerts !== false; // default true
-    this.eventsCollection = 'events';
     this.cacheCollection = 'enrichment_cache';
+    this.rollup5m = 'rollups-5m';
+    this.rollupIpHourly = 'rollups-ip-hourly';
+    this.rollupPortHourly = 'rollups-port-hourly';
+    this.rollupSigHourly = 'rollups-sig-hourly';
+    this.rollupClientHourly = 'rollups-client-hourly';
     this.healthTimeoutMs = config.healthTimeoutMs || 5000;
+    this.flushConcurrency = Math.max(1, config.flushConcurrency || 4);
 
-    // If TLS with self-signed certs, disable Node's TLS verification globally
-    // Node's native fetch doesn't support per-request agent/dispatcher options
+    // Configure Node's global fetch dispatcher once, sized for this backend's
+    // workload. Must happen before any fetch() calls in initialize().
+    _configureDispatcher(
+      config.connectTimeoutMs || 60_000,
+      config.queryTimeoutMs || 0,
+    );
+
+    // Partition existence cache — Set<'events-YYYY-MM-DD'>
+    this._partitions = new Set();
+
+    // Rollup accumulator buffers, swapped on each flush
+    this._rollupBuffers = this._newBuffers();
+    this._flushIntervalHandle = null;
+    this._flushing = false;
+    this._shuttingDown = false;
+    this._backfillStarted = false;
+
+    // Cached doc count across event partitions, used for empty-DB short-circuit
+    this._cachedDocCount = null;
+
+    // Enrichment cache map (30s TTL), used by stats joins and event overlay
+    this._cacheMap = null;
+    this._cacheMapTs = 0;
+
     if (config.useTls && !this.verifyCerts) {
       process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
       logger.warn('TLS certificate verification disabled for WardSONDB connection');
@@ -53,7 +114,6 @@ class WardsonDbBackend extends StorageBackend {
   // --query-timeout flag (default 30s). To support long-running Threat Hunt queries,
   // launch WardSONDB with --query-timeout 120 or higher.
   // Health checks use _healthRequest() with AbortSignal.timeout(healthTimeoutMs).
-  // _request() has no client-side timeout — this is intentional.
 
   async _request(method, path, body = null, retries = 3) {
     const url = `${this.baseUrl}${path}`;
@@ -71,6 +131,7 @@ class WardsonDbBackend extends StorageBackend {
           const code = json.error?.code || 'UNKNOWN';
           const msg = json.error?.message || 'Unknown error';
           if (resp.status === 404) return { _notFound: true, code, message: msg };
+          if (resp.status === 409) return { _conflict: true, code, message: msg };
           // Retry on 5xx
           if (resp.status >= 500 && attempt < retries) {
             await new Promise(r => setTimeout(r, 500 * (attempt + 1)));
@@ -81,7 +142,6 @@ class WardsonDbBackend extends StorageBackend {
 
         return json;
       } catch (err) {
-        // Retry on network errors (ECONNREFUSED, fetch failed) — not slow queries
         if (attempt < retries && err.message?.includes('fetch failed')) {
           logger.debug({ err: err.message, attempt, path }, 'WardSONDB request failed, retrying');
           await new Promise(r => setTimeout(r, 500 * (attempt + 1)));
@@ -109,46 +169,342 @@ class WardsonDbBackend extends StorageBackend {
   async _patch(path, body) { return this._request('PATCH', path, body); }
   async _delete(path) { return this._request('DELETE', path); }
 
-  // --- Lifecycle ---
+  // --- Bucket alignment (mirrors sqlite.js:494-495) ---
 
-  async initialize() {
-    // Verify connection
-    const info = await this._get('/');
-    logger.info({ backend: 'wardsondb', version: info.data.version, url: this.baseUrl }, 'Connected to WardSONDB');
-
-    // Ensure collections exist
-    await this._ensureCollection(this.eventsCollection);
-    await this._ensureCollection(this.cacheCollection);
-
-    // Check if indexes already exist (from a previous run)
-    const existingIndexes = await this._get(`/${this.eventsCollection}/indexes`);
-    const indexCount = (existingIndexes.data || []).length;
-
-    if (indexCount >= 9) {
-      logger.info({ indexCount }, 'WardSONDB indexes already exist, skipping deferred creation');
-      this.indexesReady = Promise.resolve();
-    } else {
-      // Start background index creation — write-pressure check skipped during init
-      // indexesReady resolves when all indexes are created (or on failure, to avoid stalling ingestion)
-      this._isInitializing = true;
-      this.indexesReady = new Promise(resolve => { this._resolveIndexesReady = resolve; });
-      this._startDeferredIndexCreation();
-    }
-
-    // Cache initial doc count — used to short-circuit stats on empty DB
-    // Use /_stats (fast) instead of /collection/storage (can hang)
-    try {
-      const stats = await this._get('/_stats');
-      const totalDocs = stats.data?.total_documents;
-      this._cachedDocCount = (typeof totalDocs === 'number') ? totalDocs : null;
-    } catch {
-      this._cachedDocCount = null; // Unknown — don't short-circuit to empty results
-    }
-
-    logger.info({ backend: 'wardsondb', docCount: this._cachedDocCount, healthTimeoutMs: this.healthTimeoutMs }, 'Storage backend initialized');
+  _align5m(iso) {
+    const ms = (iso ? new Date(iso) : new Date()).getTime();
+    return new Date(Math.floor(ms / 300000) * 300000).toISOString();
   }
 
-  _getRequiredIndexes() {
+  _align1h(iso) {
+    const ms = (iso ? new Date(iso) : new Date()).getTime();
+    return new Date(Math.floor(ms / 3600000) * 3600000).toISOString();
+  }
+
+  // --- Partition helpers ---
+
+  _partitionName(dateLike) {
+    const d = dateLike instanceof Date ? dateLike : new Date(dateLike);
+    return `${PARTITION_PREFIX}${d.toISOString().substring(0, 10)}`;
+  }
+
+  /** Extract the partition name from a UUIDv7 _id (first 48 bits = ms since epoch) */
+  _partitionFromId(id) {
+    if (!id || typeof id !== 'string') return null;
+    const hex = id.replace(/-/g, '').substring(0, 12);
+    const ms = parseInt(hex, 16);
+    if (!Number.isFinite(ms) || ms <= 0) return null;
+    return this._partitionName(new Date(ms));
+  }
+
+  /** Returns existing partitions overlapping [sinceISO, untilISO], oldest-first */
+  _getPartitionsForRange(sinceISO, untilISO) {
+    const start = sinceISO ? new Date(sinceISO) : new Date(0);
+    const end = untilISO ? new Date(untilISO) : new Date();
+    const out = [];
+    const cur = new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth(), start.getUTCDate()));
+    const last = new Date(Date.UTC(end.getUTCFullYear(), end.getUTCMonth(), end.getUTCDate()));
+    while (cur <= last) {
+      const name = this._partitionName(cur);
+      if (this._partitions.has(name)) out.push(name);
+      cur.setUTCDate(cur.getUTCDate() + 1);
+    }
+    return out;
+  }
+
+  /** All known partitions, newest-first */
+  _partitionsNewestFirst() {
+    return [...this._partitions].sort().reverse();
+  }
+
+  /** Idempotent partition creation. Empty collections take indexes instantly. */
+  async _ensurePartition(name) {
+    if (this._partitions.has(name)) return;
+    await this._ensureCollection(name);
+    this._partitions.add(name);
+    // Fire-and-forget — empty collection means index creation is instant
+    this._createPartitionIndexes(name).catch(err =>
+      logger.warn({ err: err.message, partition: name }, 'WardSONDB partition index creation failed'));
+  }
+
+  async _createPartitionIndexes(name) {
+    for (const idx of this._getRequiredEventIndexes()) {
+      try {
+        const body = { name: idx.name };
+        if (idx.fields) body.fields = idx.fields;
+        else body.field = idx.field;
+        await this._post(`/${name}/indexes`, body);
+      } catch (err) {
+        if (err.message?.includes('INDEX_EXISTS')) continue;
+        logger.debug({ err: err.message, partition: name, idx: idx.name }, 'Partition index creation warn');
+      }
+    }
+  }
+
+  /**
+   * Fan out a query function over the partitions overlapping [since, until],
+   * newest-first. Stops early once `limit` results have been collected.
+   * Tolerates per-partition failures.
+   */
+  async _queryAcrossPartitions(queryFn, sinceISO, untilISO, limit) {
+    const partitions = sinceISO || untilISO
+      ? this._getPartitionsForRange(sinceISO, untilISO).reverse()
+      : this._partitionsNewestFirst();
+    if (partitions.length === 0) return [];
+
+    const results = [];
+    for (const p of partitions) {
+      if (results.length >= limit) break;
+      const remaining = limit - results.length;
+      try {
+        const batch = await queryFn(p, remaining);
+        if (Array.isArray(batch)) results.push(...batch);
+      } catch (err) {
+        logger.debug({ err: err.message, partition: p }, 'WardSONDB partition query failed, continuing');
+      }
+    }
+    return results.slice(0, limit);
+  }
+
+  // --- Rollup buffers ---
+
+  _newBuffers() {
+    return {
+      fiveMin: new Map(),     // key -> { bucket, event_type, action, count }
+      ipHourly: new Map(),    // key -> { bucket, ip, direction, event_count, blocked_count, threat_count }
+      portHourly: new Map(),  // key -> { bucket, port, protocol, count }
+      sigHourly: new Map(),   // key -> { bucket, signature, classification, count }
+      clientHourly: new Map(),// key -> { bucket, mac, event_count, wifi_count, dhcp_count, firewall_count }
+    };
+  }
+
+  /**
+   * Accumulate rollup deltas in memory. Mirrors sqlite.js:481-568 _updateRollups.
+   * Private IPs are NOT filtered at write time — they're filtered at query time
+   * when callers pass excludePrivate (matches SQLite's HAVING-style semantics).
+   */
+  _accumulateRollups(events) {
+    const bufs = this._rollupBuffers;
+    const now = Date.now();
+
+    for (const evt of events) {
+      const ms = evt.received_at ? new Date(evt.received_at).getTime() : now;
+      if (!Number.isFinite(ms)) continue;
+      const b5 = new Date(Math.floor(ms / 300000) * 300000).toISOString();
+      const b1 = new Date(Math.floor(ms / 3600000) * 3600000).toISOString();
+      const type = evt.event_type || 'unknown';
+      const action = evt.action || '';
+      const isBlocked = action === 'block' ? 1 : 0;
+      const isThreat = type === 'threat' ? 1 : 0;
+
+      // rollups-5m — every event
+      {
+        const key = `${b5}|${type}|${action}`;
+        const ex = bufs.fiveMin.get(key);
+        if (ex) ex.count++;
+        else bufs.fiveMin.set(key, { bucket: b5, event_type: type, action, count: 1 });
+      }
+
+      // rollups-ip-hourly — both directions, all IPs (filter at query time)
+      if (evt.src_ip) {
+        const key = `${b1}|${evt.src_ip}|src`;
+        const ex = bufs.ipHourly.get(key);
+        if (ex) {
+          ex.event_count++;
+          ex.blocked_count += isBlocked;
+          ex.threat_count += isThreat;
+        } else {
+          bufs.ipHourly.set(key, {
+            bucket: b1, ip: evt.src_ip, direction: 'src',
+            event_count: 1, blocked_count: isBlocked, threat_count: isThreat,
+          });
+        }
+      }
+      if (evt.dst_ip) {
+        const key = `${b1}|${evt.dst_ip}|dst`;
+        const ex = bufs.ipHourly.get(key);
+        if (ex) {
+          ex.event_count++;
+          ex.blocked_count += isBlocked;
+          ex.threat_count += isThreat;
+        } else {
+          bufs.ipHourly.set(key, {
+            bucket: b1, ip: evt.dst_ip, direction: 'dst',
+            event_count: 1, blocked_count: isBlocked, threat_count: isThreat,
+          });
+        }
+      }
+
+      // rollups-port-hourly — every event with dst_port (mirrors sqlite.js:521-524)
+      if (evt.dst_port != null) {
+        const protocol = evt.protocol || '';
+        const key = `${b1}|${evt.dst_port}|${protocol}`;
+        const ex = bufs.portHourly.get(key);
+        if (ex) ex.count++;
+        else bufs.portHourly.set(key, { bucket: b1, port: evt.dst_port, protocol, count: 1 });
+      }
+
+      // rollups-sig-hourly — threat events only, '(no signature)' fallback
+      if (type === 'threat') {
+        const sig = evt.ids_signature || '(no signature)';
+        const cls = evt.ids_classification || '';
+        const key = `${b1}|${sig}|${cls}`;
+        const ex = bufs.sigHourly.get(key);
+        if (ex) ex.count++;
+        else bufs.sigHourly.set(key, { bucket: b1, signature: sig, classification: cls, count: 1 });
+      }
+
+      // rollups-client-hourly — first-non-null MAC, pre-pivoted by event type
+      const mac = evt.client_mac || evt.wifi_client_mac || evt.dhcp_mac;
+      if (mac) {
+        const key = `${b1}|${mac}`;
+        const ex = bufs.clientHourly.get(key);
+        if (ex) {
+          ex.event_count++;
+          if (type === 'wifi') ex.wifi_count++;
+          else if (type === 'dhcp') ex.dhcp_count++;
+          else if (type === 'firewall') ex.firewall_count++;
+        } else {
+          bufs.clientHourly.set(key, {
+            bucket: b1, mac,
+            event_count: 1,
+            wifi_count: type === 'wifi' ? 1 : 0,
+            dhcp_count: type === 'dhcp' ? 1 : 0,
+            firewall_count: type === 'firewall' ? 1 : 0,
+          });
+        }
+      }
+    }
+  }
+
+  // --- Rollup flush ---
+
+  _docIdForFiveMin(d) { return `${d.bucket}|${d.event_type}|${d.action}`; }
+  _docIdForIpHourly(d) { return `${d.bucket}|${d.ip}|${d.direction}`; }
+  _docIdForPortHourly(d) { return `${d.bucket}|${d.port}|${d.protocol}`; }
+  _docIdForSigHourly(d) { return `${d.bucket}|${d.signature}|${d.classification}`; }
+  _docIdForClientHourly(d) { return `${d.bucket}|${d.mac}`; }
+
+  async _upsertRollup(collection, id, doc, mergeFields) {
+    const path = `/${collection}/docs/${encodeURIComponent(id)}`;
+    const existing = await this._get(path);
+
+    if (existing._notFound) {
+      // Insert new doc with the deterministic _id in the body
+      const body = { _id: id, ...doc };
+      const created = await this._post(`/${collection}/docs`, body);
+      if (created._conflict) {
+        // Concurrent creation — fall through to PATCH on retry
+        const refetched = await this._get(path);
+        if (refetched._notFound) throw new Error(`Failed to upsert rollup ${id}: conflict but doc not found`);
+        const merged = {};
+        for (const f of mergeFields) merged[f] = (refetched.data[f] || 0) + (doc[f] || 0);
+        await this._patch(path, merged);
+      }
+      return;
+    }
+
+    const merged = {};
+    for (const f of mergeFields) merged[f] = (existing.data[f] || 0) + (doc[f] || 0);
+    await this._patch(path, merged);
+  }
+
+  _mergeBuffersBack(drain) {
+    const live = this._rollupBuffers;
+    const mergeMap = (src, dst, fields) => {
+      for (const [k, v] of src) {
+        const ex = dst.get(k);
+        if (ex) {
+          for (const f of fields) ex[f] = (ex[f] || 0) + (v[f] || 0);
+        } else {
+          dst.set(k, v);
+        }
+      }
+    };
+    mergeMap(drain.fiveMin, live.fiveMin, ['count']);
+    mergeMap(drain.ipHourly, live.ipHourly, ['event_count', 'blocked_count', 'threat_count']);
+    mergeMap(drain.portHourly, live.portHourly, ['count']);
+    mergeMap(drain.sigHourly, live.sigHourly, ['count']);
+    mergeMap(drain.clientHourly, live.clientHourly, ['event_count', 'wifi_count', 'dhcp_count', 'firewall_count']);
+  }
+
+  async _flushRollups() {
+    if (this._flushing) return;
+    this._flushing = true;
+    const t0 = Date.now();
+
+    // Atomic swap
+    const drain = this._rollupBuffers;
+    this._rollupBuffers = this._newBuffers();
+
+    const fiveMinFields = ['count'];
+    const ipFields = ['event_count', 'blocked_count', 'threat_count'];
+    const portFields = ['count'];
+    const sigFields = ['count'];
+    const clientFields = ['event_count', 'wifi_count', 'dhcp_count', 'firewall_count'];
+
+    const tasks = [];
+    for (const doc of drain.fiveMin.values()) tasks.push({ col: this.rollup5m, id: this._docIdForFiveMin(doc), doc, fields: fiveMinFields });
+    for (const doc of drain.ipHourly.values()) tasks.push({ col: this.rollupIpHourly, id: this._docIdForIpHourly(doc), doc, fields: ipFields });
+    for (const doc of drain.portHourly.values()) tasks.push({ col: this.rollupPortHourly, id: this._docIdForPortHourly(doc), doc, fields: portFields });
+    for (const doc of drain.sigHourly.values()) tasks.push({ col: this.rollupSigHourly, id: this._docIdForSigHourly(doc), doc, fields: sigFields });
+    for (const doc of drain.clientHourly.values()) tasks.push({ col: this.rollupClientHourly, id: this._docIdForClientHourly(doc), doc, fields: clientFields });
+
+    if (tasks.length === 0) {
+      this._flushing = false;
+      return;
+    }
+
+    let failed = false;
+    try {
+      let i = 0;
+      const workers = Array.from({ length: this.flushConcurrency }, async () => {
+        while (i < tasks.length) {
+          const my = tasks[i++];
+          try {
+            await this._upsertRollup(my.col, my.id, my.doc, my.fields);
+          } catch (err) {
+            failed = true;
+            logger.debug({ err: err.message, id: my.id, col: my.col }, 'Rollup upsert failed');
+          }
+        }
+      });
+      await Promise.all(workers);
+    } catch (err) {
+      failed = true;
+      logger.warn({ err: err.message }, 'Rollup flush worker pool failed');
+    }
+
+    if (failed) {
+      logger.warn({ tasks: tasks.length }, 'Rollup flush had errors, re-merging buffers for retry');
+      this._mergeBuffersBack(drain);
+    }
+
+    logger.debug({
+      '5m': drain.fiveMin.size,
+      ip: drain.ipHourly.size,
+      port: drain.portHourly.size,
+      sig: drain.sigHourly.size,
+      client: drain.clientHourly.size,
+      ms: Date.now() - t0,
+    }, 'Rollup flush');
+
+    this._flushing = false;
+  }
+
+  _startFlushInterval() {
+    if (this._flushIntervalHandle) clearInterval(this._flushIntervalHandle);
+    this._flushIntervalHandle = setInterval(() => {
+      if (this._shuttingDown) return;
+      this._flushRollups().catch(err =>
+        logger.warn({ err: err.message }, 'Rollup flush cycle error'));
+    }, FLUSH_INTERVAL_MS);
+    this._flushIntervalHandle.unref?.();
+  }
+
+  // --- Lifecycle ---
+
+  _getRequiredEventIndexes() {
     return [
       { name: 'idx_event_type', field: 'event_type' },
       { name: 'idx_received_at', field: 'received_at' },
@@ -162,64 +518,31 @@ class WardsonDbBackend extends StorageBackend {
     ];
   }
 
-  _startDeferredIndexCreation() {
-    const INDEX_DELAY = 1000; // 1 second between each index creation
-
-    logger.info('WardSONDB starting background index creation (write-pressure gated)');
-
-    // Fire-and-forget — do not await. Resolves indexesReady on completion or failure.
-    this._createIndexesSequentially(INDEX_DELAY).then(() => {
-      this._isInitializing = false;
-      this._resolveIndexesReady?.();
-    }).catch(err => {
-      logger.error({ err: err.message }, 'WardSONDB background index creation failed');
-      this._isInitializing = false;
-      this._resolveIndexesReady?.(); // Always resolve to avoid stalling ingestion
-    });
+  _getRollupIndexSpecs() {
+    return [
+      { col: this.rollup5m, name: 'idx_bucket', field: 'bucket' },
+      { col: this.rollupIpHourly, name: 'idx_bucket', field: 'bucket' },
+      { col: this.rollupIpHourly, name: 'idx_ip_bucket', fields: ['ip', 'bucket'] },
+      { col: this.rollupPortHourly, name: 'idx_bucket', field: 'bucket' },
+      { col: this.rollupSigHourly, name: 'idx_bucket', field: 'bucket' },
+      { col: this.rollupClientHourly, name: 'idx_bucket', field: 'bucket' },
+    ];
   }
 
-  async _waitForLowWritePressure() {
-    // During initialization, ingestion is paused — no compaction risk, skip the check
-    if (this._isInitializing) return;
-    const POLL_INTERVAL = 10000; // 10s between retries when write_pressure is high
-    while (true) {
-      try {
-        const health = await this._healthRequest('/_health');
-        if (health.data?.write_pressure !== 'high') return;
-        logger.info('WardSONDB write_pressure is high — waiting 30s before next index');
-      } catch (err) {
-        logger.debug({ err: err.message }, 'WardSONDB /_health check failed during index creation, retrying');
-      }
-      await new Promise(r => setTimeout(r, POLL_INTERVAL));
-    }
-  }
-
-  async _createIndexesSequentially(delayMs) {
-    const indexes = this._getRequiredIndexes();
-
-    for (const idx of indexes) {
-      // Wait for write pressure to be normal before creating each index
-      await this._waitForLowWritePressure();
-
-      try {
-        const body = { name: idx.name };
-        if (idx.fields) body.fields = idx.fields;
-        else body.field = idx.field;
-        await this._post(`/${this.eventsCollection}/indexes`, body);
-        logger.info({ index: idx.name }, 'Created WardSONDB index');
-
-        // Pause between indexes to let compaction catch up
-        await new Promise(r => setTimeout(r, delayMs));
-      } catch (err) {
-        if (err.message.includes('INDEX_EXISTS')) {
-          logger.debug({ index: idx.name }, 'WardSONDB index already exists');
-          continue;
-        }
-        logger.warn({ index: idx.name, err: err.message }, 'Failed to create WardSONDB index');
-      }
-    }
-
-    logger.info('WardSONDB index creation complete — all indexes ready');
+  /**
+   * Indexes on the enrichment_cache collection. Required for $in lookups
+   * by IP, $exists / $gt / $gte filters, and accurate count_only queries.
+   * Without these, WardSONDB falls back to full-collection scans capped at
+   * 10,000 documents — causing Threat Intel summary counts to plateau at 10K
+   * and $in lookups to miss IPs beyond that cap.
+   */
+  _getCacheIndexSpecs() {
+    return [
+      { col: this.cacheCollection, name: 'idx_cache_ip', field: 'ip' },
+      { col: this.cacheCollection, name: 'idx_cache_is_private', field: 'is_private' },
+      { col: this.cacheCollection, name: 'idx_cache_geo_country', field: 'geo_country' },
+      { col: this.cacheCollection, name: 'idx_cache_abuse_score', field: 'abuse_score' },
+    ];
   }
 
   async _ensureCollection(name) {
@@ -227,27 +550,152 @@ class WardsonDbBackend extends StorageBackend {
       await this._post('/_collections', { name });
       logger.info({ collection: name }, 'Created WardSONDB collection');
     } catch (err) {
-      if (err.message.includes('COLLECTION_EXISTS')) return; // Already exists, fine
+      if (err.message.includes('COLLECTION_EXISTS')) return;
       throw err;
     }
   }
 
+  async initialize() {
+    // Verify connection
+    const info = await this._get('/');
+    logger.info({ backend: 'wardsondb', version: info.data.version, url: this.baseUrl }, 'Connected to WardSONDB');
+
+    // Discover existing partitions
+    const cols = await this._get('/_collections');
+    const list = cols.data || [];
+    let legacyDetected = false;
+    for (const c of list) {
+      const name = typeof c === 'string' ? c : c.name;
+      if (!name) continue;
+      if (PARTITION_NAME_RE.test(name)) this._partitions.add(name);
+      else if (name === 'events') legacyDetected = true;
+    }
+    if (legacyDetected) {
+      logger.warn('Legacy single `events` collection detected. It will be ignored — backend now uses daily partitions. Drop manually with `DELETE /events` when ready.');
+    }
+    logger.info({ partitions: this._partitions.size }, 'WardSONDB partitions discovered');
+
+    // Ensure today's partition + 9 indexes
+    const today = this._partitionName(new Date());
+    await this._ensurePartition(today);
+
+    // Ensure cache + 5 rollup collections
+    await this._ensureCollection(this.cacheCollection);
+    for (const col of [this.rollup5m, this.rollupIpHourly, this.rollupPortHourly, this.rollupSigHourly, this.rollupClientHourly]) {
+      await this._ensureCollection(col);
+    }
+    for (const idx of [...this._getRollupIndexSpecs(), ...this._getCacheIndexSpecs()]) {
+      try {
+        const body = { name: idx.name };
+        if (idx.fields) body.fields = idx.fields;
+        else body.field = idx.field;
+        await this._post(`/${idx.col}/indexes`, body);
+      } catch (err) {
+        if (!err.message?.includes('INDEX_EXISTS')) {
+          logger.debug({ err: err.message, col: idx.col, idx: idx.name }, 'Rollup/cache index creation warn');
+        }
+      }
+    }
+
+    // Initial cached doc count from /_stats.total_documents (matches main).
+    // Includes rollups+cache (small overhead) but is reliable.
+    try {
+      const stats = await this._get('/_stats');
+      const t = stats.data?.total_documents;
+      this._cachedDocCount = typeof t === 'number' ? t : null;
+    } catch {
+      this._cachedDocCount = null;
+    }
+
+    // Today's partition is empty (or pre-existing with indexes already), so
+    // ingestion can resume immediately after reset/init.
+    this.indexesReady = Promise.resolve();
+
+    // Start the flush cycle
+    this._startFlushInterval();
+
+    // Schedule deferred rollup backfill (same 30s cadence as enrichment backfill)
+    setTimeout(() => {
+      this._runStartupBackfill().catch(err =>
+        logger.warn({ err: err.message }, 'Rollup backfill failed'));
+    }, 30000);
+
+    logger.info({ backend: 'wardsondb', docCount: this._cachedDocCount, healthTimeoutMs: this.healthTimeoutMs }, 'Storage backend initialized');
+  }
+
+  /**
+   * Sum doc_count across event-* partitions from a /_collections response payload.
+   * Returns null when state is unknown (non-array response, or no matching
+   * partitions when we haven't observed any yet either). Returns 0 only when
+   * we know the DB is truly empty (partitions exist in-memory but all report 0).
+   */
+  _sumPartitionDocCounts(list) {
+    if (!Array.isArray(list)) return null;
+    let total = 0;
+    let sawAny = false;
+    for (const c of list) {
+      if (typeof c !== 'object' || !c?.name) continue;
+      if (!PARTITION_NAME_RE.test(c.name)) continue;
+      const n = typeof c.doc_count === 'number' ? c.doc_count : null;
+      if (n != null) {
+        total += n;
+        sawAny = true;
+      }
+    }
+    if (sawAny) return total;
+    // No matching partitions in the response. If we also have none cached,
+    // the state is unknown (e.g., race during startup). If we have cached
+    // partitions but the response doesn't list them (shouldn't happen but
+    // defensive), prefer unknown over a bogus 0.
+    if (this._partitions.size === 0) return null;
+    return null;
+  }
+
   async close() {
-    // No cleanup needed — background index creation is fire-and-forget
+    this._shuttingDown = true;
+    if (this._flushIntervalHandle) {
+      clearInterval(this._flushIntervalHandle);
+      this._flushIntervalHandle = null;
+    }
+    // Final flush — bypass _flushing guard
+    this._flushing = false;
+    try {
+      await this._flushRollups();
+    } catch (err) {
+      logger.warn({ err: err.message }, 'Final rollup flush on shutdown failed');
+    }
   }
 
   async healthCheck() {
     try {
-      // No retries for health checks — they run every 10s, retries just pile up connections.
-      // Only call /_health and /_stats (both are fast O(1) endpoints).
-      // SKIP /{collection}/storage — it can hang/block on WardSONDB (known issue with
-      // empty or freshly-indexed collections). Use /_stats.total_documents instead.
       const health = await this._healthRequest('/_health');
       const stats = await this._healthRequest('/_stats');
 
-      // Update cached doc count from stats — preserve last known good value if /_stats returns unexpected shape
-      const totalDocs = typeof stats.data.total_documents === 'number' ? stats.data.total_documents : this._cachedDocCount;
-      this._cachedDocCount = totalDocs;
+      // Ensure today's partition exists (handles server-restart-on-new-day)
+      const today = this._partitionName(new Date());
+      if (!this._partitions.has(today)) {
+        await this._ensurePartition(today);
+      }
+
+      // Use /_stats.total_documents directly — this is what main did and it's
+      // a single, reliable, server-reported number. After partitioning it
+      // includes rollups+cache (small overhead, ~0.1% of events count for
+      // typical deployments) but it does NOT flicker the way per-partition
+      // doc_count does during WardSONDB internal stats rebuilds.
+      //
+      // Defensive: if total_documents reads as 0 but we previously saw a
+      // positive value, treat as transient noise and keep cached. Only
+      // resetData() can legitimately drop the count to zero (it sets cached
+      // to 0 explicitly).
+      let docCount = typeof stats.data?.total_documents === 'number'
+        ? stats.data.total_documents
+        : this._cachedDocCount;
+      if (docCount === 0 && typeof this._cachedDocCount === 'number' && this._cachedDocCount > 0) {
+        logger.debug({ cachedDocCount: this._cachedDocCount }, 'WardSONDB stats.total_documents=0 but cached > 0, preserving cached value');
+        docCount = this._cachedDocCount;
+      } else {
+        this._cachedDocCount = docCount;
+      }
 
       return {
         ok: health.data.status === 'healthy',
@@ -256,14 +704,14 @@ class WardsonDbBackend extends StorageBackend {
           backend: 'wardsondb',
           url: this.baseUrl,
           collections: stats.data.collection_count,
-          totalDocuments: totalDocs,
+          totalDocuments: docCount,
           uptime: stats.data.uptime_seconds,
-          // Synthesize eventsStorage from /_stats (no per-collection oldest/newest without /storage)
           eventsStorage: {
-            docCount: totalDocs,
+            docCount,
             indexCount: null,
             oldestDoc: null,
             newestDoc: null,
+            partitions: this._partitions.size,
           },
         },
       };
@@ -288,7 +736,6 @@ class WardsonDbBackend extends StorageBackend {
 
     if (event.raw_message) doc.raw_message = event.raw_message;
 
-    // Network fields (firewall/threat)
     if (event.action || event.src_ip || event.dst_ip || event.protocol) {
       doc.network = {};
       if (event.action) doc.network.action = event.action;
@@ -308,7 +755,6 @@ class WardsonDbBackend extends StorageBackend {
       if (event.rule_prefix) doc.network.rule_prefix = event.rule_prefix;
     }
 
-    // IDS fields
     if (event.ids_signature_id || event.ids_signature) {
       doc.ids = {};
       if (event.ids_signature_id) doc.ids.signature_id = event.ids_signature_id;
@@ -319,7 +765,6 @@ class WardsonDbBackend extends StorageBackend {
       if (event.threat_category) doc.ids.threat_category = event.threat_category;
     }
 
-    // DHCP fields
     if (event.dhcp_action || event.dhcp_ip || event.dhcp_mac) {
       doc.dhcp = {};
       if (event.dhcp_action) doc.dhcp.action = event.dhcp_action;
@@ -329,7 +774,6 @@ class WardsonDbBackend extends StorageBackend {
       if (event.dhcp_interface) doc.dhcp.interface = event.dhcp_interface;
     }
 
-    // DNS fields
     if (event.dns_action || event.dns_name) {
       doc.dns = {};
       if (event.dns_action) doc.dns.action = event.dns_action;
@@ -341,7 +785,6 @@ class WardsonDbBackend extends StorageBackend {
       if (event.dns_filter_category) doc.dns.filter_category = event.dns_filter_category;
     }
 
-    // WiFi fields
     if (event.wifi_action || event.wifi_client_mac) {
       doc.wifi = {};
       if (event.wifi_action) doc.wifi.action = event.wifi_action;
@@ -352,7 +795,6 @@ class WardsonDbBackend extends StorageBackend {
       if (event.wifi_rssi != null) doc.wifi.rssi = event.wifi_rssi;
     }
 
-    // CEF fields
     if (event.cef_event_class_id || event.cef_name) {
       doc.cef = {};
       if (event.cef_event_class_id) doc.cef.event_class_id = event.cef_event_class_id;
@@ -363,7 +805,6 @@ class WardsonDbBackend extends StorageBackend {
       if (event.unifi_host) doc.cef.host = event.unifi_host;
     }
 
-    // Client fields
     if (event.client_alias || event.client_mac || event.client_ip) {
       doc.client = {};
       if (event.client_alias) doc.client.alias = event.client_alias;
@@ -374,8 +815,13 @@ class WardsonDbBackend extends StorageBackend {
     return doc;
   }
 
-  /** Transform a WardSONDB document back into the flat SIEM event format */
-  _documentToEvent(doc) {
+  /**
+   * Transform a WardSONDB document back into the flat SIEM event format.
+   * If `cacheMap` is provided, overlay enrichment fields from cache when the
+   * stored doc lacks them — keeps Live Stream / Event Detail rendering
+   * SQLite-equivalent for events in older partitions.
+   */
+  _documentToEvent(doc, cacheMap = null) {
     const event = {
       id: doc._id,
       event_type: doc.event_type,
@@ -388,7 +834,6 @@ class WardsonDbBackend extends StorageBackend {
       raw_message: doc.raw_message || null,
     };
 
-    // Network
     if (doc.network) {
       event.action = doc.network.action || null;
       event.direction = doc.network.direction || null;
@@ -407,7 +852,6 @@ class WardsonDbBackend extends StorageBackend {
       event.rule_prefix = doc.network.rule_prefix || null;
     }
 
-    // IDS
     if (doc.ids) {
       event.ids_signature_id = doc.ids.signature_id || null;
       event.ids_signature = doc.ids.signature || null;
@@ -417,7 +861,6 @@ class WardsonDbBackend extends StorageBackend {
       event.threat_category = doc.ids.threat_category || null;
     }
 
-    // DHCP
     if (doc.dhcp) {
       event.dhcp_action = doc.dhcp.action || null;
       event.dhcp_ip = doc.dhcp.ip || null;
@@ -426,7 +869,6 @@ class WardsonDbBackend extends StorageBackend {
       event.dhcp_interface = doc.dhcp.interface || null;
     }
 
-    // DNS
     if (doc.dns) {
       event.dns_action = doc.dns.action || null;
       event.dns_name = doc.dns.name || null;
@@ -437,7 +879,6 @@ class WardsonDbBackend extends StorageBackend {
       event.dns_filter_category = doc.dns.filter_category || null;
     }
 
-    // WiFi
     if (doc.wifi) {
       event.wifi_action = doc.wifi.action || null;
       event.wifi_client_mac = doc.wifi.client_mac || null;
@@ -447,7 +888,6 @@ class WardsonDbBackend extends StorageBackend {
       event.wifi_rssi = doc.wifi.rssi ?? null;
     }
 
-    // CEF
     if (doc.cef) {
       event.cef_event_class_id = doc.cef.event_class_id || null;
       event.cef_name = doc.cef.name || null;
@@ -457,14 +897,13 @@ class WardsonDbBackend extends StorageBackend {
       event.unifi_host = doc.cef.host || null;
     }
 
-    // Client
     if (doc.client) {
       event.client_alias = doc.client.alias || null;
       event.client_mac = doc.client.mac || null;
       event.client_ip = doc.client.ip || null;
     }
 
-    // Enrichment
+    // Stored enrichment (today's partition only — written by updateEnrichment)
     if (doc.enrichment) {
       if (doc.enrichment.src) {
         event.src_geo_country = doc.enrichment.src.geo_country || null;
@@ -484,77 +923,112 @@ class WardsonDbBackend extends StorageBackend {
       }
     }
 
+    // Query-time cache overlay for older partitions (no stored enrichment)
+    if (cacheMap) {
+      if (event.src_ip && event.src_geo_country == null) {
+        const c = cacheMap.get(event.src_ip);
+        if (c) {
+          event.src_geo_country = c.geo_country || null;
+          event.src_geo_city = c.geo_city || null;
+          event.src_geo_lat = c.geo_lat ?? null;
+          event.src_geo_lon = c.geo_lon ?? null;
+          event.src_abuse_score = c.abuse_score ?? null;
+          event.src_hostname = c.hostname || null;
+        }
+      }
+      if (event.dst_ip && event.dst_geo_country == null) {
+        const c = cacheMap.get(event.dst_ip);
+        if (c) {
+          event.dst_geo_country = c.geo_country || null;
+          event.dst_geo_city = c.geo_city || null;
+          event.dst_geo_lat = c.geo_lat ?? null;
+          event.dst_geo_lon = c.geo_lon ?? null;
+          event.dst_abuse_score = c.abuse_score ?? null;
+          event.dst_hostname = c.hostname || null;
+        }
+      }
+    }
+
     return event;
   }
 
   // --- Write Operations ---
 
   async insertEvents(events) {
-    const documents = events.map(e => this._eventToDocument(e));
+    if (!events?.length) return { inserted: 0 };
 
-    // Batch in chunks of 500 (WardSONDB optimal batch size)
-    const CHUNK = 500;
+    // Group by UTC date of received_at — almost always one group, except at midnight
+    const byDate = new Map();
+    for (const evt of events) {
+      const ts = evt.received_at || new Date().toISOString();
+      const date = String(ts).substring(0, 10);
+      let arr = byDate.get(date);
+      if (!arr) { arr = []; byDate.set(date, arr); }
+      arr.push(evt);
+    }
+
     let totalInserted = 0;
+    const CHUNK = 500;
 
-    for (let i = 0; i < documents.length; i += CHUNK) {
-      const chunk = documents.slice(i, i + CHUNK);
-      const result = await this._post(`/${this.eventsCollection}/docs/_bulk`, { documents: chunk });
-      totalInserted += result.data.inserted;
-      // Update cached doc count so empty-DB short-circuit clears on first ingest
-      if (totalInserted > 0 && (this._cachedDocCount === 0 || this._cachedDocCount === null)) this._cachedDocCount = totalInserted;
-      if (result.data.errors?.length > 0) {
-        logger.warn({ errors: result.data.errors.length }, 'WardSONDB bulk insert had errors');
+    for (const [date, group] of byDate) {
+      const partition = `${PARTITION_PREFIX}${date}`;
+      await this._ensurePartition(partition);
+      const documents = group.map(e => this._eventToDocument(e));
+      for (let i = 0; i < documents.length; i += CHUNK) {
+        const chunk = documents.slice(i, i + CHUNK);
+        const result = await this._post(`/${partition}/docs/_bulk`, { documents: chunk });
+        totalInserted += result.data?.inserted || 0;
+        if (result.data?.errors?.length > 0) {
+          logger.warn({ partition, errors: result.data.errors.length }, 'WardSONDB bulk insert had errors');
+        }
       }
     }
+
+    // Update cached doc count additively so empty-DB short-circuit clears
+    if (totalInserted > 0) {
+      this._cachedDocCount = (this._cachedDocCount || 0) + totalInserted;
+    }
+
+    // Accumulate rollups for the inserted batch
+    this._accumulateRollups(events);
 
     return { inserted: totalInserted };
   }
 
+  /**
+   * Update enrichment fields on today's partition only. Older partitions rely
+   * on query-time cache overlay (see _documentToEvent). Uses the API's
+   * _update_by_query endpoint for atomic single-call updates.
+   */
   async updateEnrichment(ip, direction, data) {
-    // Phase 1: No _update_by_query — query matching docs and patch individually
-    // This is intentionally limited for Phase 1 testing
-    const ipField = direction === 'dst' ? 'network.dst_ip' : 'network.src_ip';
-    const enrichField = direction === 'dst' ? 'enrichment.dst' : 'enrichment.src';
-    const geoCheck = direction === 'dst' ? 'enrichment.dst.geo_country' : 'enrichment.src.geo_country';
+    const today = this._partitionName(new Date());
+    if (!this._partitions.has(today)) return { updated: 0 };
 
-    const result = await this._post(`/${this.eventsCollection}/query`, {
-      filter: {
-        [ipField]: ip,
-        [geoCheck]: { '$exists': false },
+    const ipField = direction === 'dst' ? 'network.dst_ip' : 'network.src_ip';
+    const setKey = direction === 'dst' ? 'enrichment.dst' : 'enrichment.src';
+    const geoCheckKey = `${setKey}.geo_country`;
+
+    const result = await this._post(`/${today}/docs/_update_by_query`, {
+      filter: { [ipField]: ip, [geoCheckKey]: { '$exists': false } },
+      update: {
+        '$set': {
+          [`${setKey}.geo_country`]: data.geo_country ?? null,
+          [`${setKey}.geo_city`]: data.geo_city ?? null,
+          [`${setKey}.geo_lat`]: data.geo_lat ?? null,
+          [`${setKey}.geo_lon`]: data.geo_lon ?? null,
+          [`${setKey}.abuse_score`]: data.abuse_score ?? null,
+          [`${setKey}.hostname`]: data.hostname ?? null,
+        },
       },
-      fields: ['_id'],
-      limit: 100, // Smaller batches for Phase 1
     });
 
-    if (!result.data || result.data.length === 0) return { updated: 0 };
-
-    let updated = 0;
-    const enrichmentData = {
-      geo_country: data.geo_country,
-      geo_city: data.geo_city,
-      geo_lat: data.geo_lat,
-      geo_lon: data.geo_lon,
-      abuse_score: data.abuse_score,
-      hostname: data.hostname,
-    };
-
-    for (const doc of result.data) {
-      try {
-        await this._patch(`/${this.eventsCollection}/docs/${doc._id}`, {
-          enrichment: { [direction]: enrichmentData },
-        });
-        updated++;
-      } catch (err) {
-        logger.debug({ err, id: doc._id }, 'Failed to patch enrichment');
-      }
-    }
-
-    return { updated };
+    return { updated: result.data?.updated || 0 };
   }
 
   // --- Read Operations ---
 
-  async queryEvents(filters = {}) {
+  /** Build a WardSONDB filter object from queryEvents-style HTTP filters. */
+  _buildFilter(filters) {
     const filter = {};
     const andClauses = [];
 
@@ -576,8 +1050,6 @@ class WardsonDbBackend extends StorageBackend {
     if (filters.since) andClauses.push({ received_at: { '$gte': filters.since } });
     if (filters.until) andClauses.push({ received_at: { '$lte': filters.until } });
     if (filters.search) andClauses.push({ message: { '$regex': filters.search } });
-
-    // MAC filter — use $or across multiple paths
     if (filters.mac) {
       andClauses.push({
         '$or': [
@@ -590,185 +1062,167 @@ class WardsonDbBackend extends StorageBackend {
       });
     }
 
-    let queryFilter = null;
-    if (andClauses.length > 0 || Object.keys(filter).length > 0) {
-      const allClauses = [...andClauses];
-      for (const [k, v] of Object.entries(filter)) allClauses.push({ [k]: v });
-      queryFilter = allClauses.length === 1 ? allClauses[0] : { '$and': allClauses };
-    }
+    if (andClauses.length === 0 && Object.keys(filter).length === 0) return null;
+    const allClauses = [...andClauses];
+    for (const [k, v] of Object.entries(filter)) allClauses.push({ [k]: v });
+    return allClauses.length === 1 ? allClauses[0] : { '$and': allClauses };
+  }
 
+  async queryEvents(filters = {}) {
     const limit = Math.min(parseInt(filters.limit || '50', 10), 500);
-    const offset = parseInt(filters.offset || '0', 10);
+    let offset = parseInt(filters.offset || '0', 10);
+    const queryFilter = this._buildFilter(filters);
+    const cacheMap = await this._getCacheMap();
 
-    const result = await this._post(`/${this.eventsCollection}/query`, {
-      filter: queryFilter,
-      sort: [{ '_created_at': 'desc' }],
-      limit,
-      offset,
-    });
+    const queryPartition = async (partition, remaining) => {
+      const result = await this._post(`/${partition}/query`, {
+        filter: queryFilter,
+        sort: [{ '_created_at': 'desc' }],
+        limit: remaining,
+        offset,
+      });
+      const docs = result.data || [];
+      // Approximate offset across boundaries: decrement what this partition consumed
+      if (offset > 0) offset = Math.max(0, offset - docs.length);
+      return docs.map(d => this._documentToEvent(d, cacheMap));
+    };
 
-    const events = (result.data || []).map(d => this._documentToEvent(d));
+    const events = await this._queryAcrossPartitions(queryPartition, filters.since, filters.until, limit);
     return { events };
   }
 
   async getEventById(id) {
-    const result = await this._get(`/${this.eventsCollection}/docs/${id}`);
-    if (result._notFound) return null;
-    return this._documentToEvent(result.data);
+    const cacheMap = await this._getCacheMap();
+    const partition = this._partitionFromId(id);
+
+    if (partition && this._partitions.has(partition)) {
+      const result = await this._get(`/${partition}/docs/${encodeURIComponent(id)}`);
+      if (!result._notFound) return this._documentToEvent(result.data, cacheMap);
+    }
+
+    // Fallback: scan all partitions (rare — UUIDv7 partition not in cache)
+    for (const p of this._partitionsNewestFirst()) {
+      try {
+        const r = await this._get(`/${p}/docs/${encodeURIComponent(id)}`);
+        if (!r._notFound) return this._documentToEvent(r.data, cacheMap);
+      } catch {}
+    }
+    return null;
   }
 
   async getEventCount() {
-    const result = await this._post(`/${this.eventsCollection}/query`, { count_only: true });
-    return result.meta?.total_count || result.data?.count || 0;
+    // Preserve null (unknown state) vs 0 (confirmed empty) so the sidebar
+    // renders '—' rather than a false '0' during startup before /_collections
+    // resolves.
+    return this._cachedDocCount;
   }
 
   async getEventCountToday() {
-    // Use local midnight (not UTC) so "today" matches the operator's timezone
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    const result = await this._post(`/${this.eventsCollection}/query`, {
-      filter: { received_at: { '$gte': today.toISOString() } },
-      count_only: true,
+    if (this._isCollectionEmpty()) return 0;
+    const midnight = new Date();
+    midnight.setHours(0, 0, 0, 0);
+    const midnightISO = midnight.toISOString();
+
+    const result = await this._post(`/${this.rollup5m}/aggregate`, {
+      pipeline: [
+        { '$match': { bucket: { '$gte': midnightISO } } },
+        { '$group': { '_id': null, total: { '$sum': 'count' } } },
+      ],
     });
-    return result.meta?.total_count || result.data?.count || 0;
+    let total = result.data?.[0]?.total || 0;
+
+    // Add unflushed rollup buffer contribution so the counter stays accurate
+    // during the up-to-5s gap between ingest and the next flush cycle.
+    for (const doc of this._rollupBuffers.fiveMin.values()) {
+      if (doc.bucket >= midnightISO) total += doc.count || 0;
+    }
+    return total;
   }
 
   async getLastEventTime() {
-    const result = await this._post(`/${this.eventsCollection}/query`, {
-      sort: [{ '_created_at': 'desc' }],
-      fields: ['received_at'],
-      limit: 1,
-    });
-    if (result.data && result.data.length > 0) {
-      return result.data[0].received_at || result.data[0]._created_at;
+    if (this._isCollectionEmpty()) return null;
+    for (const p of this._partitionsNewestFirst()) {
+      try {
+        const r = await this._post(`/${p}/query`, {
+          sort: [{ '_created_at': 'desc' }],
+          fields: ['received_at'],
+          limit: 1,
+        });
+        if (r.data?.length > 0) return r.data[0].received_at || r.data[0]._created_at;
+      } catch (err) {
+        logger.debug({ err: err.message, partition: p }, 'getLastEventTime partition query failed');
+      }
     }
     return null;
   }
 
   async getEventTypeCounts(since) {
-    if (await this._isCollectionEmpty()) return {};
-
-    // Use aggregation pipeline — single query instead of 11 separate count queries
+    if (this._isCollectionEmpty()) return {};
     const pipeline = [];
-    if (since) {
-      pipeline.push({ '$match': { received_at: { '$gte': since } } });
+    if (since) pipeline.push({ '$match': { bucket: { '$gte': since } } });
+    pipeline.push({ '$group': { '_id': 'event_type', count: { '$sum': 'count' } } });
+    pipeline.push({ '$sort': { count: 'desc' } });
+    const result = await this._post(`/${this.rollup5m}/aggregate`, { pipeline });
+    const counts = {};
+    for (const row of (result.data || [])) {
+      if (row._id && row.count > 0) counts[row._id] = row.count;
     }
-    pipeline.push(
-      { '$group': { '_id': 'event_type', count: { '$count': {} } } },
-      { '$sort': { count: 'desc' } }
-    );
-
-    try {
-      const result = await this._post(`/${this.eventsCollection}/aggregate`, { pipeline });
-      const counts = {};
-      for (const row of (result.data || [])) {
-        if (row._id && row.count > 0) counts[row._id] = row.count;
-      }
-      return counts;
-    } catch (err) {
-      // If the error is a connection timeout, don't cascade into 11 more queries
-      // that will also timeout — just return empty and let the next poll retry.
-      if (err.message?.includes('Timeout') || err.message?.includes('fetch failed') || err.cause) {
-        logger.warn({ err: err.message }, 'Aggregation timed out for getEventTypeCounts, skipping fallback');
-        return {};
-      }
-      // Fallback to individual count queries only for non-timeout errors (e.g. aggregation not supported)
-      logger.warn({ err }, 'Aggregation failed for getEventTypeCounts, falling back to individual queries');
-      const types = ['firewall', 'threat', 'dhcp', 'dns', 'dns_filter', 'wifi', 'admin', 'device', 'client', 'vpn', 'system'];
-      const counts = {};
-      await Promise.all(types.map(async (type) => {
-        const filter = { event_type: type };
-        if (since) filter.received_at = { '$gte': since };
-        const result = await this._post(`/${this.eventsCollection}/query`, { filter, count_only: true });
-        const count = result.meta?.total_count || result.data?.count || 0;
-        if (count > 0) counts[type] = count;
-      }));
-      return counts;
-    }
+    return counts;
   }
 
-  // --- Stats / Aggregation ---
+  // --- Stats / Aggregation (rollup-based) ---
 
   _isCollectionEmpty() {
-    // Synchronous check using cached doc count — never blocks on WardSONDB.
-    // Updated by initialize(), insertEvents(), and healthCheck().
     return this._cachedDocCount === 0;
   }
 
   async getOverviewStats(since) {
-    // Short-circuit on empty database to avoid hammering WardSONDB
-    if (await this._isCollectionEmpty()) {
+    if (this._isCollectionEmpty()) {
       return { total: 0, byType: {}, firewall: { allowed: 0, blocked: 0, threats: 0 } };
     }
-    // Bitmap-optimized: parallel count queries instead of composite $group aggregation.
-    // Each query hits bitmap scan (event_type, network.action) for <1ms response times.
-    // The old composite $group forced full doc loads at scale, causing 30s+ timeouts.
-    const timeFilter = { received_at: { '$gte': since } };
+    const timeMatch = { bucket: { '$gte': since } };
+    const sumOnlyGroup = { '_id': null, total: { '$sum': 'count' } };
+    const agg = (filter) => this._post(`/${this.rollup5m}/aggregate`, {
+      pipeline: [{ '$match': filter }, { '$group': sumOnlyGroup }],
+    });
 
-    const [totalResult, byTypeResult, allowed, blocked, threats] = await Promise.all([
-      // Total count for time range
-      this._post(`/${this.eventsCollection}/query`, {
-        filter: timeFilter,
-        count_only: true,
-      }),
-      // Count by event_type (bitmap_aggregate path)
-      this._post(`/${this.eventsCollection}/aggregate`, {
+    const [totalRes, byTypeRes, allowedRes, blockedRes, threatRes] = await Promise.all([
+      agg(timeMatch),
+      this._post(`/${this.rollup5m}/aggregate`, {
         pipeline: [
-          { '$match': timeFilter },
-          { '$group': { '_id': 'event_type', count: { '$count': {} } } },
+          { '$match': timeMatch },
+          { '$group': { '_id': 'event_type', count: { '$sum': 'count' } } },
         ],
       }),
-      // Firewall allowed count (bitmap AND: event_type + network.action)
-      this._post(`/${this.eventsCollection}/query`, {
-        filter: { event_type: 'firewall', 'network.action': 'allow', ...timeFilter },
-        count_only: true,
-      }),
-      // Firewall blocked count
-      this._post(`/${this.eventsCollection}/query`, {
-        filter: { event_type: 'firewall', 'network.action': 'block', ...timeFilter },
-        count_only: true,
-      }),
-      // Threat count
-      this._post(`/${this.eventsCollection}/query`, {
-        filter: { event_type: 'threat', ...timeFilter },
-        count_only: true,
-      }),
+      agg({ ...timeMatch, event_type: 'firewall', action: 'allow' }),
+      agg({ ...timeMatch, event_type: 'firewall', action: 'block' }),
+      agg({ ...timeMatch, event_type: 'threat' }),
     ]);
 
     const byType = {};
-    let total = 0;
-    for (const row of (byTypeResult.data || [])) {
-      if (row._id) {
-        byType[row._id] = row.count || 0;
-        total += row.count || 0;
-      }
+    for (const row of (byTypeRes.data || [])) {
+      if (row._id) byType[row._id] = row.count || 0;
     }
-    // Prefer the direct count if available (more accurate with time filter)
-    const directTotal = totalResult.meta?.total_count || totalResult.data?.count;
-    if (directTotal != null) total = directTotal;
 
     return {
-      total,
+      total: totalRes.data?.[0]?.total || 0,
       byType,
       firewall: {
-        allowed: allowed.meta?.total_count || allowed.data?.count || 0,
-        blocked: blocked.meta?.total_count || blocked.data?.count || 0,
-        threats: threats.meta?.total_count || threats.data?.count || 0,
+        allowed: allowedRes.data?.[0]?.total || 0,
+        blocked: blockedRes.data?.[0]?.total || 0,
+        threats: threatRes.data?.[0]?.total || 0,
       },
     };
   }
 
-  // --- Aggregation-powered stats ---
+  /**
+   * Timeline aggregation — single $group on rollups-5m, then re-bucket
+   * client-side into the requested bucketSize (5m/15m/1h/1d) with zero-fill.
+   * Mirrors sqlite.js:705-768.
+   */
+  async getTimeline(since, _bucketFormat, eventType, bucketSize) {
+    if (this._isCollectionEmpty()) return [];
 
-  async _aggregate(pipeline) {
-    return this._post(`/${this.eventsCollection}/aggregate`, { pipeline });
-  }
-
-  async getTimeline(since, bucketFormat, eventType, bucketSize) {
-    // Short-circuit on empty database — avoids hundreds of count queries
-    if (await this._isCollectionEmpty()) return [];
-
-    // Determine bucket interval in milliseconds
     const bucketMs = {
       '5m': 5 * 60000,
       '15m': 15 * 60000,
@@ -776,67 +1230,48 @@ class WardsonDbBackend extends StorageBackend {
       '1d': 86400000,
     }[bucketSize || '1h'] || 3600000;
 
-    // Determine time range — align to bucket boundaries
-    const sinceDate = new Date(since);
-    const nowDate = new Date();
-    // Floor sinceDate to bucket boundary
-    const startTime = new Date(Math.floor(sinceDate.getTime() / bucketMs) * bucketMs);
-    const endTime = new Date(Math.floor(nowDate.getTime() / bucketMs) * bucketMs);
-    const numBuckets = Math.floor((endTime - startTime) / bucketMs) + 1;
+    const start = new Date(Math.floor(new Date(since).getTime() / bucketMs) * bucketMs);
+    const end = new Date(Math.floor(Date.now() / bucketMs) * bucketMs);
+    const numBuckets = Math.floor((end - start) / bucketMs) + 1;
 
-    // Generate empty buckets
-    const buckets = {};
+    const buckets = new Map();
     for (let i = 0; i < numBuckets; i++) {
-      const d = new Date(startTime.getTime() + i * bucketMs);
-      const ts = d.toISOString();
-      buckets[ts] = eventType === 'firewall'
+      const ts = new Date(start.getTime() + i * bucketMs).toISOString();
+      buckets.set(ts, eventType === 'firewall'
         ? { ts, allowed: 0, blocked: 0 }
-        : { ts, firewall: 0, threat: 0, dhcp: 0, dns_filter: 0, wifi: 0, admin: 0, system: 0, total: 0 };
+        : { ts, firewall: 0, threat: 0, dhcp: 0, dns_filter: 0, wifi: 0, admin: 0, system: 0, total: 0 });
     }
 
-    // For each bucket, run count queries (parallelized in batches)
-    const bucketKeys = Object.keys(buckets);
-    const PARALLEL = 8;
+    const result = await this._post(`/${this.rollup5m}/aggregate`, {
+      pipeline: [
+        { '$match': { bucket: { '$gte': start.toISOString() } } },
+        { '$group': {
+          '_id': { b: 'bucket', t: 'event_type', a: 'action' },
+          count: { '$sum': 'count' },
+        }},
+      ],
+    });
 
-    for (let i = 0; i < bucketKeys.length; i += PARALLEL) {
-      const batch = bucketKeys.slice(i, i + PARALLEL);
-      await Promise.all(batch.map(async (ts) => {
-        const bucketStart = ts;
-        const bucketEnd = new Date(new Date(ts).getTime() + bucketMs).toISOString();
-
-        if (eventType === 'firewall') {
-          const [allowed, blocked] = await Promise.all([
-            this._post(`/${this.eventsCollection}/query`, {
-              filter: { '$and': [{ event_type: 'firewall' }, { 'network.action': 'allow' }, { received_at: { '$gte': bucketStart } }, { received_at: { '$lt': bucketEnd } }] },
-              count_only: true,
-            }),
-            this._post(`/${this.eventsCollection}/query`, {
-              filter: { '$and': [{ event_type: 'firewall' }, { 'network.action': 'block' }, { received_at: { '$gte': bucketStart } }, { received_at: { '$lt': bucketEnd } }] },
-              count_only: true,
-            }),
-          ]);
-          buckets[ts].allowed = allowed.meta?.total_count || allowed.data?.count || 0;
-          buckets[ts].blocked = blocked.meta?.total_count || blocked.data?.count || 0;
-        } else {
-          const types = ['firewall', 'threat', 'dhcp', 'dns_filter', 'wifi', 'admin', 'system'];
-          const results = await Promise.all(types.map(t =>
-            this._post(`/${this.eventsCollection}/query`, {
-              filter: { '$and': [{ event_type: t }, { received_at: { '$gte': bucketStart } }, { received_at: { '$lt': bucketEnd } }] },
-              count_only: true,
-            })
-          ));
-          let total = 0;
-          results.forEach((r, idx) => {
-            const count = r.meta?.total_count || r.data?.count || 0;
-            buckets[ts][types[idx]] = count;
-            total += count;
-          });
-          buckets[ts].total = total;
-        }
-      }));
+    for (const row of (result.data || [])) {
+      const b = row._id?.b;
+      const tp = row._id?.t;
+      const ac = row._id?.a;
+      if (!b) continue;
+      const aligned = new Date(Math.floor(new Date(b).getTime() / bucketMs) * bucketMs).toISOString();
+      const bucket = buckets.get(aligned);
+      if (!bucket) continue;
+      const cnt = row.count || 0;
+      if (eventType === 'firewall') {
+        if (tp !== 'firewall') continue;
+        if (ac === 'allow') bucket.allowed += cnt;
+        else if (ac === 'block') bucket.blocked += cnt;
+      } else {
+        if (tp && tp in bucket) bucket[tp] += cnt;
+        bucket.total += cnt;
+      }
     }
 
-    return Object.values(buckets);
+    return Array.from(buckets.values());
   }
 
   async _getCacheMap() {
@@ -850,302 +1285,344 @@ class WardsonDbBackend extends StorageBackend {
     return this._cacheMap;
   }
 
-  _isPrivateIp(ip) {
-    if (!ip) return true;
-    return ip.startsWith('10.') || ip.startsWith('192.168.') || ip.startsWith('127.') ||
-      ip.startsWith('169.254.') || ip.startsWith('100.64.') ||
-      /^172\.(1[6-9]|2\d|3[01])\./.test(ip);
-  }
-
   async getTopTalkers(since, direction, limit, excludePrivate) {
-    if (await this._isCollectionEmpty()) return [];
-    const ipField = direction === 'dst' ? 'network.dst_ip' : 'network.src_ip';
-    // Over-fetch if filtering private IPs, then trim client-side
+    if (this._isCollectionEmpty()) return [];
+    const dir = direction === 'dst' ? 'dst' : 'src';
     const fetchLimit = excludePrivate ? limit * 5 : limit;
-    const pipeline = [
-      { '$match': { received_at: { '$gte': since }, [ipField]: { '$exists': true } } },
-      { '$group': {
-        '_id': ipField,
-        'count': { '$count': {} },
-        'lastSeen': { '$max': 'received_at' },
-      }},
-      { '$sort': { 'count': 'desc' } },
-      { '$limit': fetchLimit },
-    ];
 
-    const result = await this._aggregate(pipeline);
+    const result = await this._post(`/${this.rollupIpHourly}/aggregate`, {
+      pipeline: [
+        { '$match': { bucket: { '$gte': since }, direction: dir } },
+        { '$group': { '_id': 'ip', count: { '$sum': 'event_count' } } },
+        { '$sort': { count: 'desc' } },
+        { '$limit': fetchLimit },
+      ],
+    });
+
     const cacheMap = await this._getCacheMap();
     let rows = (result.data || []).map(r => {
-      const cached = cacheMap.get(r._id);
+      const c = cacheMap.get(r._id) || {};
       return {
         ip: r._id,
-        count: r.count,
-        lastSeen: r.lastSeen,
-        country: cached?.geo_country || null,
-        hostname: cached?.hostname || null,
+        count: r.count || 0,
+        lastSeen: null,
+        country: c.geo_country || null,
+        hostname: c.hostname || null,
       };
     });
-    if (excludePrivate) rows = rows.filter(r => !this._isPrivateIp(r.ip));
+    if (excludePrivate) rows = rows.filter(r => !isPrivateIp(r.ip));
     return rows.slice(0, limit);
   }
 
   async getTopBlocked(since, direction, limit, excludePrivate) {
-    if (await this._isCollectionEmpty()) return [];
-    const ipField = direction === 'dst' ? 'network.dst_ip' : 'network.src_ip';
+    if (this._isCollectionEmpty()) return [];
+    const dir = direction === 'dst' ? 'dst' : 'src';
     const fetchLimit = excludePrivate ? limit * 5 : limit;
-    const pipeline = [
-      { '$match': { 'network.action': 'block', received_at: { '$gte': since }, [ipField]: { '$exists': true } } },
-      { '$group': {
-        '_id': ipField,
-        'count': { '$count': {} },
-        'lastSeen': { '$max': 'received_at' },
-      }},
-      { '$sort': { 'count': 'desc' } },
-      { '$limit': fetchLimit },
-    ];
 
-    const result = await this._aggregate(pipeline);
+    const result = await this._post(`/${this.rollupIpHourly}/aggregate`, {
+      pipeline: [
+        { '$match': { bucket: { '$gte': since }, direction: dir } },
+        { '$group': { '_id': 'ip', count: { '$sum': 'blocked_count' } } },
+        { '$match': { count: { '$gt': 0 } } },
+        { '$sort': { count: 'desc' } },
+        { '$limit': fetchLimit },
+      ],
+    });
+
     const cacheMap = await this._getCacheMap();
     let rows = (result.data || []).map(r => {
-      const cached = cacheMap.get(r._id);
+      const c = cacheMap.get(r._id) || {};
       return {
         ip: r._id,
-        count: r.count,
-        lastSeen: r.lastSeen,
-        country: cached?.geo_country || null,
-        abuseScore: cached?.abuse_score ?? null,
-        hostname: cached?.hostname || null,
+        count: r.count || 0,
+        lastSeen: null,
+        country: c.geo_country || null,
+        abuseScore: c.abuse_score ?? null,
+        hostname: c.hostname || null,
       };
     });
-    if (excludePrivate) rows = rows.filter(r => !this._isPrivateIp(r.ip));
+    if (excludePrivate) rows = rows.filter(r => !isPrivateIp(r.ip));
     return rows.slice(0, limit);
   }
 
   async getTopPorts(since, limit) {
-    if (await this._isCollectionEmpty()) return [];
-    const pipeline = [
-      { '$match': { received_at: { '$gte': since }, 'network.dst_port': { '$exists': true } } },
-      { '$group': {
-        '_id': { 'port': 'network.dst_port', 'protocol': 'network.protocol' },
-        'count': { '$count': {} },
-      }},
-      { '$sort': { 'count': 'desc' } },
-      { '$limit': limit },
-    ];
-
-    const result = await this._aggregate(pipeline);
+    if (this._isCollectionEmpty()) return [];
+    const result = await this._post(`/${this.rollupPortHourly}/aggregate`, {
+      pipeline: [
+        { '$match': { bucket: { '$gte': since } } },
+        { '$group': { '_id': { port: 'port', protocol: 'protocol' }, count: { '$sum': 'count' } } },
+        { '$sort': { count: 'desc' } },
+        { '$limit': limit },
+      ],
+    });
     return (result.data || []).map(r => ({
       port: r._id?.port,
-      protocol: r._id?.protocol,
-      count: r.count,
+      protocol: r._id?.protocol || null,
+      count: r.count || 0,
     }));
   }
 
   async getTopClients(since, limit) {
-    if (await this._isCollectionEmpty()) return [];
-    // Client MAC is spread across wifi.client_mac, dhcp.mac, client.mac.
-    // WardSONDB can't $or on _id, so aggregate each field separately and merge.
-    const INTERNAL_LIMIT = 500;
-    const buildPipeline = (macField) => ([
-      { '$match': { received_at: { '$gte': since }, [macField]: { '$exists': true } } },
-      { '$group': {
-        '_id': { 'mac': macField, 'et': 'event_type' },
-        'count': { '$count': {} },
-      }},
-      { '$sort': { 'count': 'desc' } },
-      { '$limit': INTERNAL_LIMIT },
-    ]);
-
-    const [wifiRes, dhcpRes, clientRes] = await Promise.all([
-      this._aggregate(buildPipeline('wifi.client_mac')),
-      this._aggregate(buildPipeline('dhcp.mac')),
-      this._aggregate(buildPipeline('client.mac')),
-    ]);
-
-    const merged = new Map();
-    const accumulate = (rows) => {
-      for (const r of rows || []) {
-        const mac = r._id?.mac;
-        const et = r._id?.et;
-        const c = r.count || 0;
-        if (!mac) continue;
-        let entry = merged.get(mac);
-        if (!entry) {
-          entry = { eventCount: 0, wifiEvents: 0, dhcpEvents: 0, firewallEvents: 0 };
-          merged.set(mac, entry);
-        }
-        entry.eventCount += c;
-        if (et === 'wifi') entry.wifiEvents += c;
-        else if (et === 'dhcp') entry.dhcpEvents += c;
-        else if (et === 'firewall') entry.firewallEvents += c;
-      }
-    };
-    accumulate(wifiRes.data);
-    accumulate(dhcpRes.data);
-    accumulate(clientRes.data);
-
-    return Array.from(merged.entries())
-      .map(([mac, v]) => ({ mac, alias: null, ip: null, ...v }))
-      .sort((a, b) => b.eventCount - a.eventCount)
-      .slice(0, limit);
+    if (this._isCollectionEmpty()) return [];
+    const result = await this._post(`/${this.rollupClientHourly}/aggregate`, {
+      pipeline: [
+        { '$match': { bucket: { '$gte': since } } },
+        { '$group': {
+          '_id': 'mac',
+          eventCount: { '$sum': 'event_count' },
+          wifiEvents: { '$sum': 'wifi_count' },
+          dhcpEvents: { '$sum': 'dhcp_count' },
+          firewallEvents: { '$sum': 'firewall_count' },
+        }},
+        { '$sort': { eventCount: 'desc' } },
+        { '$limit': limit },
+      ],
+    });
+    return (result.data || []).map(r => ({
+      mac: r._id,
+      alias: null,
+      ip: null,
+      eventCount: r.eventCount || 0,
+      wifiEvents: r.wifiEvents || 0,
+      dhcpEvents: r.dhcpEvents || 0,
+      firewallEvents: r.firewallEvents || 0,
+    }));
   }
 
   async getTopThreats(since, limit) {
-    if (await this._isCollectionEmpty()) return [];
-    const pipeline = [
-      { '$match': { event_type: 'threat', received_at: { '$gte': since } } },
-      { '$group': {
-        '_id': 'ids.signature',
-        'count': { '$count': {} },
-        'lastSeen': { '$max': 'received_at' },
-      }},
-      { '$sort': { 'count': 'desc' } },
-      { '$limit': limit },
-    ];
-
-    const result = await this._aggregate(pipeline);
+    if (this._isCollectionEmpty()) return [];
+    const result = await this._post(`/${this.rollupSigHourly}/aggregate`, {
+      pipeline: [
+        { '$match': { bucket: { '$gte': since } } },
+        { '$group': {
+          '_id': { signature: 'signature', classification: 'classification' },
+          count: { '$sum': 'count' },
+        }},
+        { '$sort': { count: 'desc' } },
+        { '$limit': limit },
+      ],
+    });
     return (result.data || []).map(r => ({
-      signature: r._id,
-      classification: null,
-      count: r.count,
-      lastSeen: r.lastSeen,
+      signature: r._id?.signature || null,
+      classification: r._id?.classification || null,
+      count: r.count || 0,
+      lastSeen: null,
     }));
   }
 
   async getThreatIntel(since, limit) {
-    if (await this._isCollectionEmpty()) {
-      return { summary: { totalEnriched: 0, withAbuseScore: 0, highThreat: 0, countries: 0 }, periodSummary: { enriched: 0, flagged: 0, highThreat: 0, countries: 0 }, ips: [] };
-    }
-    // Enrichment not embedded in events yet — use cache collection for summary
-    const cacheResult = await this._post(`/${this.cacheCollection}/query`, {
-      filter: { is_private: false },
-      limit: 10000,
-    });
-
-    const cacheData = cacheResult.data || [];
-    const totalEnriched = cacheData.filter(d => d.geo_country || d.abuse_score != null).length;
-    const withAbuseScore = cacheData.filter(d => d.abuse_score > 0).length;
-    const highThreat = cacheData.filter(d => d.abuse_score >= 50).length;
-    const countries = new Set(cacheData.filter(d => d.geo_country).map(d => d.geo_country)).size;
-
-    // Get top IPs by event count using aggregation
-    const pipeline = [
-      { '$match': { received_at: { '$gte': since }, 'network.src_ip': { '$exists': true } } },
-      { '$group': {
-        '_id': 'network.src_ip',
-        'event_count': { '$count': {} },
-        'lastSeen': { '$max': 'received_at' },
-      }},
-      { '$sort': { 'event_count': 'desc' } },
-      { '$limit': limit },
-    ];
-
-    const aggResult = await this._aggregate(pipeline);
-    const topIps = (aggResult.data || []).map(r => r._id).filter(Boolean);
-    const cacheMap = new Map(cacheData.map(d => [d.ip, d]));
-
-    // Get blocked and threat counts per IP in parallel
-    const [blockedAgg, threatAgg] = topIps.length > 0 ? await Promise.all([
-      this._aggregate([
-        { '$match': { received_at: { '$gte': since }, 'network.src_ip': { '$in': topIps }, 'network.action': 'block' } },
-        { '$group': { '_id': 'network.src_ip', 'count': { '$count': {} } } },
-      ]),
-      this._aggregate([
-        { '$match': { received_at: { '$gte': since }, 'network.src_ip': { '$in': topIps }, event_type: 'threat' } },
-        { '$group': { '_id': 'network.src_ip', 'count': { '$count': {} } } },
-      ]),
-    ]) : [{ data: [] }, { data: [] }];
-
-    const blockedMap = new Map((blockedAgg.data || []).map(r => [r._id, r.count]));
-    const threatMap = new Map((threatAgg.data || []).map(r => [r._id, r.count]));
-
-    const ips = (aggResult.data || []).map(r => {
-      const cached = cacheMap.get(r._id);
+    if (this._isCollectionEmpty()) {
       return {
-        ip: r._id,
-        country: cached?.geo_country || null,
-        city: cached?.geo_city || null,
-        lat: cached?.geo_lat ?? null,
-        lon: cached?.geo_lon ?? null,
-        abuse_score: cached?.abuse_score ?? null,
-        hostname: cached?.hostname || null,
-        event_count: r.event_count,
-        blocked_count: blockedMap.get(r._id) || 0,
-        threat_count: threatMap.get(r._id) || 0,
-        lastSeen: r.lastSeen,
+        summary: { totalEnriched: 0, withAbuseScore: 0, highThreat: 0, countries: 0 },
+        periodSummary: { enriched: 0, flagged: 0, highThreat: 0, countries: 0 },
+        ips: [],
       };
-    });
+    }
 
-    // Compute period summary from distinct IPs seen in the time range (not capped by limit)
-    const periodDistinct = await this._post(`/${this.eventsCollection}/distinct`, {
-      field: 'network.src_ip',
-      filter: { received_at: { '$gte': since }, 'network.src_ip': { '$exists': true } },
-      limit: 10000,
-    });
-    const periodIps = new Set((periodDistinct.data?.values || []));
-    const periodCached = cacheData.filter(d => periodIps.has(d.ip));
-    const periodEnriched = periodCached.filter(d => d.geo_country || d.abuse_score != null).length;
-    const periodFlagged = periodCached.filter(d => d.abuse_score > 0).length;
-    const periodHighThreat = periodCached.filter(d => d.abuse_score >= 50).length;
-    const periodCountries = new Set(periodCached.filter(d => d.geo_country).map(d => d.geo_country)).size;
+    const t0 = Date.now();
 
-    return {
-      summary: { totalEnriched, withAbuseScore, highThreat, countries },
-      periodSummary: { enriched: periodEnriched, flagged: periodFlagged, highThreat: periodHighThreat, countries: periodCountries },
-      ips,
+    // --- Global summary ---
+    // Use $group+$count aggregation instead of count_only so accuracy isn't
+    // bounded by any scan cap. Each pipeline fully aggregates the filtered set.
+    const enrichedCount = async (filter) => {
+      const r = await this._post(`/${this.cacheCollection}/aggregate`, {
+        pipeline: [
+          { '$match': filter },
+          { '$group': { '_id': null, count: { '$count': {} } } },
+        ],
+      });
+      return r.data?.[0]?.count || 0;
     };
+
+    const [totalEnriched, withAbuseScore, highThreat, countriesRes] = await Promise.all([
+      // Enriched = has geo_country OR abuse_score set (non-null). WardSONDB
+      // documents always have these fields (set to null on miss), so test for
+      // non-null truthiness via separate $or queries against concrete values.
+      enrichedCount({
+        is_private: false,
+        '$or': [
+          { geo_country: { '$ne': null } },
+          { abuse_score: { '$ne': null } },
+        ],
+      }),
+      enrichedCount({ is_private: false, abuse_score: { '$gt': 0 } }),
+      enrichedCount({ is_private: false, abuse_score: { '$gte': 50 } }),
+      this._post(`/${this.cacheCollection}/distinct`, {
+        field: 'geo_country',
+        filter: { is_private: false, geo_country: { '$ne': null } },
+        limit: 1000,
+      }).catch(() => ({ data: { count: 0 } })),
+    ]);
+    const summary = {
+      totalEnriched,
+      withAbuseScore,
+      highThreat,
+      countries: countriesRes.data?.count || 0,
+    };
+
+    // --- Top IPs ---
+    // Match SQLite semantics: sort by event_count desc (with abuse_score desc
+    // as client-side tiebreaker after enrichment join). No threat_count filter
+    // — Threat Intel shows active enriched IPs, not just IDS-alert IPs.
+    const OVERFETCH = Math.min(Math.max(limit * 10, 500), 10000);
+    const topAgg = await this._post(`/${this.rollupIpHourly}/aggregate`, {
+      pipeline: [
+        { '$match': { bucket: { '$gte': since } } },
+        { '$group': {
+          '_id': 'ip',
+          event_count: { '$sum': 'event_count' },
+          blocked_count: { '$sum': 'blocked_count' },
+          threat_count: { '$sum': 'threat_count' },
+        }},
+        { '$sort': { event_count: 'desc' } },
+        { '$limit': OVERFETCH },
+      ],
+    });
+
+    const aggRows = topAgg.data || [];
+    const aggIps = aggRows.map(r => r._id).filter(Boolean);
+
+    // Targeted cache fetch keyed by ip (requires idx_cache_ip for reliability
+    // beyond the 10K query cap).
+    let cacheMap = new Map();
+    if (aggIps.length > 0) {
+      const cacheRes = await this._post(`/${this.cacheCollection}/query`, {
+        filter: { ip: { '$in': aggIps }, is_private: false },
+        limit: Math.min(aggIps.length, 10000),
+      });
+      cacheMap = new Map((cacheRes.data || []).map(d => [d.ip, d]));
+    }
+
+    // SQLite parity: only show IPs that are enriched with geo or abuse data.
+    const enrichedRows = aggRows.filter(r => {
+      const c = cacheMap.get(r._id);
+      return c && (c.geo_country != null || c.abuse_score != null);
+    });
+
+    // Apply abuse_score tiebreaker client-side (SQLite: ORDER BY event_count DESC, abuse_score DESC)
+    enrichedRows.sort((a, b) => {
+      const ea = a.event_count || 0, eb = b.event_count || 0;
+      if (ea !== eb) return eb - ea;
+      const sa = cacheMap.get(a._id)?.abuse_score ?? -1;
+      const sb = cacheMap.get(b._id)?.abuse_score ?? -1;
+      return sb - sa;
+    });
+
+    const ips = enrichedRows
+      .slice(0, limit)
+      .map(r => {
+        const c = cacheMap.get(r._id) || {};
+        return {
+          ip: r._id,
+          country: c.geo_country || null,
+          city: c.geo_city || null,
+          lat: c.geo_lat ?? null,
+          lon: c.geo_lon ?? null,
+          abuse_score: c.abuse_score ?? null,
+          hostname: c.hostname || null,
+          event_count: r.event_count || 0,
+          blocked_count: r.blocked_count || 0,
+          threat_count: r.threat_count || 0,
+          lastSeen: null,
+        };
+      });
+
+    // --- Period summary ---
+    const periodIpsRes = await this._post(`/${this.rollupIpHourly}/aggregate`, {
+      pipeline: [
+        { '$match': { bucket: { '$gte': since } } },
+        { '$group': { '_id': 'ip' } },
+        { '$limit': 10000 },
+      ],
+    });
+    const periodIps = (periodIpsRes.data || []).map(r => r._id).filter(Boolean);
+
+    let periodSummary = { enriched: 0, flagged: 0, highThreat: 0, countries: 0 };
+    if (periodIps.length > 0) {
+      const CHUNK = 500;
+      const countriesSet = new Set();
+      let enriched = 0, flagged = 0, highThreatCount = 0;
+      for (let i = 0; i < periodIps.length; i += CHUNK) {
+        const chunk = periodIps.slice(i, i + CHUNK);
+        const res = await this._post(`/${this.cacheCollection}/query`, {
+          filter: { ip: { '$in': chunk }, is_private: false },
+          limit: chunk.length,
+        });
+        for (const d of (res.data || [])) {
+          if (d.geo_country != null || d.abuse_score != null) enriched++;
+          if (d.abuse_score > 0) flagged++;
+          if (d.abuse_score >= 50) highThreatCount++;
+          if (d.geo_country) countriesSet.add(d.geo_country);
+        }
+      }
+      periodSummary = { enriched, flagged, highThreat: highThreatCount, countries: countriesSet.size };
+    }
+
+    // Diagnostic log — helps debug empty-result cases. Info level so it shows
+    // up in default logging.
+    logger.info({
+      since, limit,
+      aggRows: aggRows.length,
+      cacheHits: cacheMap.size,
+      enrichedRows: enrichedRows.length,
+      finalIps: ips.length,
+      periodIps: periodIps.length,
+      summary,
+      ms: Date.now() - t0,
+    }, 'WardSONDB getThreatIntel diagnostic');
+
+    return { summary, periodSummary, ips };
   }
 
   async getGeoEvents(since, limit) {
-    if (await this._isCollectionEmpty()) return [];
-    // Use cache data + aggregation to get geo events
+    if (this._isCollectionEmpty()) return [];
     const cacheResult = await this._post(`/${this.cacheCollection}/query`, {
       filter: { is_private: false, geo_lat: { '$exists': true } },
       limit: 10000,
     });
     const cacheMap = new Map((cacheResult.data || []).map(d => [d.ip, d]));
 
-    const pipeline = [
-      { '$match': { received_at: { '$gte': since }, 'network.src_ip': { '$exists': true } } },
-      { '$group': {
-        '_id': 'network.src_ip',
-        'count': { '$count': {} },
-        'lastSeen': { '$max': 'received_at' },
-      }},
-      { '$sort': { 'count': 'desc' } },
-      { '$limit': limit * 3 },  // Over-fetch to survive geo-data filter (not all IPs have geo)
-    ];
+    const aggDir = (dir) => this._post(`/${this.rollupIpHourly}/aggregate`, {
+      pipeline: [
+        { '$match': { bucket: { '$gte': since }, direction: dir } },
+        { '$group': {
+          '_id': 'ip',
+          count: { '$sum': 'event_count' },
+          blocked: { '$sum': 'blocked_count' },
+          threats: { '$sum': 'threat_count' },
+        }},
+        { '$sort': { count: 'desc' } },
+        { '$limit': limit * 3 },
+      ],
+    });
 
-    const result = await this._aggregate(pipeline);
-    return (result.data || [])
-      .filter(r => cacheMap.has(r._id) && cacheMap.get(r._id).geo_lat)
-      .slice(0, limit)  // Trim to requested limit after filtering
-      .map(r => {
+    const [srcRes, dstRes] = await Promise.all([aggDir('src'), aggDir('dst')]);
+
+    const buildRows = (rows, direction) =>
+      (rows || []).filter(r => cacheMap.has(r._id) && cacheMap.get(r._id).geo_lat != null).map(r => {
         const c = cacheMap.get(r._id);
         return {
           ip: r._id,
-          country: c.geo_country,
-          city: c.geo_city,
+          country: c.geo_country || null,
+          city: c.geo_city || null,
           lat: c.geo_lat,
           lon: c.geo_lon,
-          abuseScore: c.abuse_score,
-          count: r.count,
-          blocked: 0,
-          threats: 0,
-          lastSeen: r.lastSeen,
-          direction: 'src',
+          abuseScore: c.abuse_score ?? null,
+          count: r.count || 0,
+          blocked: r.blocked || 0,
+          threats: r.threats || 0,
+          lastSeen: null,
+          direction,
         };
       });
+
+    const all = [...buildRows(srcRes.data, 'src'), ...buildRows(dstRes.data, 'dst')];
+    all.sort((a, b) => b.count - a.count);
+    return all.slice(0, limit);
   }
 
   async getRecentGeoEvents(limit) {
-    if (await this._isCollectionEmpty()) return [];
-    // Get recent events and join with cache for geo data
-    const result = await this._post(`/${this.eventsCollection}/query`, {
-      filter: { 'network.src_ip': { '$exists': true } },
-      sort: [{ '_created_at': 'desc' }],
-      limit: Math.min(limit * 3, 500), // Over-fetch since not all will have geo
-    });
+    if (this._isCollectionEmpty()) return [];
 
     const cacheResult = await this._post(`/${this.cacheCollection}/query`, {
       filter: { is_private: false, geo_lat: { '$exists': true } },
@@ -1153,33 +1630,45 @@ class WardsonDbBackend extends StorageBackend {
     });
     const cacheMap = new Map((cacheResult.data || []).map(d => [d.ip, d]));
 
+    const partitions = this._partitionsNewestFirst();
     const events = [];
-    for (const doc of (result.data || [])) {
-      const srcIp = doc.network?.src_ip;
-      const dstIp = doc.network?.dst_ip;
-      const srcGeo = srcIp ? cacheMap.get(srcIp) : null;
-      const dstGeo = dstIp ? cacheMap.get(dstIp) : null;
-      if (!srcGeo && !dstGeo) continue;
-
-      const event = this._documentToEvent(doc);
-      if (srcGeo) {
-        event.src_geo_lat = srcGeo.geo_lat;
-        event.src_geo_lon = srcGeo.geo_lon;
-        event.src_geo_country = srcGeo.geo_country;
-        event.src_geo_city = srcGeo.geo_city;
-        event.src_abuse_score = srcGeo.abuse_score;
-      }
-      if (dstGeo) {
-        event.dst_geo_lat = dstGeo.geo_lat;
-        event.dst_geo_lon = dstGeo.geo_lon;
-        event.dst_geo_country = dstGeo.geo_country;
-        event.dst_geo_city = dstGeo.geo_city;
-        event.dst_abuse_score = dstGeo.abuse_score;
-      }
-      events.push(event);
+    for (const partition of partitions) {
       if (events.length >= limit) break;
+      const remaining = limit - events.length;
+      try {
+        const r = await this._post(`/${partition}/query`, {
+          filter: { 'network.src_ip': { '$exists': true } },
+          sort: [{ '_created_at': 'desc' }],
+          limit: Math.min(remaining * 3, 500),
+        });
+        for (const doc of (r.data || [])) {
+          const srcIp = doc.network?.src_ip;
+          const dstIp = doc.network?.dst_ip;
+          const sGeo = srcIp ? cacheMap.get(srcIp) : null;
+          const dGeo = dstIp ? cacheMap.get(dstIp) : null;
+          if (!sGeo && !dGeo) continue;
+          const event = this._documentToEvent(doc);
+          if (sGeo) {
+            event.src_geo_lat = sGeo.geo_lat;
+            event.src_geo_lon = sGeo.geo_lon;
+            event.src_geo_country = sGeo.geo_country;
+            event.src_geo_city = sGeo.geo_city;
+            event.src_abuse_score = sGeo.abuse_score;
+          }
+          if (dGeo) {
+            event.dst_geo_lat = dGeo.geo_lat;
+            event.dst_geo_lon = dGeo.geo_lon;
+            event.dst_geo_country = dGeo.geo_country;
+            event.dst_geo_city = dGeo.geo_city;
+            event.dst_abuse_score = dGeo.abuse_score;
+          }
+          events.push(event);
+          if (events.length >= limit) break;
+        }
+      } catch (err) {
+        logger.debug({ err: err.message, partition }, 'getRecentGeoEvents partition query failed');
+      }
     }
-
     return events;
   }
 
@@ -1210,7 +1699,6 @@ class WardsonDbBackend extends StorageBackend {
     if (!result.data || result.data.length === 0) return null;
     const doc = result.data[0];
 
-    // Check staleness
     const updatedAt = new Date(doc.updated_at || doc._updated_at).getTime();
     const maxAge = (this.config.abuseIpDbCacheHours || 24) * 60 * 60 * 1000;
     if (Date.now() - updatedAt > maxAge) return null;
@@ -1229,7 +1717,6 @@ class WardsonDbBackend extends StorageBackend {
   }
 
   async setCachedEnrichment(ip, data) {
-    // Check if exists first
     const existing = await this._post(`/${this.cacheCollection}/query`, {
       filter: { ip },
       fields: ['_id'],
@@ -1260,7 +1747,6 @@ class WardsonDbBackend extends StorageBackend {
   }
 
   async getAllCachedEnrichment() {
-    // Get all non-private cached IPs with enrichment data
     const result = await this._post(`/${this.cacheCollection}/query`, {
       filter: {
         '$and': [
@@ -1271,7 +1757,7 @@ class WardsonDbBackend extends StorageBackend {
           ]},
         ],
       },
-      limit: 10000, // Get all — enrichment cache is typically small
+      limit: 10000,
     });
     return (result.data || []).map(d => ({
       ip: d.ip,
@@ -1287,27 +1773,179 @@ class WardsonDbBackend extends StorageBackend {
   // --- Maintenance ---
 
   async runRetention(days) {
-    // Phase 1: No _delete_by_query — log and skip
-    logger.debug('WardSONDB: runRetention() requires _delete_by_query (Phase 2)');
-    return { deleted: 0 };
+    const cutoffMs = Date.now() - days * 86400000;
+    const cutoffDate = new Date(cutoffMs);
+    const cutoffISO = cutoffDate.toISOString();
+    const cutoffDay = cutoffISO.substring(0, 10);
+
+    // Drop event partitions older than cutoffDay
+    const toDrop = [...this._partitions].filter(name => {
+      const day = name.substring(PARTITION_PREFIX.length);
+      return day < cutoffDay;
+    });
+
+    let dropped = 0;
+    for (const p of toDrop) {
+      try {
+        await this._delete(`/${p}`);
+        this._partitions.delete(p);
+        dropped++;
+      } catch (err) {
+        logger.warn({ err: err.message, partition: p }, 'Failed to drop partition during retention');
+      }
+    }
+
+    // Clean rollup entries older than cutoff (small collections, cheap)
+    const rollupCols = [this.rollup5m, this.rollupIpHourly, this.rollupPortHourly, this.rollupSigHourly, this.rollupClientHourly];
+    for (const col of rollupCols) {
+      try {
+        await this._post(`/${col}/docs/_delete_by_query`, {
+          filter: { bucket: { '$lt': cutoffISO } },
+        });
+      } catch (err) {
+        logger.debug({ err: err.message, col }, 'Rollup retention cleanup failed');
+      }
+    }
+
+    if (dropped > 0) {
+      logger.info({ dropped, cutoffDay, rollupsCleaned: rollupCols.length }, 'WardSONDB retention cleanup');
+    }
+    return { deleted: dropped };
   }
 
   async resetData() {
-    try { await this._delete(`/${this.eventsCollection}`); } catch {}
+    // Stop flush so no concurrent writes
+    if (this._flushIntervalHandle) {
+      clearInterval(this._flushIntervalHandle);
+      this._flushIntervalHandle = null;
+    }
+
+    // Discover all event partitions (union with in-memory cache)
+    const existing = new Set(this._partitions);
+    try {
+      const cols = await this._get('/_collections');
+      for (const c of (cols.data || [])) {
+        const name = typeof c === 'string' ? c : c?.name;
+        if (name && PARTITION_NAME_RE.test(name)) existing.add(name);
+      }
+    } catch {}
+
+    // Drop all event partitions
+    for (const p of existing) {
+      try { await this._delete(`/${p}`); } catch {}
+    }
+    // Drop rollup collections
+    for (const c of [this.rollup5m, this.rollupIpHourly, this.rollupPortHourly, this.rollupSigHourly, this.rollupClientHourly]) {
+      try { await this._delete(`/${c}`); } catch {}
+    }
+    // Drop enrichment cache
     try { await this._delete(`/${this.cacheCollection}`); } catch {}
-    await this._ensureCollection(this.eventsCollection);
-    await this._ensureCollection(this.cacheCollection);
+
+    // Reset in-memory state
+    this._partitions.clear();
+    this._rollupBuffers = this._newBuffers();
+    this._cacheMap = null;
+    this._cacheMapTs = 0;
     this._cachedDocCount = 0;
-    // Re-create indexes on the fresh collection — skip write-pressure check during init
-    this._isInitializing = true;
-    this.indexesReady = new Promise(resolve => { this._resolveIndexesReady = resolve; });
-    this._startDeferredIndexCreation();
+
+    // Recreate today's partition + indexes
+    const today = this._partitionName(new Date());
+    await this._ensurePartition(today);
+
+    // Recreate rollup collections + indexes
+    for (const col of [this.rollup5m, this.rollupIpHourly, this.rollupPortHourly, this.rollupSigHourly, this.rollupClientHourly]) {
+      await this._ensureCollection(col);
+    }
+    // Recreate enrichment cache BEFORE its indexes
+    await this._ensureCollection(this.cacheCollection);
+
+    for (const idx of [...this._getRollupIndexSpecs(), ...this._getCacheIndexSpecs()]) {
+      try {
+        const body = { name: idx.name };
+        if (idx.fields) body.fields = idx.fields;
+        else body.field = idx.field;
+        await this._post(`/${idx.col}/indexes`, body);
+      } catch (err) {
+        if (!err.message?.includes('INDEX_EXISTS')) {
+          logger.debug({ err: err.message, col: idx.col, idx: idx.name }, 'Rollup/cache index creation warn during reset');
+        }
+      }
+    }
+
+    // Today's partition is empty — indexes are instant — ingestion can resume
+    this.indexesReady = Promise.resolve();
+
+    // Restart flush
+    this._startFlushInterval();
+  }
+
+  // --- Backfill ---
+
+  /**
+   * One-time rollup backfill on startup if rollup collections are empty but
+   * event partitions hold data (e.g., upgrading from a pre-rollup version, or
+   * recovering from a wipe of the rollup collections only).
+   * Idempotency: read-then-increment double-counts on re-run, so we hard-skip
+   * if rollups already contain anything.
+   */
+  async _runStartupBackfill() {
+    if (this._backfillStarted || this._shuttingDown) return;
+    this._backfillStarted = true;
+
+    // Probe rollups for existing data
+    let rollupCount = 0;
+    try {
+      const probe = await this._post(`/${this.rollup5m}/query`, { count_only: true, limit: 1 });
+      rollupCount = probe.meta?.total_count || probe.data?.count || 0;
+    } catch {}
+
+    if (rollupCount > 0) {
+      logger.info({ rollupCount }, 'Skipping rollup backfill — rollups already populated');
+      return;
+    }
+    if (this._partitions.size === 0) {
+      logger.info('Skipping rollup backfill — no event partitions');
+      return;
+    }
+
+    logger.info({ partitions: this._partitions.size }, 'Starting rollup backfill');
+    const startedAt = Date.now();
+    const CHUNK = 1000;
+
+    for (const partition of [...this._partitions].sort()) {
+      let offset = 0;
+      let chunkIdx = 0;
+      while (!this._shuttingDown) {
+        const t0 = Date.now();
+        let docs;
+        try {
+          const r = await this._post(`/${partition}/query`, {
+            sort: [{ '_created_at': 'asc' }],
+            limit: CHUNK,
+            offset,
+          });
+          docs = r.data || [];
+        } catch (err) {
+          logger.warn({ err: err.message, partition, offset }, 'Backfill chunk fetch failed');
+          break;
+        }
+        if (docs.length === 0) break;
+
+        const events = docs.map(d => this._documentToEvent(d));
+        this._accumulateRollups(events);
+        await this._flushRollups();
+
+        offset += docs.length;
+        chunkIdx++;
+        logger.info({ partition, chunk: chunkIdx, docs: docs.length, ms: Date.now() - t0 }, 'Rollup backfill chunk');
+        if (docs.length < CHUNK) break;
+      }
+    }
+    logger.info({ totalMs: Date.now() - startedAt }, 'Rollup backfill complete');
   }
 
   // --- Settings ---
-  // Settings stay in SQLite (needed to select the backend on boot)
-  // These methods should not be called when WardSONDB is active — the
-  // storage manager routes settings calls to SQLite always.
+  // Settings stay in SQLite (needed to select the backend on boot).
 
   async getSetting() { throw new Error('Settings are managed by SQLite'); }
   async setSetting() { throw new Error('Settings are managed by SQLite'); }

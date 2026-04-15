@@ -11,6 +11,14 @@ const { getResetGraceStatus } = require('./settings');
 const router = express.Router();
 const startTime = Date.now();
 
+// Debounce write_pressure === 'high' — require two consecutive high readings
+// (~20s at the 10s poll cadence) before we report rebuilding due to pressure.
+// Clears instantly on any non-high reading. Eliminates single-poll flickers
+// from WardSONDB's volatile write_pressure signal while preserving the signal
+// for sustained heavy load. Module-level because the route is a singleton.
+let _consecutiveHighPressure = 0;
+const HIGH_PRESSURE_DEBOUNCE_POLLS = 2;
+
 // Race a promise against a timeout — returns fallback on timeout or error
 function withTimeout(promise, ms, fallback) {
   return Promise.race([
@@ -53,10 +61,13 @@ router.get('/', async (req, res) => {
       const healthTimedOut = healthCheck === TIMEOUT;
 
       const writePressure = hc?.writePressure || null;
-      // Only show rebuilding when WardSONDB reports high write pressure or during
-      // the post-reset grace period. Query timeouts alone should not trigger the banner —
-      // the dashboard can render with partial data.
-      const isRebuilding = !isEmpty && !!(graceStatus || writePressure === 'high');
+      if (writePressure === 'high') _consecutiveHighPressure++;
+      else _consecutiveHighPressure = 0;
+      const pressureSustained = _consecutiveHighPressure >= HIGH_PRESSURE_DEBOUNCE_POLLS;
+      // Only show rebuilding when WardSONDB reports sustained high write pressure
+      // (two consecutive polls) or during the post-reset grace period. Query timeouts
+      // alone should not trigger the banner — the dashboard can render with partial data.
+      const isRebuilding = !isEmpty && !!(graceStatus || pressureSustained);
 
       // Derive eventsTotal and lastEventAt from healthCheck data (O(1) lookups)
       const eventsTotal = hc?.details?.eventsStorage?.docCount ?? null;

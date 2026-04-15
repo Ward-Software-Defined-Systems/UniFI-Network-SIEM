@@ -319,6 +319,18 @@
   color: #f59e0b;
 }
 
+.hunt-period-row {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin: 0.75rem 0 0 0.5rem;
+}
+
+.hunt-period-label {
+  font-size: 0.75rem;
+  color: #94a3b8;
+}
+
 /* Error */
 .hunt-error {
   background: rgba(239, 68, 68, 0.1);

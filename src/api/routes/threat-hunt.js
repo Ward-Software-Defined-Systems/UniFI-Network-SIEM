@@ -6,6 +6,21 @@ const logger = require('../../utils/logger');
 
 const router = express.Router();
 
+// Period selector — same options as Dashboard / Live Map / Threat Intel
+const PERIOD_MS = {
+  '1h': 3600000, '6h': 21600000, '24h': 86400000,
+  '7d': 604800000, '30d': 2592000000,
+};
+const DEFAULT_PERIOD = '24h';
+
+function getSince(period) {
+  const offset = PERIOD_MS[period] || PERIOD_MS[DEFAULT_PERIOD];
+  return new Date(Date.now() - offset).toISOString();
+}
+
+// Concurrency cap for WardSONDB partition fan-out
+const HUNT_FANOUT_CONCURRENCY = 8;
+
 // In-memory settings for threat hunt (also persisted to DB)
 let huntSettings = {
   provider: 'anthropic',  // anthropic | openai | gemini
@@ -69,25 +84,28 @@ router.put('/settings', (req, res) => {
 // POST /api/threat-hunt/investigate (non-streaming fallback)
 router.post('/investigate', async (req, res) => {
   loadSettings();
-  const { target } = req.body;
+  const { target, period } = req.body;
   if (!target) return res.status(400).json({ error: 'Target IP or hostname required' });
 
   const key = getActiveKey();
   if (!key) return res.status(400).json({ error: `No API key configured for ${huntSettings.provider}` });
 
   try {
-    // Gather local intelligence (async for WardSONDB support)
-    const intel = await gatherLocalIntel(target);
+    const since = getSince(period || DEFAULT_PERIOD);
 
-    // Gather external intelligence
+    // Gather local intelligence (scoped to the requested period)
+    const intel = await gatherLocalIntel(target, since);
+
+    // Gather external intelligence (not time-scoped — rDNS / WHOIS)
     const external = await gatherExternalIntel(target);
 
     // Build prompt and call AI
-    const prompt = buildInvestigationPrompt(target, intel, external);
+    const prompt = buildInvestigationPrompt(target, intel, external, period || DEFAULT_PERIOD);
     const analysis = await callAI(prompt);
 
     res.json({
       target,
+      period: period || DEFAULT_PERIOD,
       provider: huntSettings.provider,
       intel,
       external,
@@ -103,7 +121,7 @@ router.post('/investigate', async (req, res) => {
 // POST /api/threat-hunt/investigate-stream (SSE streaming)
 router.post('/investigate-stream', async (req, res) => {
   loadSettings();
-  const { target } = req.body;
+  const { target, period } = req.body;
   if (!target) return res.status(400).json({ error: 'Target IP or hostname required' });
 
   const key = getActiveKey();
@@ -120,20 +138,23 @@ router.post('/investigate-stream', async (req, res) => {
   };
 
   try {
-    const intel = await gatherLocalIntel(target);
+    const periodKey = period || DEFAULT_PERIOD;
+    const since = getSince(periodKey);
+    const intel = await gatherLocalIntel(target, since);
     const external = await gatherExternalIntel(target);
     const timestamp = new Date().toISOString();
 
     // Send metadata immediately so frontend can render intel panels
     sendEvent('metadata', {
       target,
+      period: periodKey,
       provider: huntSettings.provider,
       intel,
       external,
       timestamp,
     });
 
-    const prompt = buildInvestigationPrompt(target, intel, external);
+    const prompt = buildInvestigationPrompt(target, intel, external, periodKey);
     const provider = huntSettings.provider;
 
     switch (provider) {
@@ -168,59 +189,60 @@ function getActiveKey() {
   }
 }
 
-async function gatherLocalIntel(target) {
+async function gatherLocalIntel(target, since) {
   const backendName = storage.getBackendName();
 
   if (backendName === 'WardSONDB') {
-    return gatherLocalIntelWardsonDB(target);
+    return gatherLocalIntelWardsonDB(target, since);
   }
 
   if (backendName === 'OpenSearch') {
-    return gatherLocalIntelOpenSearch(target);
+    return gatherLocalIntelOpenSearch(target, since);
   }
 
   // SQLite path (original)
-  return gatherLocalIntelSQLite(target);
+  return gatherLocalIntelSQLite(target, since);
 }
 
-function gatherLocalIntelSQLite(target) {
+function gatherLocalIntelSQLite(target, since) {
   const db = getDb();
 
+  // Cache + related-IPs lookups are NOT time-scoped (cache is current-state).
   const cached = db.prepare('SELECT * FROM ip_enrichment_cache WHERE ip = ?').get(target);
   const totalEvents = db.prepare(
-    'SELECT COUNT(*) as c FROM events WHERE src_ip = ? OR dst_ip = ?'
-  ).get(target, target).c;
+    'SELECT COUNT(*) as c FROM events WHERE (src_ip = ? OR dst_ip = ?) AND received_at >= ?'
+  ).get(target, target, since).c;
   const byAction = db.prepare(`
     SELECT action, COUNT(*) as count FROM events
-    WHERE (src_ip = ? OR dst_ip = ?) AND action IS NOT NULL
+    WHERE (src_ip = ? OR dst_ip = ?) AND action IS NOT NULL AND received_at >= ?
     GROUP BY action ORDER BY count DESC
-  `).all(target, target);
+  `).all(target, target, since);
   const byType = db.prepare(`
     SELECT event_type, COUNT(*) as count FROM events
-    WHERE src_ip = ? OR dst_ip = ?
+    WHERE (src_ip = ? OR dst_ip = ?) AND received_at >= ?
     GROUP BY event_type ORDER BY count DESC
-  `).all(target, target);
+  `).all(target, target, since);
   const topPorts = db.prepare(`
     SELECT dst_port, protocol, COUNT(*) as count FROM events
-    WHERE src_ip = ? AND dst_port IS NOT NULL
+    WHERE src_ip = ? AND dst_port IS NOT NULL AND received_at >= ?
     GROUP BY dst_port, protocol ORDER BY count DESC LIMIT 20
-  `).all(target);
+  `).all(target, since);
   const topSrcPorts = db.prepare(`
     SELECT src_port, protocol, COUNT(*) as count FROM events
-    WHERE dst_ip = ? AND src_port IS NOT NULL
+    WHERE dst_ip = ? AND src_port IS NOT NULL AND received_at >= ?
     GROUP BY src_port, protocol ORDER BY count DESC LIMIT 10
-  `).all(target);
+  `).all(target, since);
   const timeline = db.prepare(`
     SELECT strftime('%Y-%m-%dT%H:00:00Z', received_at) as hour, COUNT(*) as count
-    FROM events WHERE src_ip = ? OR dst_ip = ?
+    FROM events WHERE (src_ip = ? OR dst_ip = ?) AND received_at >= ?
     GROUP BY hour ORDER BY hour
-  `).all(target, target);
+  `).all(target, target, since);
   const firstSeen = db.prepare(
-    'SELECT MIN(received_at) as t FROM events WHERE src_ip = ? OR dst_ip = ?'
-  ).get(target, target).t;
+    'SELECT MIN(received_at) as t FROM events WHERE (src_ip = ? OR dst_ip = ?) AND received_at >= ?'
+  ).get(target, target, since).t;
   const lastSeen = db.prepare(
-    'SELECT MAX(received_at) as t FROM events WHERE src_ip = ? OR dst_ip = ?'
-  ).get(target, target).t;
+    'SELECT MAX(received_at) as t FROM events WHERE (src_ip = ? OR dst_ip = ?) AND received_at >= ?'
+  ).get(target, target, since).t;
   const subnet = target.split('.').slice(0, 3).join('.');
   const relatedIPs = db.prepare(`
     SELECT ip, abuse_score, geo_country, hostname FROM ip_enrichment_cache
@@ -229,168 +251,244 @@ function gatherLocalIntelSQLite(target) {
   `).all(subnet + '.%', target);
   const signatures = db.prepare(`
     SELECT ids_signature, ids_classification, COUNT(*) as count
-    FROM events WHERE (src_ip = ? OR dst_ip = ?) AND ids_signature IS NOT NULL
+    FROM events WHERE (src_ip = ? OR dst_ip = ?) AND ids_signature IS NOT NULL AND received_at >= ?
     GROUP BY ids_signature ORDER BY count DESC LIMIT 10
-  `).all(target, target);
+  `).all(target, target, since);
   const targetsHit = db.prepare(`
-    SELECT COUNT(DISTINCT dst_ip) as c FROM events WHERE src_ip = ?
-  `).get(target).c;
+    SELECT COUNT(DISTINCT dst_ip) as c FROM events WHERE src_ip = ? AND received_at >= ?
+  `).get(target, since).c;
   const topDestinations = db.prepare(`
     SELECT dst_ip as ip, COUNT(*) as count FROM events
-    WHERE src_ip = ? AND dst_ip IS NOT NULL
+    WHERE src_ip = ? AND dst_ip IS NOT NULL AND received_at >= ?
     GROUP BY dst_ip ORDER BY count DESC LIMIT 20
-  `).all(target);
+  `).all(target, since);
   const topSources = db.prepare(`
     SELECT src_ip as ip, COUNT(*) as count FROM events
-    WHERE dst_ip = ? AND src_ip IS NOT NULL
+    WHERE dst_ip = ? AND src_ip IS NOT NULL AND received_at >= ?
     GROUP BY src_ip ORDER BY count DESC LIMIT 20
-  `).all(target);
+  `).all(target, since);
 
   return { cached, totalEvents, byAction, byType, topPorts, topSrcPorts, timeline, firstSeen, lastSeen, relatedIPs, signatures, targetsHit, topDestinations, topSources };
 }
 
-async function gatherLocalIntelWardsonDB(target) {
-  const backend = storage.getBackend();
-  const col = 'events';
-  const cacheCol = 'enrichment_cache';
+/**
+ * Run the same WardSONDB aggregation pipeline against each partition with
+ * bounded concurrency, then merge results client-side by _id.
+ */
+async function fanOutAggregate(backend, partitions, pipeline) {
+  if (!partitions.length) return [];
+  const merged = new Map();
+  let i = 0;
+  const workers = Array.from({ length: HUNT_FANOUT_CONCURRENCY }, async () => {
+    while (i < partitions.length) {
+      const p = partitions[i++];
+      try {
+        const r = await backend._request('POST', `/${p}/aggregate`, { pipeline }, 3);
+        for (const row of (r.data || [])) {
+          const key = typeof row._id === 'object' ? JSON.stringify(row._id) : String(row._id);
+          const ex = merged.get(key);
+          if (ex) ex.count = (ex.count || 0) + (row.count || 0);
+          else merged.set(key, { _id: row._id, count: row.count || 0 });
+        }
+      } catch (err) {
+        logger.debug({ err: err.message, partition: p }, 'Threat hunt fan-out aggregation failed');
+      }
+    }
+  });
+  await Promise.all(workers);
+  return Array.from(merged.values()).sort((a, b) => (b.count || 0) - (a.count || 0));
+}
 
-  // Threat hunt queries can be heavy — no client-side timeout, let WardSONDB handle it
+/** Fan out a count_only query and sum the counts across partitions. */
+async function fanOutCount(backend, partitions, filter) {
+  if (!partitions.length) return 0;
+  let total = 0;
+  let i = 0;
+  const workers = Array.from({ length: HUNT_FANOUT_CONCURRENCY }, async () => {
+    while (i < partitions.length) {
+      const p = partitions[i++];
+      try {
+        const r = await backend._request('POST', `/${p}/query`, { filter, count_only: true }, 3);
+        total += r.meta?.total_count || r.data?.count || 0;
+      } catch (err) {
+        logger.debug({ err: err.message, partition: p }, 'Threat hunt fan-out count failed');
+      }
+    }
+  });
+  await Promise.all(workers);
+  return total;
+}
+
+async function gatherLocalIntelWardsonDB(target, since) {
+  const backend = storage.getBackend();
+  const cacheCol = backend.cacheCollection;
   const post = (path, body) => backend._request('POST', path, body, 3);
 
-  // All queries run in parallel for speed
+  // Resolve the partition set covering [since, now]
+  const untilISO = new Date().toISOString();
+  const partitions = backend._getPartitionsForRange(since, untilISO);
+
+  // IP filter applied at $match (cheap pre-filter on indexed src/dst ip fields)
   const ipFilter = { '$or': [{ 'network.src_ip': target }, { 'network.dst_ip': target }] };
 
+  // Enrichment cache lookup is not partitioned and not time-scoped
+  const cachedResult = await post(`/${cacheCol}/query`, { filter: { ip: target }, limit: 1 }).catch(() => ({ data: [] }));
+  const cached = cachedResult.data?.[0] || null;
+
+  if (partitions.length === 0) {
+    return {
+      cached, totalEvents: 0, byAction: [], byType: [], topPorts: [], topSrcPorts: [],
+      timeline: [], firstSeen: null, lastSeen: null, relatedIPs: [],
+      signatures: [], targetsHit: 0, topDestinations: [], topSources: [],
+    };
+  }
+
+  // Run the heavy aggregations in parallel — each one fans out across partitions internally
   const [
-    cachedResult,
-    totalResult,
-    byActionResult,
-    byTypeResult,
-    topPortsResult,
-    topSrcPortsResult,
-    firstLastResult,
-    signaturesResult,
-    targetsHitResult,
-    topDestinationsResult,
-    topSourcesResult,
+    totalEvents,
+    byActionRows,
+    byTypeRows,
+    topPortsRows,
+    topSrcPortsRows,
+    signaturesRows,
+    topDestinationsRows,
+    topSourcesRows,
+    firstLastResults,
+    targetsHitSet,
   ] = await Promise.all([
-    // Enrichment cache lookup
-    post(`/${cacheCol}/query`, { filter: { ip: target }, limit: 1 }).catch(() => ({ data: [] })),
+    fanOutCount(backend, partitions, ipFilter),
 
-    // Total events
-    post(`/${col}/query`, { filter: ipFilter, count_only: true }).catch(() => ({ data: { count: 0 } })),
-
-    // Events by action
-    post(`/${col}/aggregate`, { pipeline: [
+    fanOutAggregate(backend, partitions, [
       { '$match': ipFilter },
       { '$group': { '_id': 'network.action', count: { '$count': {} } } },
-      { '$sort': { count: 'desc' } },
-    ]}).catch(() => ({ data: [] })),
+    ]),
 
-    // Events by type
-    post(`/${col}/aggregate`, { pipeline: [
+    fanOutAggregate(backend, partitions, [
       { '$match': ipFilter },
       { '$group': { '_id': 'event_type', count: { '$count': {} } } },
-      { '$sort': { count: 'desc' } },
-    ]}).catch(() => ({ data: [] })),
+    ]),
 
-    // Top destination ports (target as source)
-    post(`/${col}/aggregate`, { pipeline: [
+    fanOutAggregate(backend, partitions, [
       { '$match': { 'network.src_ip': target, 'network.dst_port': { '$exists': true } } },
       { '$group': { '_id': { port: 'network.dst_port', protocol: 'network.protocol' }, count: { '$count': {} } } },
-      { '$sort': { count: 'desc' } },
-      { '$limit': 20 },
-    ]}).catch(() => ({ data: [] })),
+    ]),
 
-    // Top source ports (target as destination)
-    post(`/${col}/aggregate`, { pipeline: [
+    fanOutAggregate(backend, partitions, [
       { '$match': { 'network.dst_ip': target, 'network.src_port': { '$exists': true } } },
       { '$group': { '_id': { port: 'network.src_port', protocol: 'network.protocol' }, count: { '$count': {} } } },
-      { '$sort': { count: 'desc' } },
-      { '$limit': 10 },
-    ]}).catch(() => ({ data: [] })),
+    ]),
 
-    // First and last seen (sort asc limit 1 + sort desc limit 1)
-    Promise.all([
-      post(`/${col}/query`, { filter: ipFilter, sort: [{ received_at: 'asc' }], fields: ['received_at'], limit: 1 }),
-      post(`/${col}/query`, { filter: ipFilter, sort: [{ received_at: 'desc' }], fields: ['received_at'], limit: 1 }),
-    ]).catch(() => [{ data: [] }, { data: [] }]),
+    fanOutAggregate(backend, partitions, [
+      { '$match': { '$and': [ipFilter, { 'ids.signature': { '$exists': true } }] } },
+      { '$group': { '_id': { sig: 'ids.signature', cls: 'ids.classification' }, count: { '$count': {} } } },
+    ]),
 
-    // IDS signatures
-    post(`/${col}/aggregate`, { pipeline: [
-      { '$match': { '$and': [ipFilter, { 'ids_signature': { '$exists': true } }] } },
-      { '$group': { '_id': { sig: 'ids_signature', cls: 'ids_classification' }, count: { '$count': {} } } },
-      { '$sort': { count: 'desc' } },
-      { '$limit': 10 },
-    ]}).catch(() => ({ data: [] })),
-
-    // Unique destination IPs targeted (count)
-    post(`/${col}/distinct`, { field: 'network.dst_ip', filter: { 'network.src_ip': target } })
-      .catch(() => ({ data: { count: 0 } })),
-
-    // Top destination IPs targeted (with event counts)
-    post(`/${col}/aggregate`, { pipeline: [
+    fanOutAggregate(backend, partitions, [
       { '$match': { 'network.src_ip': target } },
       { '$group': { '_id': 'network.dst_ip', count: { '$count': {} } } },
-      { '$sort': { count: 'desc' } },
-      { '$limit': 20 },
-    ]}).catch(() => ({ data: [] })),
+    ]),
 
-    // Top source IPs communicating with target (as destination)
-    post(`/${col}/aggregate`, { pipeline: [
+    fanOutAggregate(backend, partitions, [
       { '$match': { 'network.dst_ip': target } },
       { '$group': { '_id': 'network.src_ip', count: { '$count': {} } } },
-      { '$sort': { count: 'desc' } },
-      { '$limit': 20 },
-    ]}).catch(() => ({ data: [] })),
+    ]),
+
+    // First and last seen — query each partition for one record at each end, then min/max client-side
+    (async () => {
+      let i = 0;
+      const firsts = [];
+      const lasts = [];
+      const workers = Array.from({ length: HUNT_FANOUT_CONCURRENCY }, async () => {
+        while (i < partitions.length) {
+          const p = partitions[i++];
+          try {
+            const [a, b] = await Promise.all([
+              post(`/${p}/query`, { filter: ipFilter, sort: [{ received_at: 'asc' }], fields: ['received_at'], limit: 1 }),
+              post(`/${p}/query`, { filter: ipFilter, sort: [{ received_at: 'desc' }], fields: ['received_at'], limit: 1 }),
+            ]);
+            const f = a.data?.[0]?.received_at;
+            const l = b.data?.[0]?.received_at;
+            if (f) firsts.push(f);
+            if (l) lasts.push(l);
+          } catch {}
+        }
+      });
+      await Promise.all(workers);
+      return [firsts.length ? firsts.sort()[0] : null, lasts.length ? lasts.sort().slice(-1)[0] : null];
+    })(),
+
+    // Unique dst IPs targeted — distinct per partition, union into a Set
+    (async () => {
+      const set = new Set();
+      let i = 0;
+      const workers = Array.from({ length: HUNT_FANOUT_CONCURRENCY }, async () => {
+        while (i < partitions.length) {
+          const p = partitions[i++];
+          try {
+            const r = await post(`/${p}/distinct`, { field: 'network.dst_ip', filter: { 'network.src_ip': target }, limit: 10000 });
+            for (const v of (r.data?.values || [])) set.add(v);
+          } catch {}
+        }
+      });
+      await Promise.all(workers);
+      return set;
+    })(),
   ]);
 
-  // Parse results
-  const cached = cachedResult.data?.[0] || null;
-  const totalEvents = totalResult.data?.count ?? totalResult.meta?.total_count ?? 0;
-  const byAction = (byActionResult.data || []).map(r => ({ action: r._id, count: r.count }));
-  const byType = (byTypeResult.data || []).map(r => ({ event_type: r._id, count: r.count }));
-  const topPorts = (topPortsResult.data || []).map(r => ({ dst_port: r._id?.port, protocol: r._id?.protocol, count: r.count }));
-  const topSrcPorts = (topSrcPortsResult.data || []).map(r => ({ src_port: r._id?.port, protocol: r._id?.protocol, count: r.count }));
+  const trimRank = (rows, lim) => rows.slice(0, lim).map(r => ({ _id: r._id, count: r.count }));
 
-  const [firstResult, lastResult] = firstLastResult;
-  const firstSeen = firstResult.data?.[0]?.received_at || null;
-  const lastSeen = lastResult.data?.[0]?.received_at || null;
-
-  const signatures = (signaturesResult.data || []).map(r => ({
+  const byAction = trimRank(byActionRows, 50).map(r => ({ action: r._id, count: r.count }));
+  const byType = trimRank(byTypeRows, 50).map(r => ({ event_type: r._id, count: r.count }));
+  const topPorts = trimRank(topPortsRows, 20).map(r => ({ dst_port: r._id?.port, protocol: r._id?.protocol, count: r.count }));
+  const topSrcPorts = trimRank(topSrcPortsRows, 10).map(r => ({ src_port: r._id?.port, protocol: r._id?.protocol, count: r.count }));
+  const signatures = trimRank(signaturesRows, 10).map(r => ({
     ids_signature: r._id?.sig, ids_classification: r._id?.cls, count: r.count,
   }));
+  const topDestinations = trimRank(topDestinationsRows, 20).map(r => ({ ip: r._id, count: r.count }));
+  const topSources = trimRank(topSourcesRows, 20).map(r => ({ ip: r._id, count: r.count }));
 
-  const targetsHit = targetsHitResult.data?.count ?? 0;
-  const topDestinations = (topDestinationsResult.data || []).map(r => ({ ip: r._id, count: r.count }));
-  const topSources = (topSourcesResult.data || []).map(r => ({ ip: r._id, count: r.count }));
+  const [firstSeen, lastSeen] = firstLastResults;
+  const targetsHit = targetsHitSet.size;
 
-  // Timeline: fetch events with projection, bucket client-side (hourly)
+  // Timeline — paginate per partition, project received_at, bucket client-side by hour.
+  // Cap total fetched docs across all partitions at 100K (existing safety cap).
   let timeline = [];
   try {
-    const timelineDocs = [];
-    let offset = 0;
-    const PAGE = 10000;
-    let hasMore = true;
-    while (hasMore) {
-      const page = await post(`/${col}/query`, {
-        filter: ipFilter,
-        fields: ['received_at'],
-        limit: PAGE,
-        offset,
-      });
-      const docs = page.data || [];
-      timelineDocs.push(...docs);
-      hasMore = docs.length === PAGE;
-      offset += PAGE;
-      // Safety cap — don't fetch more than 100K docs for timeline
-      if (offset >= 100000) break;
-    }
-    // Bucket by hour
     const buckets = {};
-    for (const doc of timelineDocs) {
-      if (!doc.received_at) continue;
-      const hour = doc.received_at.substring(0, 13) + ':00:00Z';
-      buckets[hour] = (buckets[hour] || 0) + 1;
+    let totalFetched = 0;
+    const PAGE = 10000;
+    const FETCH_CAP = 100000;
+
+    let pi = 0;
+    outer: while (pi < partitions.length && totalFetched < FETCH_CAP) {
+      const p = partitions[pi++];
+      let offset = 0;
+      while (true) {
+        const remaining = FETCH_CAP - totalFetched;
+        if (remaining <= 0) break outer;
+        const limit = Math.min(PAGE, remaining);
+        let docs;
+        try {
+          const page = await post(`/${p}/query`, {
+            filter: ipFilter,
+            fields: ['received_at'],
+            limit,
+            offset,
+          });
+          docs = page.data || [];
+        } catch {
+          break;
+        }
+        if (docs.length === 0) break;
+        for (const doc of docs) {
+          if (!doc.received_at) continue;
+          const hour = doc.received_at.substring(0, 13) + ':00:00Z';
+          buckets[hour] = (buckets[hour] || 0) + 1;
+        }
+        totalFetched += docs.length;
+        offset += docs.length;
+        if (docs.length < limit) break;
+      }
     }
     timeline = Object.entries(buckets)
       .sort(([a], [b]) => a.localeCompare(b))
@@ -399,15 +497,15 @@ async function gatherLocalIntelWardsonDB(target) {
     logger.warn({ err }, 'Failed to build timeline for threat hunt');
   }
 
-  // Related IPs from same /24 subnet (from enrichment cache)
+  // Related IPs from same /24 subnet (cache only — not time-scoped)
   let relatedIPs = [];
   try {
     const subnet = target.split('.').slice(0, 3).join('.');
-    const cacheResult = await post(`/${cacheCol}/query`, {
-      filter: { ip: { '$regex': `^${subnet.replace(/\./g, '\\\\.')}\\\\.` }, is_private: false },
+    const subnetCacheResult = await post(`/${cacheCol}/query`, {
+      filter: { ip: { '$regex': `^${subnet.replace(/\./g, '\\.')}\\.` }, is_private: false },
       limit: 100,
     });
-    relatedIPs = (cacheResult.data || [])
+    relatedIPs = (subnetCacheResult.data || [])
       .filter(r => r.ip !== target)
       .sort((a, b) => (b.abuse_score || 0) - (a.abuse_score || 0))
       .slice(0, 10)
@@ -417,13 +515,15 @@ async function gatherLocalIntelWardsonDB(target) {
   return { cached, totalEvents, byAction, byType, topPorts, topSrcPorts, timeline, firstSeen, lastSeen, relatedIPs, signatures, targetsHit, topDestinations, topSources };
 }
 
-async function gatherLocalIntelOpenSearch(target) {
+async function gatherLocalIntelOpenSearch(target, since) {
   const backend = storage.getBackend();
   const client = backend.client;
   const eventsIndex = backend.eventsIndex;
   const cacheIndex = backend.cacheIndex;
 
-  const ipFilter = { bool: { should: [{ term: { src_ip: target } }, { term: { dst_ip: target } }], minimum_should_match: 1 } };
+  const timeRange = { range: { received_at: { gte: since } } };
+  const ipShould = { bool: { should: [{ term: { src_ip: target } }, { term: { dst_ip: target } }], minimum_should_match: 1 } };
+  const ipFilter = { bool: { filter: [ipShould, timeRange] } };
 
   try {
     const [mainResult, portsResult, srcPortsResult, firstLastResult, sigsResult, targetsResult, topDstResult, topSrcResult, cachedResult] = await Promise.all([
@@ -441,14 +541,14 @@ async function gatherLocalIntelOpenSearch(target) {
       // Top destination ports (target as source)
       client.search({ index: eventsIndex, body: {
         size: 0,
-        query: { bool: { filter: [{ term: { src_ip: target } }, { exists: { field: 'dst_port' } }] } },
+        query: { bool: { filter: [{ term: { src_ip: target } }, { exists: { field: 'dst_port' } }, timeRange] } },
         aggs: { top_ports: { terms: { field: 'dst_port', size: 20 }, aggs: { proto: { terms: { field: 'protocol', size: 1 } } } } },
       }}).catch(() => ({ body: { aggregations: {} } })),
 
       // Top source ports (target as destination)
       client.search({ index: eventsIndex, body: {
         size: 0,
-        query: { bool: { filter: [{ term: { dst_ip: target } }, { exists: { field: 'src_port' } }] } },
+        query: { bool: { filter: [{ term: { dst_ip: target } }, { exists: { field: 'src_port' } }, timeRange] } },
         aggs: { top_ports: { terms: { field: 'src_port', size: 10 }, aggs: { proto: { terms: { field: 'protocol', size: 1 } } } } },
       }}).catch(() => ({ body: { aggregations: {} } })),
 
@@ -461,32 +561,32 @@ async function gatherLocalIntelOpenSearch(target) {
       // IDS signatures
       client.search({ index: eventsIndex, body: {
         size: 0,
-        query: { bool: { filter: [ipFilter, { exists: { field: 'ids_signature' } }] } },
+        query: { bool: { filter: [ipShould, { exists: { field: 'ids_signature' } }, timeRange] } },
         aggs: { sigs: { terms: { field: 'ids_signature', size: 10 }, aggs: { cls: { terms: { field: 'ids_category', size: 1 } } } } },
       }}).catch(() => ({ body: { aggregations: {} } })),
 
       // Unique targets hit (cardinality)
       client.search({ index: eventsIndex, body: {
         size: 0,
-        query: { term: { src_ip: target } },
+        query: { bool: { filter: [{ term: { src_ip: target } }, timeRange] } },
         aggs: { unique_dst: { cardinality: { field: 'dst_ip' } } },
       }}).catch(() => ({ body: { aggregations: {} } })),
 
       // Top destination IPs
       client.search({ index: eventsIndex, body: {
         size: 0,
-        query: { bool: { filter: [{ term: { src_ip: target } }, { exists: { field: 'dst_ip' } }] } },
+        query: { bool: { filter: [{ term: { src_ip: target } }, { exists: { field: 'dst_ip' } }, timeRange] } },
         aggs: { top: { terms: { field: 'dst_ip', size: 20 } } },
       }}).catch(() => ({ body: { aggregations: {} } })),
 
       // Top source IPs
       client.search({ index: eventsIndex, body: {
         size: 0,
-        query: { bool: { filter: [{ term: { dst_ip: target } }, { exists: { field: 'src_ip' } }] } },
+        query: { bool: { filter: [{ term: { dst_ip: target } }, { exists: { field: 'src_ip' } }, timeRange] } },
         aggs: { top: { terms: { field: 'src_ip', size: 20 } } },
       }}).catch(() => ({ body: { aggregations: {} } })),
 
-      // Enrichment cache lookup
+      // Enrichment cache lookup (not time-scoped)
       client.get({ index: cacheIndex, id: target }).catch(() => ({ body: { found: false } })),
     ]);
 
@@ -535,7 +635,7 @@ async function gatherLocalIntelOpenSearch(target) {
       };
     }
 
-    // Timeline — hourly date_histogram
+    // Timeline — hourly date_histogram (time-scoped)
     let timeline = [];
     try {
       const tlResult = await client.search({ index: eventsIndex, body: {
@@ -603,12 +703,13 @@ async function gatherExternalIntel(target) {
   return results;
 }
 
-function buildInvestigationPrompt(target, intel, external) {
+function buildInvestigationPrompt(target, intel, external, period) {
   const sections = [];
 
   sections.push(`You are a senior threat intelligence analyst. Investigate the following IP address and provide a comprehensive threat assessment based on the data provided from our SIEM.`);
 
   sections.push(`\n## Target: ${target}`);
+  if (period) sections.push(`## Investigation Window: last ${period}`);
 
   // Enrichment data
   if (intel.cached) {

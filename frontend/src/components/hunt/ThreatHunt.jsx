@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 import { countryFlag, abuseScoreColor } from '../../lib/format';
+import PeriodSelector from '../shared/PeriodSelector';
 import './ThreatHunt.css';
 
 const API_PROVIDERS = [
@@ -8,7 +9,7 @@ const API_PROVIDERS = [
   { id: 'gemini', name: 'Google (Gemini 3.1 Pro)', icon: '🔵' },
 ];
 
-export default function ThreatHunt() {
+export default function ThreatHunt({ period, setPeriod }) {
   const [settings, setSettings] = useState({
     provider: 'anthropic',
     anthropicKey: '',
@@ -86,7 +87,7 @@ export default function ThreatHunt() {
       const res = await fetch('/api/threat-hunt/investigate-stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ target: target.trim() }),
+        body: JSON.stringify({ target: target.trim(), period }),
       });
 
       if (!res.ok) {
@@ -298,6 +299,10 @@ export default function ThreatHunt() {
               <>🎯 Investigate</>
             )}
           </button>
+        </div>
+        <div className="hunt-period-row">
+          <span className="hunt-period-label">Investigation window:</span>
+          <PeriodSelector value={period} onChange={setPeriod} />
         </div>
         {!hasActiveKey && (
           <p className="input-hint warning">⚠️ No API key configured for {activeProvider?.name}. Open Settings to add one.</p>

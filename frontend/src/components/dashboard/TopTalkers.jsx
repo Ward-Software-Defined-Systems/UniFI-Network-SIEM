@@ -23,15 +23,15 @@ export default function TopTalkers({ data, title = 'Top Talkers' }) {
               className="absolute inset-0 bg-blue-500/10 rounded"
               style={{ width: `${(row.count / maxCount) * 100}%` }}
             />
-            <div className="relative flex items-center justify-between px-2 py-1.5">
-              <div className="flex items-center gap-2">
-                <span className="text-xs text-gray-500 w-5">{i + 1}</span>
-                <span className="text-xs font-mono text-gray-200">{row.ip}</span>
-                {row.abuseScore > 0 && (() => { const c = abuseScoreColor(row.abuseScore); return c ? <span className={`text-[10px] px-1.5 py-0.5 rounded-full border ${c.bg} ${c.text} ${c.border}`}>{row.abuseScore}%</span> : null; })()}
-                {row.country && <span className="text-xs text-gray-500">{countryFlag(row.country)} {row.country}</span>}
-                {row.hostname && <span className="text-xs text-gray-500">{row.hostname}</span>}
+            <div className="relative flex items-center justify-between px-2 py-1.5 gap-2">
+              <div className="flex items-center gap-2 min-w-0 flex-1">
+                <span className="text-xs text-gray-500 w-5 shrink-0">{i + 1}</span>
+                <span className="text-xs font-mono text-gray-200 shrink-0">{row.ip}</span>
+                {row.abuseScore > 0 && (() => { const c = abuseScoreColor(row.abuseScore); return c ? <span className={`text-[10px] px-1.5 py-0.5 rounded-full border shrink-0 ${c.bg} ${c.text} ${c.border}`}>{row.abuseScore}%</span> : null; })()}
+                {row.country && <span className="text-xs text-gray-500 shrink-0">{countryFlag(row.country)} {row.country}</span>}
+                {row.hostname && <span className="text-xs text-gray-500 truncate min-w-0" title={row.hostname}>{row.hostname}</span>}
               </div>
-              <span className="text-xs font-medium text-gray-300">{formatNumber(row.count)}</span>
+              <span className="text-xs font-medium text-gray-300 shrink-0">{formatNumber(row.count)}</span>
             </div>
           </div>
         ))}

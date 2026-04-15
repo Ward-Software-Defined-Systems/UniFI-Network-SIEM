@@ -24,7 +24,7 @@ export default function App() {
       {view === 'dashboard' && <Dashboard period={period} setPeriod={setPeriod} {...refreshProps} />}
       {view === 'map' && <LiveMap period={period} setPeriod={setPeriod} {...refreshProps} />}
       {view === 'intel' && <ThreatIntel period={period} setPeriod={setPeriod} {...refreshProps} />}
-      {view === 'hunt' && <ThreatHunt />}
+      {view === 'hunt' && <ThreatHunt period={period} setPeriod={setPeriod} />}
       {view === 'settings' && <Settings setRebuilding={setRebuilding} />}
     </Layout>
   );

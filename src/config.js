@@ -26,6 +26,16 @@ const config = {
   },
   wardsondb: {
     healthTimeoutMs: parseInt(process.env.WARDSONDB_HEALTH_TIMEOUT_MS || '5000', 10),
+    // TCP connect timeout. Default 60s because a saturated WardSONDB server
+    // under heavy flush/backfill load takes longer than undici's 10s default
+    // to accept new connections, causing spurious `Connect Timeout Error`s.
+    connectTimeoutMs: parseInt(process.env.WARDSONDB_CONNECT_TIMEOUT_MS || '60000', 10),
+    // Client-side request timeout (body+headers). 0 = no timeout — let
+    // WardSONDB's server-side --query-timeout flag govern duration.
+    queryTimeoutMs: parseInt(process.env.WARDSONDB_QUERY_TIMEOUT_MS || '0', 10),
+    // Concurrency for the rollup flush worker pool. Lower values reduce
+    // pressure on WardSONDB's connection accept loop when ingest is heavy.
+    flushConcurrency: parseInt(process.env.WARDSONDB_FLUSH_CONCURRENCY || '4', 10),
   },
   opensearch: {
     host: process.env.OPENSEARCH_HOST || 'localhost',

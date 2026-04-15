@@ -21,7 +21,7 @@ export function formatDateTime(ts) {
 }
 
 export function formatNumber(n) {
-  if (n == null) return '0';
+  if (n == null) return '—';
   return n.toLocaleString();
 }
 
