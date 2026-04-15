@@ -328,8 +328,16 @@ async function gatherLocalIntelWardsonDB(target, since) {
   const untilISO = new Date().toISOString();
   const partitions = backend._getPartitionsForRange(since, untilISO);
 
+  // Partitions narrow the day-range, but within each partition we still need
+  // a received_at >= since clause so queries don't scan events outside the
+  // requested window (e.g. period=1h in today's partition would otherwise
+  // return all of today's events, not just the last hour).
+  const timeRange = { received_at: { '$gte': since } };
+  const withTime = (f) => ({ '$and': [f, timeRange] });
+
   // IP filter applied at $match (cheap pre-filter on indexed src/dst ip fields)
-  const ipFilter = { '$or': [{ 'network.src_ip': target }, { 'network.dst_ip': target }] };
+  const ipOr = { '$or': [{ 'network.src_ip': target }, { 'network.dst_ip': target }] };
+  const ipFilter = withTime(ipOr);
 
   // Enrichment cache lookup is not partitioned and not time-scoped
   const cachedResult = await post(`/${cacheCol}/query`, { filter: { ip: target }, limit: 1 }).catch(() => ({ data: [] }));
@@ -369,27 +377,27 @@ async function gatherLocalIntelWardsonDB(target, since) {
     ]),
 
     fanOutAggregate(backend, partitions, [
-      { '$match': { 'network.src_ip': target, 'network.dst_port': { '$exists': true } } },
+      { '$match': withTime({ 'network.src_ip': target, 'network.dst_port': { '$exists': true } }) },
       { '$group': { '_id': { port: 'network.dst_port', protocol: 'network.protocol' }, count: { '$count': {} } } },
     ]),
 
     fanOutAggregate(backend, partitions, [
-      { '$match': { 'network.dst_ip': target, 'network.src_port': { '$exists': true } } },
+      { '$match': withTime({ 'network.dst_ip': target, 'network.src_port': { '$exists': true } }) },
       { '$group': { '_id': { port: 'network.src_port', protocol: 'network.protocol' }, count: { '$count': {} } } },
     ]),
 
     fanOutAggregate(backend, partitions, [
-      { '$match': { '$and': [ipFilter, { 'ids.signature': { '$exists': true } }] } },
+      { '$match': { '$and': [ipOr, { 'ids.signature': { '$exists': true } }, timeRange] } },
       { '$group': { '_id': { sig: 'ids.signature', cls: 'ids.classification' }, count: { '$count': {} } } },
     ]),
 
     fanOutAggregate(backend, partitions, [
-      { '$match': { 'network.src_ip': target } },
+      { '$match': withTime({ 'network.src_ip': target }) },
       { '$group': { '_id': 'network.dst_ip', count: { '$count': {} } } },
     ]),
 
     fanOutAggregate(backend, partitions, [
-      { '$match': { 'network.dst_ip': target } },
+      { '$match': withTime({ 'network.dst_ip': target }) },
       { '$group': { '_id': 'network.src_ip', count: { '$count': {} } } },
     ]),
 
@@ -425,7 +433,11 @@ async function gatherLocalIntelWardsonDB(target, since) {
         while (i < partitions.length) {
           const p = partitions[i++];
           try {
-            const r = await post(`/${p}/distinct`, { field: 'network.dst_ip', filter: { 'network.src_ip': target }, limit: 10000 });
+            const r = await post(`/${p}/distinct`, {
+              field: 'network.dst_ip',
+              filter: withTime({ 'network.src_ip': target }),
+              limit: 10000,
+            });
             for (const v of (r.data?.values || [])) set.add(v);
           } catch {}
         }
