@@ -70,15 +70,20 @@ router.get('/', async (req, res) => {
 router.put('/', async (req, res) => {
   try {
     const settingsBackend = storage.getSettingsBackend();
-    for (const [key, value] of Object.entries(req.body)) {
+    const body = { ...req.body };
+    if (typeof body.abuseIpDbKey === 'string') {
+      body.abuseIpDbKey = body.abuseIpDbKey.trim();
+    }
+
+    for (const [key, value] of Object.entries(body)) {
       await settingsBackend.setSetting(key, value);
     }
 
-    if (req.body.abuseIpDbKey !== undefined) {
-      config.enrichment.abuseIpDbKey = req.body.abuseIpDbKey;
+    if (body.abuseIpDbKey !== undefined) {
+      config.enrichment.abuseIpDbKey = body.abuseIpDbKey;
     }
-    if (req.body.rdnsEnabled !== undefined) {
-      config.enrichment.rdnsEnabled = !!req.body.rdnsEnabled;
+    if (body.rdnsEnabled !== undefined) {
+      config.enrichment.rdnsEnabled = !!body.rdnsEnabled;
     }
 
     res.json({ ok: true });

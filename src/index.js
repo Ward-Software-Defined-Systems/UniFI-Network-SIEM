@@ -63,8 +63,10 @@ async function main() {
     for (const row of rows) {
       try {
         const val = JSON.parse(row.value);
-        if (row.key === 'abuseIpDbKey' && val && !config.enrichment.abuseIpDbKey) {
-          config.enrichment.abuseIpDbKey = val;
+        // DB-stored key wins over .env when present and non-empty.
+        // Settings UI is the user-facing source of truth; .env is bootstrap fallback.
+        if (row.key === 'abuseIpDbKey' && typeof val === 'string' && val.trim()) {
+          config.enrichment.abuseIpDbKey = val.trim();
           logger.info('Loaded AbuseIPDB API key from settings DB');
         }
         if (row.key === 'rdnsEnabled') {
