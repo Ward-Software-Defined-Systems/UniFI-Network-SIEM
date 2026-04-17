@@ -2,6 +2,7 @@ const express = require('express');
 const fs = require('fs');
 const config = require('../../config');
 const storage = require('../../db/storage');
+const logger = require('../../utils/logger');
 const { isGeoIpAvailable } = require('../../enrichment/geoip');
 const { isAbuseIpDbConfigured } = require('../../enrichment/abuseipdb');
 const { getQueueSize } = require('../../enrichment/enrichment-queue');
@@ -11,13 +12,16 @@ const { getResetGraceStatus } = require('./settings');
 const router = express.Router();
 const startTime = Date.now();
 
-// Debounce write_pressure === 'high' — require two consecutive high readings
-// (~20s at the 10s poll cadence) before we report rebuilding due to pressure.
-// Clears instantly on any non-high reading. Eliminates single-poll flickers
-// from WardSONDB's volatile write_pressure signal while preserving the signal
-// for sustained heavy load. Module-level because the route is a singleton.
+// Debounce write_pressure === 'high' — require N consecutive high readings
+// before we report rebuilding due to pressure. Clears instantly on any
+// non-high reading. Eliminates single-poll flickers from WardSONDB's volatile
+// write_pressure signal while preserving the signal for sustained heavy load.
+// Override with HEALTH_REBUILDING_DEBOUNCE_POLLS env var — at the 10s poll
+// cadence, 2 polls ≈ 20s.
+const HIGH_PRESSURE_DEBOUNCE_POLLS = Math.max(1,
+  parseInt(process.env.HEALTH_REBUILDING_DEBOUNCE_POLLS, 10) || 2);
 let _consecutiveHighPressure = 0;
-const HIGH_PRESSURE_DEBOUNCE_POLLS = 2;
+let _pressureSustainedLast = false;
 
 // Race a promise against a timeout — returns fallback on timeout or error
 function withTimeout(promise, ms, fallback) {
@@ -64,9 +68,20 @@ router.get('/', async (req, res) => {
       if (writePressure === 'high') _consecutiveHighPressure++;
       else _consecutiveHighPressure = 0;
       const pressureSustained = _consecutiveHighPressure >= HIGH_PRESSURE_DEBOUNCE_POLLS;
+      // Log the rising/falling edge so real sustained pressure stays visible
+      // even when we're debouncing the user-facing banner.
+      if (pressureSustained !== _pressureSustainedLast) {
+        if (pressureSustained) {
+          logger.info({ consecutive: _consecutiveHighPressure, threshold: HIGH_PRESSURE_DEBOUNCE_POLLS },
+            'WardSONDB sustained high write pressure — banner active');
+        } else {
+          logger.info('WardSONDB write pressure cleared — banner deactivated');
+        }
+        _pressureSustainedLast = pressureSustained;
+      }
       // Only show rebuilding when WardSONDB reports sustained high write pressure
-      // (two consecutive polls) or during the post-reset grace period. Query timeouts
-      // alone should not trigger the banner — the dashboard can render with partial data.
+      // or during the post-reset grace period. Query timeouts alone should not
+      // trigger the banner — the dashboard can render with partial data.
       const isRebuilding = !isEmpty && !!(graceStatus || pressureSustained);
 
       // Derive eventsTotal and lastEventAt from healthCheck data (O(1) lookups)

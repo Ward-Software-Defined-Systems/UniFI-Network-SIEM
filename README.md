@@ -6,7 +6,7 @@
 
 A self-contained, **AI-powered** Node.js application that collects syslog from UniFi consoles and gateways, parses all event types, stores them in SQLite (or OpenSearch/WardSONDB), and serves a real-time security dashboard with built-in AI threat hunting.
 
-> **📊 Backend Recommendation for Scale:** OpenSearch is currently the recommended storage backend for deployments expecting 8M+ events. Its native aggregations (`date_histogram`, `terms`, `cardinality`) eliminate the rollup table overhead used by SQLite and provide sub-second dashboard queries at any scale. SQLite and WardSONDB remain fully supported and are appropriate for smaller deployments — performance optimizations for both are planned. See [Using OpenSearch Backend](#using-opensearch-backend-optional) below to get started.
+> **📊 Backend Recommendation for Scale:** Both **OpenSearch** and **SQLite** are production-ready at scale. OpenSearch uses native aggregations (`date_histogram`, `terms`, `cardinality`) for sub-second dashboard queries. SQLite uses five materialized rollup tables updated atomically on insert plus a dedicated stats worker thread, tested stable at 8M+ events. **WardSONDB** mirrors SQLite's rollup pattern (daily event partitions + five rollup collections) and is running live at 12M+ events — optimizations are still being iterated on and tested, so treat it as Beta for now. See [Using OpenSearch Backend](#using-opensearch-backend-optional) below to get started.
 
 ## Features
 
@@ -19,10 +19,11 @@ A self-contained, **AI-powered** Node.js application that collects syslog from U
 - **GeoIP & threat enrichment** — MaxMind GeoLite2 for geolocation, AbuseIPDB for threat scoring, reverse DNS — all async with caching
 - **Country flags & abuse badges** — 🇺🇸 emoji flags with country codes on external IPs; color-coded abuse score badges across all views
 - **Threat Intel** — sortable/filterable table of enriched IPs with abuse scores, event counts, and locations; period-filtered summary cards alongside all-time totals
-- **Threat Hunt (Beta)** — AI-powered threat actor investigation with SSE streaming. Enter any IP to get a full profile: local SIEM activity (events, ports, timeline, IDS signatures, related /24 IPs), external intel (rDNS, WHOIS/ASN), and a structured AI threat assessment streamed token-by-token with PDF export. Supports Anthropic (Opus 4.6 with adaptive thinking, 128K output), OpenAI (GPT-5.4, 128K output), and Google (Gemini 3.1 Pro, 65K output) with on-page API key management. *Currently tested with Anthropic only — OpenAI and Google integrations are implemented but untested.*
+- **Threat Hunt (Beta)** — AI-powered threat actor investigation with SSE streaming. Enter any IP and choose a time window (`1h / 6h / 24h / 7d / 30d`) — the same period selector used by Dashboard / Live Map / Threat Intel — and every local-intel query is scoped to that window. Returns a full profile: local SIEM activity (events, ports, timeline, IDS signatures, related /24 IPs), external intel (rDNS, WHOIS/ASN), and a structured AI threat assessment streamed token-by-token with PDF export. Supports Anthropic (Opus 4.6 with adaptive thinking, 128K output), OpenAI (GPT-5.4, 128K output), and Google (Gemini 3.1 Pro, 65K output) with on-page API key management. *Currently tested with Anthropic only — OpenAI and Google integrations are implemented but untested.*
 - **HTTPS by default** — auto-generated self-signed TLS certificate
-- **Pluggable storage backends** — SQLite (built-in default), WardSONDB (Beta), OpenSearch (Beta). OpenSearch runs via Docker with native aggregations (no rollup tables), batched enrichment backfill with `update_by_query`, and full Threat Hunt support
+- **Pluggable storage backends** — SQLite (built-in default), WardSONDB (Beta), OpenSearch (Beta). OpenSearch runs via Docker with native aggregations (no rollup tables), batched enrichment backfill with `update_by_query`, and full Threat Hunt support. WardSONDB runs remotely over HTTPS with a per-client undici dispatcher for connect-timeout tuning
 - **SQLite storage** — WAL mode, batched inserts, automatic retention cleanup, worker thread enrichment. Materialized rollup tables (event_stats_5m, ip/port/sig/client_stats_hourly) are updated atomically on insert for sub-second dashboard stats at scale (tested to 8M+ events). A dedicated stats worker thread keeps the event loop responsive during queries. Existing databases self-heal on restart: legacy indexes are automatically dropped and replaced with optimized compound indexes, and rollup tables are backfilled from existing events on first upgrade
+- **WardSONDB storage** — daily event partitions (`events-YYYY-MM-DD`) with partition-drop retention (no `_delete_by_query` on event data), five pre-aggregated rollup collections matching SQLite's schemas exactly (`rollups-5m`, `rollups-ip-hourly`, `rollups-port-hourly`, `rollups-sig-hourly`, `rollups-client-hourly`) flushed every 5 seconds via read-then-increment. Dashboard stats, Live Map, and Threat Intel all query rollups exclusively; Threat Hunt fans out across the partitions overlapping the selected period with per-partition result merging. Running live at 12M+ events — still iterating on optimizations
 - **Zero external services** — everything runs in one process
 
 ## Screenshots
@@ -49,8 +50,12 @@ A self-contained, **AI-powered** Node.js application that collects syslog from U
 
 ### Prerequisites
 
-- Node.js v22 LTS+
-- macOS, Linux, or Windows (any platform with Node.js and `better-sqlite3` support)
+- **Node.js v22 LTS** — pinned via `.nvmrc`, so `nvm use` (or `fnm use` / `nodenv local`) will pick the right version automatically
+- **C++ build toolchain** for `better-sqlite3`'s native build:
+  - macOS: `xcode-select --install`
+  - Debian / Ubuntu: `sudo apt-get install build-essential python3`
+  - Windows: Visual Studio 2022 Build Tools with the "Desktop development with C++" workload
+- macOS, Linux, or Windows
 
 ### Install
 
@@ -64,6 +69,9 @@ cd frontend && npm install && cd ..
 # Configure
 cp .env.example .env
 # Edit .env if needed (defaults work for most setups)
+
+# Optional but recommended: download MaxMind GeoLite2-City.mmdb to ./data/
+# Live Map and Threat Intel need this to populate geo data — see "Enrichment Setup" below
 ```
 
 ### Run
@@ -206,6 +214,10 @@ For full functionality, three logging sources on the UniFi Console should be con
 | `RDNS_TIMEOUT_MS` | 2000 | Reverse DNS lookup timeout (ms) |
 | `WS_BROADCAST_THROTTLE_MS` | 100 | WebSocket broadcast throttle interval (ms) |
 | `WARDSONDB_HEALTH_TIMEOUT_MS` | 5000 | WardSONDB health check timeout (ms) |
+| `WARDSONDB_CONNECT_TIMEOUT_MS` | 60000 | TCP connect timeout for the per-client undici Agent. Default is higher than undici's 10s stock timeout because saturated WardSONDB instances under heavy flush/backfill take longer to accept new connections |
+| `WARDSONDB_QUERY_TIMEOUT_MS` | 0 | Client-side headers/body timeout. `0` = no client-side limit (server-side `--query-timeout` governs). Operator escape hatch |
+| `WARDSONDB_FLUSH_CONCURRENCY` | 4 | Rollup flush worker-pool size. Lower values reduce accept-loop pressure on saturated WardSONDB instances |
+| `HEALTH_REBUILDING_DEBOUNCE_POLLS` | 2 | Consecutive `write_pressure: "high"` polls required before the Rebuilding banner fires. At the 10s poll cadence, `2` ≈ 20s. Eliminates single-poll flickers from volatile write-pressure signals |
 | `OPENSEARCH_HOST` | localhost | OpenSearch host |
 | `OPENSEARCH_PORT` | 9200 | OpenSearch port |
 | `OPENSEARCH_USERNAME` | *(empty)* | Basic auth username (empty = no auth) |
@@ -217,7 +229,7 @@ For full functionality, three logging sources on the UniFi Console should be con
 
 > **⚠️ Important:** Settings and configuration are always stored in the local SQLite database (`data/events.db`), regardless of which storage backend is active. Do not delete this file even when using WardSONDB or OpenSearch — it contains your backend configuration, API keys, and other settings needed to boot the application. Changing the storage backend requires a SIEM restart to take effect.
 
-> **WardSONDB query timeouts:** Query duration is controlled by WardSONDB's server-side `--query-timeout` flag (default 30s). For large datasets or Threat Hunt queries, launch WardSONDB with `--query-timeout 120` or higher. The SIEM has no client-side query timeout — this is intentional.
+> **WardSONDB query timeouts:** Query duration is controlled by WardSONDB's server-side `--query-timeout` flag (default 30s). For large datasets or Threat Hunt queries, launch WardSONDB with `--query-timeout 120` or higher. By default the SIEM has no client-side query timeout — this is intentional. If you need to override per-request (e.g. unreliable network, long-running server-side queries you want to cap), set `WARDSONDB_QUERY_TIMEOUT_MS` in `.env` as an escape hatch.
 
 ## Project Structure
 
@@ -342,5 +354,6 @@ The app runs HTTPS by default with an auto-generated self-signed certificate. Be
 - [x] Storage backend abstraction — pluggable database engine (SQLite, WardSONDB, OpenSearch) selectable from Settings
 - [x] WardSONDB integration — high-performance Rust-based JSON document database with deferred index creation and write pressure detection
 - [x] OpenSearch integration — distributed search/analytics engine via Docker with native aggregations, batched enrichment backfill, and full Threat Hunt support
-- [x] Query performance optimization — bitmap scan acceleration and compound range scans via WardSONDB at 3.45M+ events
+- [x] Query performance optimization — bitmap scan acceleration and compound range scans via WardSONDB, running live at 12M+ events
+- [x] WardSONDB scale optimization — daily event partitioning with partition-drop retention and five pre-aggregated rollup collections mirroring SQLite's schema, flushed every 5 seconds. Threat Hunt queries fan out across the partitions overlapping the selected period
 - [ ] launchd plist for macOS auto-start

@@ -16,38 +16,15 @@
 const StorageBackend = require('./interface');
 const logger = require('../../utils/logger');
 const { isPrivateIp } = require('../../utils/ip-utils');
-const { Agent, setGlobalDispatcher } = require('undici');
+// Use undici's own fetch (not Node's globalThis.fetch) so the per-client Agent
+// we construct from the same undici package has a matching request-handler
+// interface. Mixing Node's bundled undici with a standalone-undici Agent
+// surfaces as `InvalidArgumentError: invalid onRequestStart method`.
+const { Agent, fetch } = require('undici');
 
 const FLUSH_INTERVAL_MS = 5000;
 const PARTITION_PREFIX = 'events-';
 const PARTITION_NAME_RE = /^events-\d{4}-\d{2}-\d{2}$/;
-
-// Configure Node's global fetch dispatcher so our WardSONDB client uses a
-// connect timeout that matches a busy/saturated server's accept latency.
-// Without this, undici's default 10s connect timeout surfaces as spurious
-// `Connect Timeout Error`s when many concurrent requests (rollup flushes +
-// inserts + dashboard polls) queue up behind a busy WardSONDB instance.
-// This is applied once at module load and affects every fetch() in the
-// process. Values are read from environment via src/config.js so operators
-// can tune them without a code change.
-let _dispatcherConfigured = false;
-function _configureDispatcher(connectTimeoutMs, queryTimeoutMs) {
-  if (_dispatcherConfigured) return;
-  _dispatcherConfigured = true;
-  try {
-    setGlobalDispatcher(new Agent({
-      connect: { timeout: connectTimeoutMs },
-      // 0 means "no client-side timeout" — server's --query-timeout governs.
-      headersTimeout: queryTimeoutMs || 0,
-      bodyTimeout: queryTimeoutMs || 0,
-      keepAliveTimeout: 10_000,
-      keepAliveMaxTimeout: 600_000,
-    }));
-    logger.info({ connectTimeoutMs, queryTimeoutMs }, 'WardSONDB undici dispatcher configured');
-  } catch (err) {
-    logger.warn({ err: err.message }, 'Failed to configure undici dispatcher — using defaults');
-  }
-}
 
 class WardsonDbBackend extends StorageBackend {
   constructor(config = {}) {
@@ -64,12 +41,32 @@ class WardsonDbBackend extends StorageBackend {
     this.healthTimeoutMs = config.healthTimeoutMs || 5000;
     this.flushConcurrency = Math.max(1, config.flushConcurrency || 4);
 
-    // Configure Node's global fetch dispatcher once, sized for this backend's
-    // workload. Must happen before any fetch() calls in initialize().
-    _configureDispatcher(
-      config.connectTimeoutMs || 60_000,
-      config.queryTimeoutMs || 0,
-    );
+    // Per-client undici dispatcher. A WardSONDB server under heavy
+    // flush+backfill load takes longer than undici's 10s default connect
+    // timeout to accept new connections, causing spurious
+    // `Connect Timeout Error`s. Scoping the Agent to this instance keeps the
+    // connect-timeout tuning (and TLS trust) from affecting AbuseIPDB,
+    // ipinfo.io, or AI provider fetches. Passed to fetch() as
+    // `{ dispatcher }` per-call.
+    const connectTimeoutMs = config.connectTimeoutMs || 60_000;
+    const queryTimeoutMs = config.queryTimeoutMs || 0;
+    const agentConnect = { timeout: connectTimeoutMs };
+    // Per-client TLS trust instead of the global NODE_TLS_REJECT_UNAUTHORIZED
+    // hack — keeps the bypass scoped to WardSONDB calls (matches the OpenSearch
+    // backend's per-client `rejectUnauthorized: false` pattern).
+    if (config.useTls && !this.verifyCerts) {
+      agentConnect.rejectUnauthorized = false;
+      logger.warn('TLS certificate verification disabled for WardSONDB connection');
+    }
+    this._agent = new Agent({
+      connect: agentConnect,
+      // 0 means "no client-side timeout" — server's --query-timeout governs.
+      headersTimeout: queryTimeoutMs || 0,
+      bodyTimeout: queryTimeoutMs || 0,
+      keepAliveTimeout: 10_000,
+      keepAliveMaxTimeout: 600_000,
+    });
+    logger.info({ connectTimeoutMs, queryTimeoutMs }, 'WardSONDB undici dispatcher configured (per-client)');
 
     // Partition existence cache — Set<'events-YYYY-MM-DD'>
     this._partitions = new Set();
@@ -87,11 +84,6 @@ class WardsonDbBackend extends StorageBackend {
     // Enrichment cache map (30s TTL), used by stats joins and event overlay
     this._cacheMap = null;
     this._cacheMapTs = 0;
-
-    if (config.useTls && !this.verifyCerts) {
-      process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
-      logger.warn('TLS certificate verification disabled for WardSONDB connection');
-    }
   }
 
   static get metadata() {
@@ -119,7 +111,7 @@ class WardsonDbBackend extends StorageBackend {
     const url = `${this.baseUrl}${path}`;
     const headers = { 'Content-Type': 'application/json' };
     if (this.apiKey) headers['Authorization'] = `Bearer ${this.apiKey}`;
-    const opts = { method, headers };
+    const opts = { method, headers, dispatcher: this._agent };
     if (body) opts.body = JSON.stringify(body);
 
     for (let attempt = 0; attempt <= retries; attempt++) {
@@ -157,7 +149,12 @@ class WardsonDbBackend extends StorageBackend {
     const url = `${this.baseUrl}${path}`;
     const headers = { 'Content-Type': 'application/json' };
     if (this.apiKey) headers['Authorization'] = `Bearer ${this.apiKey}`;
-    const resp = await fetch(url, { method: 'GET', headers, signal: AbortSignal.timeout(this.healthTimeoutMs) });
+    const resp = await fetch(url, {
+      method: 'GET',
+      headers,
+      dispatcher: this._agent,
+      signal: AbortSignal.timeout(this.healthTimeoutMs),
+    });
     const json = await resp.json();
     if (!json.ok) throw new Error(`WardSONDB ${json.error?.code}: ${json.error?.message}`);
     return json;
@@ -664,6 +661,10 @@ class WardsonDbBackend extends StorageBackend {
     } catch (err) {
       logger.warn({ err: err.message }, 'Final rollup flush on shutdown failed');
     }
+    // Release keep-alive sockets held by the per-client dispatcher.
+    try {
+      await this._agent?.close();
+    } catch {}
   }
 
   async healthCheck() {
@@ -1276,11 +1277,17 @@ class WardsonDbBackend extends StorageBackend {
 
   async _getCacheMap() {
     if (this._cacheMapTs && Date.now() - this._cacheMapTs < 30000) return this._cacheMap;
+    const CAP = 100000;
     const result = await this._post(`/${this.cacheCollection}/query`, {
       filter: { is_private: false },
-      limit: 10000,
+      limit: CAP,
     });
-    this._cacheMap = new Map((result.data || []).map(d => [d.ip, d]));
+    const data = result.data || [];
+    if (data.length >= CAP) {
+      logger.warn({ loaded: data.length, cap: CAP },
+        'WardSONDB _getCacheMap hit cap — some enrichment data may be missing from event/stats joins');
+    }
+    this._cacheMap = new Map(data.map(d => [d.ip, d]));
     this._cacheMapTs = Date.now();
     return this._cacheMap;
   }
@@ -1576,11 +1583,11 @@ class WardsonDbBackend extends StorageBackend {
 
   async getGeoEvents(since, limit) {
     if (this._isCollectionEmpty()) return [];
-    const cacheResult = await this._post(`/${this.cacheCollection}/query`, {
-      filter: { is_private: false, geo_lat: { '$exists': true } },
-      limit: 10000,
-    });
-    const cacheMap = new Map((cacheResult.data || []).map(d => [d.ip, d]));
+
+    // Over-fetch per direction so the geo filter (applied client-side after
+    // the cache join) doesn't starve the final result when many top IPs are
+    // private/multicast/unenriched. Mirror getThreatIntel's scaling.
+    const OVERFETCH = Math.min(Math.max(limit * 10, 500), 10000);
 
     const aggDir = (dir) => this._post(`/${this.rollupIpHourly}/aggregate`, {
       pipeline: [
@@ -1592,14 +1599,37 @@ class WardsonDbBackend extends StorageBackend {
           threats: { '$sum': 'threat_count' },
         }},
         { '$sort': { count: 'desc' } },
-        { '$limit': limit * 3 },
+        { '$limit': OVERFETCH },
       ],
     });
 
     const [srcRes, dstRes] = await Promise.all([aggDir('src'), aggDir('dst')]);
+    const srcRows = srcRes.data || [];
+    const dstRows = dstRes.data || [];
+
+    // Targeted cache fetch keyed by the specific rollup IPs (requires
+    // idx_cache_ip). Avoids the 10K cap that a bulk {is_private:false} query
+    // imposes — our deployments routinely have >10K cached IPs.
+    const ipSet = new Set();
+    for (const r of srcRows) if (r._id) ipSet.add(r._id);
+    for (const r of dstRows) if (r._id) ipSet.add(r._id);
+    const ips = [...ipSet];
+
+    let cacheMap = new Map();
+    if (ips.length > 0) {
+      const CHUNK = 500;
+      for (let i = 0; i < ips.length; i += CHUNK) {
+        const chunk = ips.slice(i, i + CHUNK);
+        const cacheRes = await this._post(`/${this.cacheCollection}/query`, {
+          filter: { ip: { '$in': chunk }, is_private: false, geo_lat: { '$ne': null } },
+          limit: chunk.length,
+        });
+        for (const d of (cacheRes.data || [])) cacheMap.set(d.ip, d);
+      }
+    }
 
     const buildRows = (rows, direction) =>
-      (rows || []).filter(r => cacheMap.has(r._id) && cacheMap.get(r._id).geo_lat != null).map(r => {
+      rows.filter(r => cacheMap.has(r._id)).map(r => {
         const c = cacheMap.get(r._id);
         return {
           ip: r._id,
@@ -1616,58 +1646,88 @@ class WardsonDbBackend extends StorageBackend {
         };
       });
 
-    const all = [...buildRows(srcRes.data, 'src'), ...buildRows(dstRes.data, 'dst')];
+    const all = [...buildRows(srcRows, 'src'), ...buildRows(dstRows, 'dst')];
     all.sort((a, b) => b.count - a.count);
-    return all.slice(0, limit);
+    const final = all.slice(0, limit);
+
+    logger.info({
+      since, limit,
+      srcAgg: srcRows.length,
+      dstAgg: dstRows.length,
+      uniqueIps: ips.length,
+      cacheHits: cacheMap.size,
+      returned: final.length,
+    }, 'WardSONDB getGeoEvents diagnostic');
+
+    return final;
   }
 
   async getRecentGeoEvents(limit) {
     if (this._isCollectionEmpty()) return [];
 
-    const cacheResult = await this._post(`/${this.cacheCollection}/query`, {
-      filter: { is_private: false, geo_lat: { '$exists': true } },
-      limit: 10000,
-    });
-    const cacheMap = new Map((cacheResult.data || []).map(d => [d.ip, d]));
-
+    // First pass: collect recent event docs across partitions newest-first.
     const partitions = this._partitionsNewestFirst();
-    const events = [];
+    const candidates = [];
     for (const partition of partitions) {
-      if (events.length >= limit) break;
-      const remaining = limit - events.length;
+      if (candidates.length >= limit * 3) break;
+      const remaining = limit * 3 - candidates.length;
       try {
         const r = await this._post(`/${partition}/query`, {
           filter: { 'network.src_ip': { '$exists': true } },
           sort: [{ '_created_at': 'desc' }],
-          limit: Math.min(remaining * 3, 500),
+          limit: Math.min(remaining, 500),
         });
-        for (const doc of (r.data || [])) {
-          const srcIp = doc.network?.src_ip;
-          const dstIp = doc.network?.dst_ip;
-          const sGeo = srcIp ? cacheMap.get(srcIp) : null;
-          const dGeo = dstIp ? cacheMap.get(dstIp) : null;
-          if (!sGeo && !dGeo) continue;
-          const event = this._documentToEvent(doc);
-          if (sGeo) {
-            event.src_geo_lat = sGeo.geo_lat;
-            event.src_geo_lon = sGeo.geo_lon;
-            event.src_geo_country = sGeo.geo_country;
-            event.src_geo_city = sGeo.geo_city;
-            event.src_abuse_score = sGeo.abuse_score;
-          }
-          if (dGeo) {
-            event.dst_geo_lat = dGeo.geo_lat;
-            event.dst_geo_lon = dGeo.geo_lon;
-            event.dst_geo_country = dGeo.geo_country;
-            event.dst_geo_city = dGeo.geo_city;
-            event.dst_abuse_score = dGeo.abuse_score;
-          }
-          events.push(event);
-          if (events.length >= limit) break;
-        }
+        for (const doc of (r.data || [])) candidates.push(doc);
       } catch (err) {
         logger.debug({ err: err.message, partition }, 'getRecentGeoEvents partition query failed');
       }
+    }
+
+    // Second pass: targeted cache lookup for the IPs we actually saw.
+    const ipSet = new Set();
+    for (const doc of candidates) {
+      if (doc.network?.src_ip) ipSet.add(doc.network.src_ip);
+      if (doc.network?.dst_ip) ipSet.add(doc.network.dst_ip);
+    }
+    const ips = [...ipSet];
+    const cacheMap = new Map();
+    if (ips.length > 0) {
+      const CHUNK = 500;
+      for (let i = 0; i < ips.length; i += CHUNK) {
+        const chunk = ips.slice(i, i + CHUNK);
+        const cacheRes = await this._post(`/${this.cacheCollection}/query`, {
+          filter: { ip: { '$in': chunk }, is_private: false, geo_lat: { '$ne': null } },
+          limit: chunk.length,
+        });
+        for (const d of (cacheRes.data || [])) cacheMap.set(d.ip, d);
+      }
+    }
+
+    // Third pass: overlay geo on events that have at least one enriched IP.
+    const events = [];
+    for (const doc of candidates) {
+      if (events.length >= limit) break;
+      const srcIp = doc.network?.src_ip;
+      const dstIp = doc.network?.dst_ip;
+      const sGeo = srcIp ? cacheMap.get(srcIp) : null;
+      const dGeo = dstIp ? cacheMap.get(dstIp) : null;
+      if (!sGeo && !dGeo) continue;
+      const event = this._documentToEvent(doc);
+      if (sGeo) {
+        event.src_geo_lat = sGeo.geo_lat;
+        event.src_geo_lon = sGeo.geo_lon;
+        event.src_geo_country = sGeo.geo_country;
+        event.src_geo_city = sGeo.geo_city;
+        event.src_abuse_score = sGeo.abuse_score;
+      }
+      if (dGeo) {
+        event.dst_geo_lat = dGeo.geo_lat;
+        event.dst_geo_lon = dGeo.geo_lon;
+        event.dst_geo_country = dGeo.geo_country;
+        event.dst_geo_city = dGeo.geo_city;
+        event.dst_abuse_score = dGeo.abuse_score;
+      }
+      events.push(event);
     }
     return events;
   }
