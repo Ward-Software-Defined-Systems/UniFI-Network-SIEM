@@ -126,6 +126,11 @@ function initWorker() {
       case 'update-done':
         logger.debug({ ip: msg.ip, src: msg.srcChanged, dst: msg.dstChanged }, 'Worker: enrichment update applied');
         break;
+      case 'update-error':
+        // H18: surface SQLITE_BUSY / I/O errors that previously vanished
+        // silently in the worker's catch.
+        logger.warn({ ip: msg.ip, err: msg.error, code: msg.code }, 'Worker: enrichment update failed');
+        break;
     }
   });
 

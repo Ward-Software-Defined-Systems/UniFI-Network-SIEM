@@ -740,7 +740,7 @@ class OpenSearchBackend extends StorageBackend {
                 filter: {
                   bool: { filter: [
                     { term: { event_type: 'firewall' } },
-                    { terms: { network_action: ['block', 'drop'] } },
+                    { term: { network_action: 'block' } },
                   ] },
                 },
               },
@@ -817,7 +817,7 @@ class OpenSearchBackend extends StorageBackend {
           return {
             ts,
             allowed: actionMap['allow'] || 0,
-            blocked: (actionMap['block'] || 0) + (actionMap['drop'] || 0),
+            blocked: (actionMap['block'] || 0),
           };
         } else {
           const typeMap = {};
@@ -907,7 +907,7 @@ class OpenSearchBackend extends StorageBackend {
               filter: [
                 this._timeRange(since),
                 { exists: { field: ipField } },
-                { terms: { network_action: ['block', 'drop'] } },
+                { term: { network_action: 'block' } },
               ],
             },
           },
@@ -1086,7 +1086,7 @@ class OpenSearchBackend extends StorageBackend {
       const aggBody = {
         aggs: {
           events: { value_count: { field: 'received_at' } },
-          blocked: { filter: { terms: { network_action: ['block', 'drop'] } } },
+          blocked: { filter: { term: { network_action: 'block' } } },
           threats: { filter: { term: { event_type: 'threat' } } },
           last_seen: { max: { field: 'received_at' } },
         },
@@ -1216,7 +1216,7 @@ class OpenSearchBackend extends StorageBackend {
                       _source: ['src_country', 'src_city', 'src_latitude', 'src_longitude', 'src_abuseScore', 'src_hostname'],
                     },
                   },
-                  blocked: { filter: { terms: { network_action: ['block', 'drop'] } } },
+                  blocked: { filter: { term: { network_action: 'block' } } },
                   threats: { filter: { term: { event_type: 'threat' } } },
                 },
               },
@@ -1242,7 +1242,7 @@ class OpenSearchBackend extends StorageBackend {
                       _source: ['dst_country', 'dst_city', 'dst_latitude', 'dst_longitude', 'dst_abuseScore', 'dst_hostname'],
                     },
                   },
-                  blocked: { filter: { terms: { network_action: ['block', 'drop'] } } },
+                  blocked: { filter: { term: { network_action: 'block' } } },
                   threats: { filter: { term: { event_type: 'threat' } } },
                 },
               },

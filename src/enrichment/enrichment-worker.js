@@ -15,7 +15,7 @@ const db = new Database(dbPath);
 db.pragma('journal_mode = WAL');
 db.pragma('synchronous = NORMAL');
 db.pragma('cache_size = -64000'); // 64MB (less than main — worker is write-heavy, not read-heavy)
-db.pragma('busy_timeout = 10000'); // Higher timeout — main thread may hold locks during batch inserts
+db.pragma('busy_timeout = 30000'); // Match main thread's 30s — main may hold write locks during large insert batches; shorter waits silently dropped enrichment updates (H18)
 
 // Prepared statements (lazily created)
 let updateSrcStmt = null;
@@ -110,9 +110,20 @@ function runBackfill() {
 parentPort.on('message', (msg) => {
   switch (msg.type) {
     case 'update': {
-      // Inline enrichment update for a single IP
-      const result = updateEventsWithEnrichment(msg.ip, msg.data, msg.batchLimit);
-      parentPort.postMessage({ type: 'update-done', ip: msg.ip, ...result });
+      // Inline enrichment update for a single IP. Wrap in try/catch so
+      // the queue can see SQLITE_BUSY / I/O errors instead of silently
+      // losing the enrichment for this IP (H18).
+      try {
+        const result = updateEventsWithEnrichment(msg.ip, msg.data, msg.batchLimit);
+        parentPort.postMessage({ type: 'update-done', ip: msg.ip, ...result });
+      } catch (err) {
+        parentPort.postMessage({
+          type: 'update-error',
+          ip: msg.ip,
+          error: err.message || String(err),
+          code: err.code || null,
+        });
+      }
       break;
     }
     case 'backfill': {
