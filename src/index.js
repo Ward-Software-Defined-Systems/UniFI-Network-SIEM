@@ -1,11 +1,87 @@
 const config = require('./config');
 const logger = require('./utils/logger');
+const cryptoUtil = require('./utils/crypto');
 const storage = require('./db/storage');
 const { createSyslogServer, pause: pauseSyslog, resume: resumeSyslog } = require('./collector/syslog-server');
 const { createServer } = require('./api/server');
 const { broadcastEvent, broadcastStats, getClientCount } = require('./api/websocket');
 const { initGeoIp } = require('./enrichment/geoip');
 const { enqueueEvent, backfillFromCache, shutdownWorker, setCacheAccessors, setUpdateEnrichment, setBatchUpdateEnrichment, queueEnrichmentUpdate } = require('./enrichment/enrichment-queue');
+
+/**
+ * Resolve and apply settings from the SQLite settings backend.
+ *
+ *   1. Resolve the master encryption key (env > DB > generate). The key
+ *      itself is stored plaintext — it IS the protection layer.
+ *   2. Apply DB overlay to the in-memory `config` object (decrypts sensitive
+ *      values).
+ *   3. Migrate any legacy plaintext sensitive values to encrypted form.
+ *   4. Bootstrap the API auth token if no value was loaded.
+ *
+ * Auto-generated values (master key, API token) are logged ONCE at the
+ * generation moment so the operator can copy them. On subsequent restarts
+ * they're loaded silently from the DB.
+ */
+async function bootstrapSettings() {
+  const settingsBackend = storage.getSettingsBackend();
+  let rows = [];
+  try {
+    rows = await settingsBackend.getAllSettings();
+  } catch (err) {
+    logger.warn({ err }, 'bootstrapSettings: settings backend unavailable, skipping');
+    return;
+  }
+
+  // 1. Master key
+  const masterKeyRow = rows.find((r) => r.key === 'security.masterKey');
+  const masterKeyEnv = process.env.SIEM_MASTER_KEY;
+  let masterKeyHex = masterKeyEnv || masterKeyRow?.value || null;
+  let generatedMaster = false;
+
+  if (!masterKeyHex) {
+    masterKeyHex = cryptoUtil.generateMasterKey();
+    await settingsBackend.setSetting('security.masterKey', masterKeyHex);
+    rows.push({ key: 'security.masterKey', value: masterKeyHex });
+    generatedMaster = true;
+  }
+  cryptoUtil.setMasterKey(masterKeyHex);
+
+  if (generatedMaster) {
+    logger.warn('====================================================================');
+    logger.warn('BOOTSTRAP: generated a new SIEM_MASTER_KEY for at-rest encryption.');
+    logger.warn(`           SIEM_MASTER_KEY=${masterKeyHex}`);
+    logger.warn('           Keep a copy if you ever want to restore the encrypted DB');
+    logger.warn('           on another host. Lose this key and encrypted settings');
+    logger.warn('           cannot be recovered.');
+    logger.warn('====================================================================');
+  }
+
+  // 2. Apply DB overlay (decrypts sensitive values via crypto.decrypt)
+  const { plaintextSensitive } = config.applyDbOverrides(rows);
+
+  // 3. Migrate plaintext sensitive rows → encrypted
+  for (const item of plaintextSensitive) {
+    try {
+      await settingsBackend.setSetting(item.dbKey, cryptoUtil.encrypt(item.plaintext));
+      logger.info({ key: item.dbKey }, 'Migrated plaintext sensitive setting to encrypted form');
+    } catch (err) {
+      logger.warn({ err, key: item.dbKey }, 'Failed to migrate plaintext sensitive setting');
+    }
+  }
+
+  // 4. Bootstrap API token if missing
+  if (!config.auth.apiToken) {
+    const newToken = cryptoUtil.generateApiToken();
+    await settingsBackend.setSetting('auth.apiToken', cryptoUtil.encrypt(newToken));
+    config.applySettingChange('auth.apiToken', newToken);
+    logger.warn('====================================================================');
+    logger.warn('BOOTSTRAP: generated a new SIEM_API_TOKEN for /api and /ws auth.');
+    logger.warn(`           SIEM_API_TOKEN=${newToken}`);
+    logger.warn('           Use this in `Authorization: Bearer <token>` headers.');
+    logger.warn('           Phase 3 will enforce this; for now, save it.');
+    logger.warn('====================================================================');
+  }
+}
 
 // Batch queue for the active backend
 let queue = [];
@@ -56,25 +132,8 @@ async function main() {
   await storage.initialize();
   const backendName = storage.getBackendName();
 
-  // Load saved settings from SQLite into in-memory config
-  try {
-    const settingsBackend = storage.getSettingsBackend();
-    const rows = await settingsBackend.getAllSettings();
-    for (const row of rows) {
-      try {
-        const val = JSON.parse(row.value);
-        // DB-stored key wins over .env when present and non-empty.
-        // Settings UI is the user-facing source of truth; .env is bootstrap fallback.
-        if (row.key === 'abuseIpDbKey' && typeof val === 'string' && val.trim()) {
-          config.enrichment.abuseIpDbKey = val.trim();
-          logger.info('Loaded AbuseIPDB API key from settings DB');
-        }
-        if (row.key === 'rdnsEnabled') {
-          config.enrichment.rdnsEnabled = !!val;
-        }
-      } catch {}
-    }
-  } catch {}
+  // Schema-driven settings load + bootstrap (master key, API token, encryption migration)
+  await bootstrapSettings();
 
   // Initialize GeoIP
   await initGeoIp();

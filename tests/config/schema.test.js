@@ -179,10 +179,11 @@ describe('config (schema-driven loader)', () => {
       expect(config.enrichment.rdnsEnabled).toBe(true);
     });
 
-    it('treats empty-string DB values as "not set" (does not clobber default)', () => {
+    it('treats empty-string DB values as "not set" (does not clobber prior value)', () => {
       const config = loadConfig();
+      const before = config.enrichment.abuseIpDbKey;
       config.applyDbOverrides([{ key: 'enrichment.abuseIpDbKey', value: '' }]);
-      expect(config.enrichment.abuseIpDbKey).toBe(''); // unchanged from default
+      expect(config.enrichment.abuseIpDbKey).toBe(before);
     });
 
     it('skips unknown keys silently (e.g. database_engine)', () => {

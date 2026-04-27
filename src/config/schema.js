@@ -43,12 +43,14 @@ const SCHEMA = [
     category: 'enrichment', description: 'Path to MaxMind GeoLite2 database' },
   { key: 'enrichment.abuseIpDbKey', envVar: 'ABUSEIPDB_API_KEY', type: 'string',
     default: '', category: 'enrichment', sensitivity: 'private',
+    legacyKey: 'abuseIpDbKey',
     description: 'AbuseIPDB API key (free tier: 1000 lookups/day)' },
   { key: 'enrichment.abuseIpDbCacheHours', envVar: 'ABUSEIPDB_CACHE_HOURS',
     type: 'number', default: 24, category: 'enrichment',
     description: 'Cache duration for abuse scores (hours)' },
   { key: 'enrichment.rdnsEnabled', envVar: 'RDNS_ENABLED', type: 'boolean',
     default: false, category: 'enrichment',
+    legacyKey: 'rdnsEnabled',
     description: 'Enable reverse DNS lookups for external IPs' },
   { key: 'enrichment.rdnsTimeoutMs', envVar: 'RDNS_TIMEOUT_MS', type: 'number',
     default: 2000, category: 'enrichment',
@@ -130,7 +132,8 @@ const SCHEMA = [
   // ---------------------------------------------------------------- security
   { key: 'security.masterKey', envVar: 'SIEM_MASTER_KEY', type: 'string',
     default: '', category: 'security', sensitivity: 'private',
-    description: 'Master encryption key for sensitive settings (AES-256-GCM). Auto-generated on first run if neither this DB row nor SIEM_MASTER_KEY env var is set' },
+    noEncrypt: true,
+    description: 'Master encryption key for sensitive settings (AES-256-GCM). Stored plaintext (it IS the encryption key — can\'t encrypt itself). Auto-generated on first run if neither this DB row nor SIEM_MASTER_KEY env var is set' },
 ];
 
 // Quick lookups

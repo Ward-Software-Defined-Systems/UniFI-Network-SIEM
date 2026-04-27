@@ -2,10 +2,63 @@ const express = require('express');
 const storage = require('../../db/storage');
 const { getAvailableBackends } = require('../../db/backends');
 const config = require('../../config');
+const cryptoUtil = require('../../utils/crypto');
+const { SCHEMA, listEntries, CATEGORY_ORDER } = require('../../config/schema');
+const logger = require('../../utils/logger');
 
 const router = express.Router();
 
-// Database engine backends metadata (for Settings UI)
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Map a UI-supplied key to the schema entry. Accepts either the schema's
+ * dotted key (`enrichment.abuseIpDbKey`) or its legacyKey (`abuseIpDbKey`).
+ */
+function findSchemaEntry(uiKey) {
+  return SCHEMA.find((e) => e.key === uiKey || e.legacyKey === uiKey) || null;
+}
+
+/** Encrypt a string for sensitive storage (no-op for non-sensitive entries). */
+function encodeForStorage(entry, value) {
+  if (entry.sensitivity === 'private' && typeof value === 'string' && value !== '') {
+    return cryptoUtil.encrypt(value);
+  }
+  return value;
+}
+
+/** Decode a stored value: decrypt sensitive, fall through plaintext. */
+function decodeFromStorage(entry, value) {
+  if (entry.sensitivity === 'private' && typeof value === 'string' && cryptoUtil.isEncrypted(value)) {
+    try {
+      return cryptoUtil.decrypt(value);
+    } catch {
+      return ''; // master key wrong; surface as empty rather than ciphertext
+    }
+  }
+  return value;
+}
+
+/** Update the in-memory config + persist a single setting. */
+async function persistSetting(entry, value) {
+  const settingsBackend = storage.getSettingsBackend();
+  const dbKey = entry.legacyKey || entry.key;
+
+  // Trim string values defensively (matches the existing AbuseIPDB pattern)
+  const trimmed = typeof value === 'string' ? value.trim() : value;
+
+  // Live in-memory update so consumers (e.g. abuseipdb.js) see the new value
+  config.applySettingChange(entry.key, trimmed);
+
+  // Persist (encrypted if sensitive)
+  await settingsBackend.setSetting(dbKey, encodeForStorage(entry, trimmed));
+}
+
+// ---------------------------------------------------------------------------
+// Database engine routes (unchanged from prior versions)
+// ---------------------------------------------------------------------------
+
 router.get('/database-engines', async (req, res) => {
   try {
     const backends = getAvailableBackends();
@@ -50,49 +103,115 @@ router.put('/database-engine', async (req, res) => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// Legacy flat-keyed settings API (kept working for the current Settings.jsx).
+// Reads/writes are now schema-aware: sensitive values are stored encrypted
+// at rest and the route decrypts on read before applying the last-4 mask.
+// ---------------------------------------------------------------------------
+
 router.get('/', async (req, res) => {
   try {
     const settingsBackend = storage.getSettingsBackend();
     const rows = await settingsBackend.getAllSettings();
+
     const settings = {};
     for (const row of rows) {
-      try { settings[row.key] = JSON.parse(row.value); } catch { settings[row.key] = row.value; }
+      // Skip schema-tracked rows that have a dotted key — those are surfaced
+      // via /v2. The legacy endpoint only exposes the flat-key namespace
+      // that the current UI knows about (abuseIpDbKey, rdnsEnabled, etc.)
+      // plus untracked operational rows (database_engine, hunt_*).
+      const entry = findSchemaEntry(row.key);
+      if (entry && entry.key !== row.key) {
+        // legacyKey row — decode + mask sensitive
+        const decoded = decodeFromStorage(entry, row.value);
+        settings[row.key] = entry.sensitivity === 'private' && decoded
+          ? cryptoUtil.maskSensitive(decoded)
+          : decoded;
+      } else if (!entry) {
+        // Untracked row — return as-is (database_engine, hunt_*)
+        settings[row.key] = row.value;
+      }
+      // Schema-key rows (e.g., 'security.masterKey') are intentionally
+      // omitted from the legacy endpoint.
     }
-    if (settings.abuseIpDbKey) {
-      settings.abuseIpDbKey = '••••••••' + settings.abuseIpDbKey.slice(-4);
-    }
+
     res.json(settings);
   } catch (err) {
+    logger.error({ err }, 'GET /api/settings failed');
     res.status(500).json({ error: 'Failed to get settings' });
   }
 });
 
 router.put('/', async (req, res) => {
   try {
-    const settingsBackend = storage.getSettingsBackend();
     const body = { ...req.body };
-    if (typeof body.abuseIpDbKey === 'string') {
-      body.abuseIpDbKey = body.abuseIpDbKey.trim();
-    }
 
-    for (const [key, value] of Object.entries(body)) {
-      await settingsBackend.setSetting(key, value);
-    }
-
-    if (body.abuseIpDbKey !== undefined) {
-      config.enrichment.abuseIpDbKey = body.abuseIpDbKey;
-    }
-    if (body.rdnsEnabled !== undefined) {
-      config.enrichment.rdnsEnabled = !!body.rdnsEnabled;
+    for (const [uiKey, rawValue] of Object.entries(body)) {
+      const entry = findSchemaEntry(uiKey);
+      if (entry) {
+        await persistSetting(entry, rawValue);
+      } else {
+        // Untracked legacy key — pass through as before
+        const settingsBackend = storage.getSettingsBackend();
+        await settingsBackend.setSetting(uiKey, rawValue);
+      }
     }
 
     res.json({ ok: true });
   } catch (err) {
+    logger.error({ err }, 'PUT /api/settings failed');
     res.status(500).json({ error: 'Failed to save settings' });
   }
 });
 
-// Grace period after DB reset — suppress heavy queries while indexes rebuild
+// ---------------------------------------------------------------------------
+// Schema-aware /v2 GET — for the upcoming Settings UI rewrite (Phase 2B2).
+// Returns the schema + current values, with sensitive entries masked.
+// ---------------------------------------------------------------------------
+
+router.get('/v2', async (req, res) => {
+  try {
+    const entries = listEntries().map((entry) => {
+      const dottedPath = entry.key.split('.');
+      let value = config;
+      for (const p of dottedPath) {
+        if (value == null) break;
+        value = value[p];
+      }
+      const masked = entry.sensitivity === 'private' && typeof value === 'string' && value
+        ? cryptoUtil.maskSensitive(value)
+        : value;
+      const isSet = entry.sensitivity === 'private'
+        ? typeof value === 'string' && value.length > 0
+        : value !== entry.default;
+      return {
+        key: entry.key,
+        type: entry.type,
+        category: entry.category,
+        description: entry.description,
+        default: entry.sensitivity === 'private' ? '' : entry.default,
+        sensitivity: entry.sensitivity || 'public',
+        envVar: entry.envVar || null,
+        requiresRestart: !!entry.requiresRestart,
+        value: masked,
+        isSet,
+      };
+    });
+
+    res.json({
+      categories: CATEGORY_ORDER,
+      entries,
+    });
+  } catch (err) {
+    logger.error({ err }, 'GET /api/settings/v2 failed');
+    res.status(500).json({ error: 'Failed to get settings schema' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// DB reset — unchanged
+// ---------------------------------------------------------------------------
+
 let lastResetAt = null;
 const RESET_GRACE_SECONDS = 60;
 
@@ -102,31 +221,28 @@ function getResetGraceStatus() {
   if (elapsed < RESET_GRACE_SECONDS) {
     return { rebuilding: true, secondsLeft: Math.ceil(RESET_GRACE_SECONDS - elapsed) };
   }
-  lastResetAt = null; // Grace period over, clear
+  lastResetAt = null;
   return null;
 }
 
 router.post('/reset-db', async (req, res) => {
-  // Pause syslog ingestion to avoid write contention during reset + index creation
   req.app.locals.pauseSyslog?.();
   try {
     const backend = storage.getBackend();
     await backend.resetData();
-    // Wait for indexes to be fully built before resuming ingestion (WardSONDB).
-    // SQLite resolves immediately. 5-minute safety ceiling prevents permanent pause.
     await Promise.race([
       backend.indexesReady,
-      new Promise(resolve => setTimeout(resolve, 300_000)),
+      new Promise((resolve) => setTimeout(resolve, 300_000)),
     ]);
     lastResetAt = Date.now();
     res.json({ ok: true, gracePeriod: RESET_GRACE_SECONDS });
   } catch (err) {
+    logger.error({ err }, 'POST /api/settings/reset-db failed');
     res.status(500).json({ error: 'Failed to reset database' });
   } finally {
     req.app.locals.resumeSyslog?.();
   }
 });
 
-// Export router + helper for health endpoint
 module.exports = router;
 module.exports.getResetGraceStatus = getResetGraceStatus;

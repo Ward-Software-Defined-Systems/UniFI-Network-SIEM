@@ -85,23 +85,37 @@ for (const entry of SCHEMA) {
 // DB overlay — called from src/index.js after storage.initialize().
 // `rows` is an array of { key, value } from the settings backend, where
 // `value` is already JSON-parsed (matches the existing settings backend
-// contract).
+// contract). Schema entries with a `legacyKey` resolve against that key in
+// the DB, so existing rows like `abuseIpDbKey` keep their storage shape.
+//
+// Returns a list of `{key, plaintext}` for sensitive entries whose stored
+// value was plaintext (no `v1:` prefix). Caller can iterate this list to
+// re-write encrypted values, completing the migration. The in-memory
+// config is updated either way.
 // -----------------------------------------------------------------------------
 function applyDbOverrides(rows) {
-  for (const row of rows || []) {
-    const entry = SCHEMA.find((e) => e.key === row.key);
-    if (!entry) continue; // not a schema-tracked setting (e.g. database_engine)
+  const rowMap = new Map((rows || []).map((r) => [r.key, r.value]));
+  const plaintextSensitive = [];
 
-    let value = row.value;
-    if (entry.sensitivity === 'private' && typeof value === 'string') {
-      try {
-        value = crypto.decrypt(value);
-      } catch (err) {
-        // Master key missing or wrong — leave the in-memory value at its
-        // .env/default fallback. Caller should log this.
-        continue;
+  for (const entry of SCHEMA) {
+    const dbKey = entry.legacyKey || entry.key;
+    if (!rowMap.has(dbKey)) continue;
+    let value = rowMap.get(dbKey);
+
+    if (entry.sensitivity === 'private' && typeof value === 'string' && !entry.noEncrypt) {
+      if (crypto.isEncrypted(value)) {
+        try {
+          value = crypto.decrypt(value);
+        } catch (err) {
+          // Master key missing or wrong — skip; leaves in-memory at .env/default.
+          continue;
+        }
+      } else if (value !== '') {
+        // Plaintext sensitive value — flag for migration write-back.
+        plaintextSensitive.push({ schemaKey: entry.key, dbKey, plaintext: value });
       }
     }
+    // noEncrypt entries (e.g. security.masterKey) pass through plaintext.
 
     if (typeof value === 'string' && entry.type === 'boolean') value = coerce(value, 'boolean');
     if (typeof value === 'string' && entry.type === 'number') value = coerce(value, 'number');
@@ -115,6 +129,8 @@ function applyDbOverrides(rows) {
 
     setDeep(config, entry.key, value);
   }
+
+  return { plaintextSensitive };
 }
 
 /** Apply a single setting change (used by the settings PUT route). */
