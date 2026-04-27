@@ -6,6 +6,7 @@ import LiveMap from './components/map/LiveMap';
 import ThreatIntel from './components/intel/ThreatIntel';
 import ThreatHunt from './components/hunt/ThreatHunt';
 import Settings from './components/Settings';
+import TokenGate from './components/TokenGate';
 
 const DEFAULT_REFRESH = 60000;
 
@@ -19,13 +20,15 @@ export default function App() {
   const refreshProps = { refreshRate, setRefreshRate, paused, setPaused };
 
   return (
-    <Layout activeView={view} onViewChange={setView} rebuilding={rebuilding} setRebuilding={setRebuilding}>
-      {view === 'live' && <LiveStream />}
-      {view === 'dashboard' && <Dashboard period={period} setPeriod={setPeriod} {...refreshProps} />}
-      {view === 'map' && <LiveMap period={period} setPeriod={setPeriod} {...refreshProps} />}
-      {view === 'intel' && <ThreatIntel period={period} setPeriod={setPeriod} {...refreshProps} />}
-      {view === 'hunt' && <ThreatHunt period={period} setPeriod={setPeriod} />}
-      {view === 'settings' && <Settings setRebuilding={setRebuilding} />}
-    </Layout>
+    <TokenGate>
+      <Layout activeView={view} onViewChange={setView} rebuilding={rebuilding} setRebuilding={setRebuilding}>
+        {view === 'live' && <LiveStream />}
+        {view === 'dashboard' && <Dashboard period={period} setPeriod={setPeriod} {...refreshProps} />}
+        {view === 'map' && <LiveMap period={period} setPeriod={setPeriod} {...refreshProps} />}
+        {view === 'intel' && <ThreatIntel period={period} setPeriod={setPeriod} {...refreshProps} />}
+        {view === 'hunt' && <ThreatHunt period={period} setPeriod={setPeriod} />}
+        {view === 'settings' && <Settings setRebuilding={setRebuilding} />}
+      </Layout>
+    </TokenGate>
   );
 }
