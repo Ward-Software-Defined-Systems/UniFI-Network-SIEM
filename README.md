@@ -257,12 +257,12 @@ src/
       cef.js                   # CEF (Activity Logging) parser
       system.js                # Catch-all parser
   db/
-    database.js                # SQLite connection & schema
-    events.js                  # Event CRUD & batch insert
-    cache.js                   # IP enrichment cache
-    retention.js               # Periodic cleanup
-    storage.js                 # Active backend manager (singleton)
-    stats-worker.js            # Read-only stats worker thread
+    storage.js                 # Active backend orchestrator (getBackend/getSettingsBackend/getDb)
+    stats-worker.js            # Read-only stats worker thread (SQLite)
+    database.js                # SQLite connection & schema (legacy — still used by threat-hunt.js)
+    events.js                  # Event CRUD & batch insert (legacy — no current importers)
+    cache.js                   # IP enrichment cache (used on SQLite cache-accessor path)
+    retention.js               # Periodic cleanup (legacy — backend.runRetention is the active path)
     backends/
       interface.js             # StorageBackend base class
       index.js                 # Backend registry & factory

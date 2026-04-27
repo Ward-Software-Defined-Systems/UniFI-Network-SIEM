@@ -103,4 +103,8 @@ function broadcastStats(stats) {
   }
 }
 
-module.exports = { createWebSocketServer, broadcastEvent, broadcastStats };
+function getClientCount() {
+  return wss ? wss.clients.size : 0;
+}
+
+module.exports = { createWebSocketServer, broadcastEvent, broadcastStats, getClientCount };

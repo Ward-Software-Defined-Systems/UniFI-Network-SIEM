@@ -33,7 +33,6 @@ function getAvailableBackends() {
       id: 'wardsondb',
     },
     {
-      id: 'opensearch',
       ...OpenSearchBackend.metadata,
       id: 'opensearch',
     },

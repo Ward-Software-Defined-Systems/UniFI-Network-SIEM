@@ -1,5 +1,7 @@
 const express = require('express');
 const storage = require('../../db/storage');
+const logger = require('../../utils/logger');
+const { getSinceOrDefault } = require('../../utils/period');
 
 const router = express.Router();
 
@@ -13,14 +15,7 @@ function bucketToFormat(bucket) {
   return map[bucket] || '%Y-%m-%dT%H:00:00Z';
 }
 
-function getSince(period) {
-  const ms = {
-    '1h': 3600000, '6h': 21600000, '24h': 86400000,
-    '7d': 604800000, '30d': 2592000000,
-  };
-  const offset = ms[period] || 86400000;
-  return new Date(Date.now() - offset).toISOString();
-}
+const getSince = (period) => getSinceOrDefault(period);
 
 router.get('/overview', async (req, res) => {
   try {
@@ -29,7 +24,7 @@ router.get('/overview', async (req, res) => {
     const result = await backend.getOverviewStats(since);
     res.json(result);
   } catch (err) {
-    console.error('[stats/overview] Error:', err.message || err);
+    logger.error({ err }, 'getOverviewStats failed');
     res.status(500).json({ error: 'Failed to get overview stats', detail: err.message });
   }
 });
@@ -43,7 +38,7 @@ router.get('/timeline', async (req, res) => {
     const rows = await backend.getTimeline(since, bucketToFormat(bucket), req.query.event_type, bucket);
     res.json(rows);
   } catch (err) {
-    console.error('[stats/timeline] Error:', err.message || err);
+    logger.error({ err }, 'getTimeline failed');
     res.status(500).json({ error: 'Failed to get timeline', detail: err.message });
   }
 });

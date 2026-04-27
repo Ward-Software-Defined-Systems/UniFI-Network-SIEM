@@ -3,7 +3,7 @@ const logger = require('./utils/logger');
 const storage = require('./db/storage');
 const { createSyslogServer, pause: pauseSyslog, resume: resumeSyslog } = require('./collector/syslog-server');
 const { createServer } = require('./api/server');
-const { broadcastEvent } = require('./api/websocket');
+const { broadcastEvent, broadcastStats, getClientCount } = require('./api/websocket');
 const { initGeoIp } = require('./enrichment/geoip');
 const { enqueueEvent, backfillFromCache, shutdownWorker, setCacheAccessors, setUpdateEnrichment, setBatchUpdateEnrichment, queueEnrichmentUpdate } = require('./enrichment/enrichment-queue');
 
@@ -183,12 +183,13 @@ async function main() {
     await backend.runRetention(config.db.retentionDays);
   } catch {}
 
-  // Periodic stats broadcast
-  setInterval(async () => {
+  // Periodic stats broadcast — skip both the backend query and the broadcast
+  // when no WS clients are connected (saves a backend roundtrip every 5s).
+  const statsInterval = setInterval(async () => {
+    if (getClientCount() === 0) return;
     try {
       const backend = storage.getBackend();
       const byType = await backend.getEventTypeCounts();
-      const { broadcastStats } = require('./api/websocket');
       broadcastStats({ byType });
     } catch {}
   }, 5000);
@@ -199,6 +200,7 @@ async function main() {
     shutdownWorker();
     await flushQueue();
     clearInterval(retentionInterval);
+    clearInterval(statsInterval);
     await storage.close();
     process.exit(0);
   };

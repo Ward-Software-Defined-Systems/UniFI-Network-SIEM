@@ -3,6 +3,7 @@ const { getDb } = require('../../db/database');
 const storage = require('../../db/storage');
 const config = require('../../config');
 const logger = require('../../utils/logger');
+const { PERIOD_MS, getSinceOptional } = require('../../utils/period');
 
 const router = express.Router();
 
@@ -10,16 +11,7 @@ const router = express.Router();
 // When the request body omits `period` entirely the queries revert to main's
 // all-time behavior (no time filter). The UI always sends a period so this
 // only affects direct API callers.
-const PERIOD_MS = {
-  '1h': 3600000, '6h': 21600000, '24h': 86400000,
-  '7d': 604800000, '30d': 2592000000,
-};
-
-function getSince(period) {
-  const offset = PERIOD_MS[period];
-  if (!offset) return null;
-  return new Date(Date.now() - offset).toISOString();
-}
+const getSince = (period) => getSinceOptional(period);
 
 // Concurrency cap for WardSONDB partition fan-out
 const HUNT_FANOUT_CONCURRENCY = 8;
