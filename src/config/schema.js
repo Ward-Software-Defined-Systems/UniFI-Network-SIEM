@@ -29,6 +29,9 @@ const SCHEMA = [
     category: 'network',
     description: 'HTTPS bind address (127.0.0.1 = localhost only; set to your LAN IP or 0.0.0.0 for remote access)',
     requiresRestart: true },
+  { key: 'network.syslogAllowedSources', envVar: 'SYSLOG_ALLOWED_SOURCES',
+    type: 'string', default: '', category: 'network',
+    description: 'Comma-separated list of source IPs or IPv4 CIDRs allowed to send syslog (e.g. "10.0.0.0/8,172.16.4.1"). Empty = allow all (default). Live-reloaded — no restart needed.' },
 
   // ----------------------------------------------------------------- storage
   { key: 'db.path', envVar: 'DB_PATH', type: 'string', default: './data/events.db',
@@ -69,6 +72,9 @@ const SCHEMA = [
   { key: 'performance.wsBroadcastThrottleMs', envVar: 'WS_BROADCAST_THROTTLE_MS',
     type: 'number', default: 100, category: 'performance',
     description: 'WebSocket event broadcast throttle (ms)' },
+  { key: 'performance.syslogRateLimitPerSourcePerSec', envVar: 'SYSLOG_RATE_LIMIT_PER_SOURCE',
+    type: 'number', default: 0, category: 'performance',
+    description: 'Max syslog events/sec from a single source IP. 0 = no limit (default). When exceeded, packets are dropped and a per-minute summary is logged at warn level.' },
   { key: 'performance.httpServerTimeoutMs', type: 'number', default: 300000,
     category: 'performance',
     description: 'HTTPS request timeout (ms). Kills slow requests after this. Long Threat Hunt SSE streams may exceed 5 min — bump if needed.' },
