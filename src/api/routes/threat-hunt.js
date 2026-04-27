@@ -831,8 +831,8 @@ async function callAnthropic(prompt, key) {
       'anthropic-version': '2023-06-01',
     },
     body: JSON.stringify({
-      model: 'claude-opus-4-6',
-      max_tokens: 128000,
+      model: config.threathunt.anthropicModel,
+      max_tokens: config.threathunt.anthropicMaxTokens,
       thinking: { type: 'adaptive', display: 'summarized' },
       messages: [{ role: 'user', content: prompt }],
     }),
@@ -857,8 +857,8 @@ async function callOpenAI(prompt, key) {
       'Authorization': `Bearer ${key}`,
     },
     body: JSON.stringify({
-      model: 'gpt-5.4',
-      max_tokens: 128000,
+      model: config.threathunt.openaiModel,
+      max_tokens: config.threathunt.openaiMaxTokens,
       messages: [{ role: 'user', content: prompt }],
     }),
   });
@@ -873,12 +873,12 @@ async function callOpenAI(prompt, key) {
 }
 
 async function callGemini(prompt, key) {
-  const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-pro:generateContent?key=${key}`, {
+  const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${config.threathunt.geminiModel}:generateContent?key=${key}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       contents: [{ parts: [{ text: prompt }] }],
-      generationConfig: { maxOutputTokens: 65536 },
+      generationConfig: { maxOutputTokens: config.threathunt.geminiMaxTokens },
     }),
   });
 
@@ -927,8 +927,8 @@ async function callAnthropicStream(prompt, key, sendEvent) {
       'anthropic-version': '2023-06-01',
     },
     body: JSON.stringify({
-      model: 'claude-opus-4-6',
-      max_tokens: 128000,
+      model: config.threathunt.anthropicModel,
+      max_tokens: config.threathunt.anthropicMaxTokens,
       thinking: { type: 'adaptive', display: 'summarized' },
       stream: true,
       messages: [{ role: 'user', content: prompt }],
@@ -968,8 +968,8 @@ async function callOpenAIStream(prompt, key, sendEvent) {
       'Authorization': `Bearer ${key}`,
     },
     body: JSON.stringify({
-      model: 'gpt-5.4',
-      max_tokens: 128000,
+      model: config.threathunt.openaiModel,
+      max_tokens: config.threathunt.openaiMaxTokens,
       stream: true,
       messages: [{ role: 'user', content: prompt }],
     }),
@@ -989,12 +989,12 @@ async function callOpenAIStream(prompt, key, sendEvent) {
 }
 
 async function callGeminiStream(prompt, key, sendEvent) {
-  const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-pro:streamGenerateContent?alt=sse&key=${key}`, {
+  const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${config.threathunt.geminiModel}:streamGenerateContent?alt=sse&key=${key}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       contents: [{ parts: [{ text: prompt }] }],
-      generationConfig: { maxOutputTokens: 65536 },
+      generationConfig: { maxOutputTokens: config.threathunt.geminiMaxTokens },
     }),
   });
 

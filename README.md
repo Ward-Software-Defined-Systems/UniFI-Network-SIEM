@@ -194,38 +194,27 @@ For full functionality, three logging sources on the UniFi Console should be con
 | `POST /api/threat-hunt/investigate-stream` | SSE streaming AI investigation (primary endpoint) |
 | `WSS /ws/events` | Live event stream with filtering |
 
-## Configuration (.env)
+## Configuration
+
+Operator settings live in the SQLite database and are managed via the **Settings** view in the dashboard. `.env` is the bootstrap layer only — it carries the handful of values needed before the database is open, plus optional headless/CI overrides for the auth token and master key.
+
+### Bootstrap (`.env`)
 
 | Variable | Default | Description |
 |---|---|---|
-| `SYSLOG_PORT` | 5514 | UDP port for syslog listener |
-| `HTTP_PORT` | 3000 | Web dashboard port |
-| `DB_PATH` | ./data/events.db | SQLite database path |
-| `RETENTION_DAYS` | 60 | Auto-delete events older than this |
-| `LOG_LEVEL` | info | Logging level (trace/debug/info/warn/error) |
-| `GEOIP_DB_PATH` | ./data/GeoLite2-City.mmdb | Path to MaxMind GeoLite2 database |
-| `ABUSEIPDB_API_KEY` | *(empty)* | AbuseIPDB API key (free tier: 1000/day) |
-| `ABUSEIPDB_CACHE_HOURS` | 24 | Cache duration for abuse scores |
-| `RDNS_ENABLED` | false | Enable reverse DNS lookups |
-| `LOG_RAW_MESSAGES` | false | Store raw syslog text in DB |
-| `INSERT_BATCH_SIZE` | 50 | Batch insert threshold |
-| `INSERT_BATCH_INTERVAL_MS` | 500 | Batch insert flush interval |
-| `ENRICHMENT_CONCURRENCY` | 5 | Max parallel enrichment lookups |
-| `RDNS_TIMEOUT_MS` | 2000 | Reverse DNS lookup timeout (ms) |
-| `WS_BROADCAST_THROTTLE_MS` | 100 | WebSocket broadcast throttle interval (ms) |
-| `WARDSONDB_HEALTH_TIMEOUT_MS` | 5000 | WardSONDB health check timeout (ms) |
-| `WARDSONDB_CONNECT_TIMEOUT_MS` | 60000 | TCP connect timeout for the per-client undici Agent. Default is higher than undici's 10s stock timeout because saturated WardSONDB instances under heavy flush/backfill take longer to accept new connections |
-| `WARDSONDB_QUERY_TIMEOUT_MS` | 0 | Client-side headers/body timeout. `0` = no client-side limit (server-side `--query-timeout` governs). Operator escape hatch |
-| `WARDSONDB_FLUSH_CONCURRENCY` | 4 | Rollup flush worker-pool size. Lower values reduce accept-loop pressure on saturated WardSONDB instances |
-| `HEALTH_REBUILDING_DEBOUNCE_POLLS` | 2 | Consecutive `write_pressure: "high"` polls required before the Rebuilding banner fires. At the 10s poll cadence, `2` ≈ 20s. Eliminates single-poll flickers from volatile write-pressure signals |
-| `OPENSEARCH_HOST` | localhost | OpenSearch host |
-| `OPENSEARCH_PORT` | 9200 | OpenSearch port |
-| `OPENSEARCH_USERNAME` | *(empty)* | Basic auth username (empty = no auth) |
-| `OPENSEARCH_PASSWORD` | *(empty)* | Basic auth password |
-| `OPENSEARCH_USE_TLS` | false | Enable HTTPS connection |
-| `OPENSEARCH_VERIFY_CERTS` | true | Verify TLS certificates (set false for self-signed) |
-| `OPENSEARCH_INDEX_PREFIX` | siem- | Prefix for OpenSearch index names |
-| `OPENSEARCH_BULK_SIZE` | 50 | Bulk insert batch size |
+| `DB_PATH` | `./data/events.db` | SQLite database path. Required before the DB is open. |
+| `LOG_LEVEL` | `info` | Logging level. Required for boot-time logs. |
+| `HTTP_HOST` | `127.0.0.1` | HTTPS bind address. Set to your LAN IP or `0.0.0.0` for remote dashboard access. |
+| `SIEM_API_TOKEN` | *(auto-generated)* | API/WebSocket auth token. Auto-generated and logged once on first run if unset. Required for `/api` and `/ws` auth (Phase 3+). |
+| `SIEM_MASTER_KEY` | *(auto-generated)* | 64 hex chars (32 bytes). Decrypts sensitive settings at rest (AES-256-GCM). Auto-generated and logged once on first run if unset. |
+
+### First-run seeding (optional)
+
+Any setting that has an `envVar` in the schema can be pre-populated on first run by setting it in `.env`. After the first run the value is in the DB and `.env` becomes inert for that key — edit through the Settings UI thereafter. See `.env.example` for the full list of seedable env vars.
+
+### Settings UI
+
+All other settings (syslog port, retention, AbuseIPDB key, WardSONDB tunables, OpenSearch credentials, Threat Hunt model + max tokens, HTTPS timeouts, health debounce, etc.) are configurable in **Settings → Operator Settings**, grouped by category. Sensitive values (API keys, passwords, tokens) are encrypted at rest with the master key and shown masked in the UI.
 
 > **⚠️ Important:** Settings and configuration are always stored in the local SQLite database (`data/events.db`), regardless of which storage backend is active. Do not delete this file even when using WardSONDB or OpenSearch — it contains your backend configuration, API keys, and other settings needed to boot the application. Changing the storage backend requires a SIEM restart to take effect.
 
