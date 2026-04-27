@@ -1003,7 +1003,16 @@ class SqliteBackend extends StorageBackend {
   }
 
   async getAllSettings() {
-    return this.db.prepare('SELECT key, value FROM settings').all();
+    const rows = this.db.prepare('SELECT key, value FROM settings').all();
+    // Parse values so callers receive structured data (matches getSetting).
+    // Returning the raw JSON-encoded string here was the cause of the
+    // master-key/auth-token quote-wrapping bug: callers passed the
+    // doubly-encoded string into setMasterKey()/encrypt(), producing
+    // ciphertext that couldn't decrypt across restart.
+    return rows.map((row) => {
+      try { return { key: row.key, value: JSON.parse(row.value) }; }
+      catch { return { key: row.key, value: row.value }; }
+    });
   }
 
   // --- Direct DB access (for backward compatibility) ---

@@ -57,7 +57,7 @@ async function bootstrapSettings() {
   }
 
   // 2. Apply DB overlay (decrypts sensitive values via crypto.decrypt)
-  const { plaintextSensitive } = config.applyDbOverrides(rows);
+  const { plaintextSensitive, decryptFailures } = config.applyDbOverrides(rows);
 
   // 3. Migrate plaintext sensitive rows → encrypted
   for (const item of plaintextSensitive) {
@@ -66,6 +66,28 @@ async function bootstrapSettings() {
       logger.info({ key: item.dbKey }, 'Migrated plaintext sensitive setting to encrypted form');
     } catch (err) {
       logger.warn({ err, key: item.dbKey }, 'Failed to migrate plaintext sensitive setting');
+    }
+  }
+
+  // 3a. Surface decrypt failures so the operator knows which sensitive
+  // settings need re-entry. If any are present, we delete the row so
+  // bootstrap can regenerate (auth.apiToken) or fall back to .env/default
+  // (everything else) on this startup.
+  if (decryptFailures.length > 0) {
+    const keys = decryptFailures.map((f) => f.key).join(', ');
+    logger.warn(`====================================================================`);
+    logger.warn(`Could not decrypt these sensitive settings (master key mismatch):`);
+    logger.warn(`  ${keys}`);
+    logger.warn(`This usually means the SIEM_MASTER_KEY changed since the row was`);
+    logger.warn(`stored, or the row was written by an earlier buggy version. The`);
+    logger.warn(`affected rows have been cleared. After this startup:`);
+    logger.warn(`  - auth.apiToken will be auto-regenerated and logged below.`);
+    logger.warn(`  - other entries (e.g. abuseIpDbKey) need re-entry via Settings UI.`);
+    logger.warn(`====================================================================`);
+    for (const failure of decryptFailures) {
+      try {
+        await settingsBackend.setSetting(failure.dbKey, '');
+      } catch {}
     }
   }
 

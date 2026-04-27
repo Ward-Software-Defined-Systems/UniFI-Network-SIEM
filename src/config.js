@@ -96,6 +96,7 @@ for (const entry of SCHEMA) {
 function applyDbOverrides(rows) {
   const rowMap = new Map((rows || []).map((r) => [r.key, r.value]));
   const plaintextSensitive = [];
+  const decryptFailures = [];
 
   for (const entry of SCHEMA) {
     const dbKey = entry.legacyKey || entry.key;
@@ -107,7 +108,12 @@ function applyDbOverrides(rows) {
         try {
           value = crypto.decrypt(value);
         } catch (err) {
-          // Master key missing or wrong — skip; leaves in-memory at .env/default.
+          // Master key missing or wrong. Common cause: the row was encrypted
+          // under a different master key (DB restored from backup, master key
+          // env-overridden, or rotated without re-encrypt). Skip silently —
+          // this is collected up by the caller via decryptFailures so a
+          // single startup-time warning can list affected keys.
+          decryptFailures.push({ key: entry.key, dbKey });
           continue;
         }
       } else if (value !== '') {
@@ -130,7 +136,7 @@ function applyDbOverrides(rows) {
     setDeep(config, entry.key, value);
   }
 
-  return { plaintextSensitive };
+  return { plaintextSensitive, decryptFailures };
 }
 
 /** Apply a single setting change (used by the settings PUT route). */
