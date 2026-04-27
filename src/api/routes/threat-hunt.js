@@ -2,6 +2,8 @@ const express = require('express');
 const { getDb } = require('../../db/database');
 const storage = require('../../db/storage');
 const config = require('../../config');
+const cryptoUtil = require('../../utils/crypto');
+const { SCHEMA } = require('../../config/schema');
 const logger = require('../../utils/logger');
 const { PERIOD_MS, getSinceOptional } = require('../../utils/period');
 
@@ -16,74 +18,67 @@ const getSince = (period) => getSinceOptional(period);
 // Concurrency cap for WardSONDB partition fan-out
 const HUNT_FANOUT_CONCURRENCY = 8;
 
-// In-memory settings for threat hunt (also persisted to DB)
-let huntSettings = {
-  provider: 'anthropic',  // anthropic | openai | gemini
-  anthropicKey: '',
-  openaiKey: '',
-  geminiKey: '',
+// Map UI-facing keys (provider, anthropicKey, etc.) to schema entries so the
+// existing /api/threat-hunt/settings shape keeps working. Each key's row in
+// the DB lives under its legacyKey ('hunt_*'); applyDbOverrides decrypts at
+// startup and the bootstrap migration auto-encrypts any previously-plaintext
+// hunt_* rows on first read.
+const HUNT_KEY_MAP = {
+  provider: SCHEMA.find((e) => e.key === 'threathunt.provider'),
+  anthropicKey: SCHEMA.find((e) => e.key === 'threathunt.anthropicKey'),
+  openaiKey: SCHEMA.find((e) => e.key === 'threathunt.openaiKey'),
+  geminiKey: SCHEMA.find((e) => e.key === 'threathunt.geminiKey'),
 };
 
-// Load settings from DB on first use
-let settingsLoaded = false;
-function loadSettings() {
-  if (settingsLoaded) return;
-  try {
-    const db = getDb();
-    const rows = db.prepare("SELECT key, value FROM settings WHERE key LIKE 'hunt_%'").all();
-    for (const row of rows) {
-      try {
-        const val = JSON.parse(row.value);
-        const field = row.key.replace('hunt_', '');
-        if (field in huntSettings) huntSettings[field] = val;
-      } catch {}
-    }
-    settingsLoaded = true;
-  } catch {}
+function maskKey(value) {
+  if (!value) return '';
+  return value.length <= 4 ? '••••' : '••••••••' + value.slice(-4);
 }
 
-// GET /api/threat-hunt/settings
+// GET /api/threat-hunt/settings — masked view backed by config.threathunt.*
 router.get('/settings', (req, res) => {
-  loadSettings();
+  const t = config.threathunt;
   res.json({
-    provider: huntSettings.provider,
-    anthropicKey: huntSettings.anthropicKey ? '••••••••' + huntSettings.anthropicKey.slice(-4) : '',
-    openaiKey: huntSettings.openaiKey ? '••••••••' + huntSettings.openaiKey.slice(-4) : '',
-    geminiKey: huntSettings.geminiKey ? '••••••••' + huntSettings.geminiKey.slice(-4) : '',
-    hasAnthropicKey: !!huntSettings.anthropicKey,
-    hasOpenaiKey: !!huntSettings.openaiKey,
-    hasGeminiKey: !!huntSettings.geminiKey,
+    provider: t.provider,
+    anthropicKey: maskKey(t.anthropicKey),
+    openaiKey: maskKey(t.openaiKey),
+    geminiKey: maskKey(t.geminiKey),
+    hasAnthropicKey: !!t.anthropicKey,
+    hasOpenaiKey: !!t.openaiKey,
+    hasGeminiKey: !!t.geminiKey,
   });
 });
 
-// PUT /api/threat-hunt/settings
-router.put('/settings', (req, res) => {
+// PUT /api/threat-hunt/settings — schema-aware: sensitive values are encrypted
+// at rest, in-memory config is updated immediately so live calls see new keys.
+router.put('/settings', async (req, res) => {
   try {
-    const db = getDb();
-    const upsert = db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)');
-    const txn = db.transaction((entries) => {
-      for (const [key, value] of entries) {
-        if (key in huntSettings) {
-          huntSettings[key] = value;
-          upsert.run(`hunt_${key}`, JSON.stringify(value));
-        }
-      }
-    });
-    txn(Object.entries(req.body));
+    const settingsBackend = storage.getSettingsBackend();
+    for (const [uiKey, rawValue] of Object.entries(req.body || {})) {
+      const entry = HUNT_KEY_MAP[uiKey];
+      if (!entry) continue; // ignore unknown keys
+      const trimmed = typeof rawValue === 'string' ? rawValue.trim() : rawValue;
+      const dbKey = entry.legacyKey || entry.key;
+      const stored = entry.sensitivity === 'private' && typeof trimmed === 'string' && trimmed !== ''
+        ? cryptoUtil.encrypt(trimmed)
+        : trimmed;
+      await settingsBackend.setSetting(dbKey, stored);
+      config.applySettingChange(entry.key, trimmed);
+    }
     res.json({ ok: true });
   } catch (err) {
+    logger.error({ err }, 'PUT /api/threat-hunt/settings failed');
     res.status(500).json({ error: 'Failed to save settings' });
   }
 });
 
 // POST /api/threat-hunt/investigate (non-streaming fallback)
 router.post('/investigate', async (req, res) => {
-  loadSettings();
   const { target, period } = req.body;
   if (!target) return res.status(400).json({ error: 'Target IP or hostname required' });
 
   const key = getActiveKey();
-  if (!key) return res.status(400).json({ error: `No API key configured for ${huntSettings.provider}` });
+  if (!key) return res.status(400).json({ error: `No API key configured for ${config.threathunt.provider}` });
 
   try {
     const since = period ? getSince(period) : null; // null = all-time
@@ -101,7 +96,7 @@ router.post('/investigate', async (req, res) => {
     res.json({
       target,
       period: period || null,
-      provider: huntSettings.provider,
+      provider: config.threathunt.provider,
       intel,
       external,
       analysis,
@@ -115,12 +110,11 @@ router.post('/investigate', async (req, res) => {
 
 // POST /api/threat-hunt/investigate-stream (SSE streaming)
 router.post('/investigate-stream', async (req, res) => {
-  loadSettings();
   const { target, period } = req.body;
   if (!target) return res.status(400).json({ error: 'Target IP or hostname required' });
 
   const key = getActiveKey();
-  if (!key) return res.status(400).json({ error: `No API key configured for ${huntSettings.provider}` });
+  if (!key) return res.status(400).json({ error: `No API key configured for ${config.threathunt.provider}` });
 
   // SSE headers
   res.setHeader('Content-Type', 'text/event-stream');
@@ -142,14 +136,14 @@ router.post('/investigate-stream', async (req, res) => {
     sendEvent('metadata', {
       target,
       period: period || null,
-      provider: huntSettings.provider,
+      provider: config.threathunt.provider,
       intel,
       external,
       timestamp,
     });
 
     const prompt = buildInvestigationPrompt(target, intel, external, period || null);
-    const provider = huntSettings.provider;
+    const provider = config.threathunt.provider;
 
     switch (provider) {
       case 'anthropic':
@@ -175,10 +169,10 @@ router.post('/investigate-stream', async (req, res) => {
 });
 
 function getActiveKey() {
-  switch (huntSettings.provider) {
-    case 'anthropic': return huntSettings.anthropicKey;
-    case 'openai': return huntSettings.openaiKey;
-    case 'gemini': return huntSettings.geminiKey;
+  switch (config.threathunt.provider) {
+    case 'anthropic': return config.threathunt.anthropicKey;
+    case 'openai': return config.threathunt.openaiKey;
+    case 'gemini': return config.threathunt.geminiKey;
     default: return null;
   }
 }
@@ -811,7 +805,7 @@ function buildInvestigationPrompt(target, intel, external, period) {
 }
 
 async function callAI(prompt) {
-  const provider = huntSettings.provider;
+  const provider = config.threathunt.provider;
   const key = getActiveKey();
 
   switch (provider) {
