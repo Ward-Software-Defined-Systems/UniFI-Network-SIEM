@@ -5,16 +5,7 @@ import RefreshControls, { PausedIndicator } from '../shared/RefreshControls';
 import { getGeoEvents, getRecentGeoEvents } from '../../lib/api';
 import { formatNumber, formatDateTime, countryFlag } from '../../lib/format';
 import 'leaflet/dist/leaflet.css';
-
-function isPrivateIp(ip) {
-  if (!ip) return false;
-  return ip.startsWith('10.') ||
-    ip.startsWith('192.168.') ||
-    ip.startsWith('127.') ||
-    ip.startsWith('169.254.') ||
-    /^172\.(1[6-9]|2\d|3[01])\./.test(ip) ||
-    /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(ip);
-}
+import { isPrivateIp } from '../../lib/ip-utils';
 
 function getMarkerColor(event) {
   if (event.threats > 0 || event.abuseScore > 50) return '#ef4444'; // red

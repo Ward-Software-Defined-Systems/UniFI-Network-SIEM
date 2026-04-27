@@ -10,6 +10,7 @@ const path = require('path');
 const fs = require('fs');
 const StorageBackend = require('./interface');
 const logger = require('../../utils/logger');
+const { buildPrivateIpFilter } = require('../utils/private-ip-sql');
 
 class SqliteBackend extends StorageBackend {
   constructor(config = {}) {
@@ -675,16 +676,10 @@ class SqliteBackend extends StorageBackend {
   // --- Stats / Aggregation ---
 
   _privateIpFilter(col) {
-    return `${col} NOT LIKE '10.%'
-      AND ${col} NOT LIKE '192.168.%'
-      AND ${col} NOT LIKE '172.16.%' AND ${col} NOT LIKE '172.17.%' AND ${col} NOT LIKE '172.18.%' AND ${col} NOT LIKE '172.19.%'
-      AND ${col} NOT LIKE '172.2_.%' AND ${col} NOT LIKE '172.30.%' AND ${col} NOT LIKE '172.31.%'
-      AND ${col} NOT LIKE '100.64.%' AND ${col} NOT LIKE '100.65.%' AND ${col} NOT LIKE '100.66.%' AND ${col} NOT LIKE '100.67.%'
-      AND ${col} NOT LIKE '100.68.%' AND ${col} NOT LIKE '100.69.%' AND ${col} NOT LIKE '100.7_.%'
-      AND ${col} NOT LIKE '100.8_.%' AND ${col} NOT LIKE '100.9_.%' AND ${col} NOT LIKE '100.1__.%'
-      AND ${col} NOT LIKE '100.12_.%'
-      AND ${col} NOT LIKE '127.%'
-      AND ${col} NOT LIKE '169.254.%'`;
+    // Generated from the canonical isPrivateIp predicate. See
+    // src/db/utils/private-ip-sql.js — keeps SQL exclusions in sync with
+    // the JS isPrivateIp the other backends apply post-query.
+    return buildPrivateIpFilter(col);
   }
 
   async getOverviewStats(since) {

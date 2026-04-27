@@ -74,32 +74,44 @@ describe('isPrivateIp', () => {
     });
   });
 
-  describe('IPv6 (H5 — pending fix in Phase 3)', () => {
-    // The current implementation maps every non-IPv4 string to long=0, which
-    // then matches the all-zeros branch and returns true (private). For
-    // private-ish addresses (loopback, link-local, ULA) this is accidentally
-    // correct; for global IPv6 it is incorrect (silent classification as
-    // private → enrichment never runs). The skipped test below documents the
-    // bug and will be un-skipped once Phase 3 lands the IPv6 handling.
-
+  describe('IPv6 (Phase 4 / H5)', () => {
     it('IPv6 loopback ::1 is private', () => {
       expect(isPrivateIp('::1')).toBe(true);
     });
 
+    it('IPv6 unspecified :: is private', () => {
+      expect(isPrivateIp('::')).toBe(true);
+    });
+
     it('IPv6 link-local fe80::/10 is private', () => {
       expect(isPrivateIp('fe80::1')).toBe(true);
+      expect(isPrivateIp('febf::ffff')).toBe(true);
     });
 
     it('IPv6 ULA fc00::/7 is private', () => {
       expect(isPrivateIp('fc00::1')).toBe(true);
+      expect(isPrivateIp('fd12:3456::1')).toBe(true);
     });
 
-    it.skip('global IPv6 (2001:db8::1) is PUBLIC — currently broken (H5)', () => {
+    it('global IPv6 (2001:db8::1) is PUBLIC', () => {
       expect(isPrivateIp('2001:db8::1')).toBe(false);
     });
 
-    it.skip('IPv4-mapped IPv6 (::ffff:8.8.8.8) is PUBLIC — currently broken (H5)', () => {
+    it('IPv4-mapped IPv6 of a public IPv4 is PUBLIC', () => {
       expect(isPrivateIp('::ffff:8.8.8.8')).toBe(false);
+    });
+
+    it('IPv4-mapped IPv6 of a private IPv4 is private (delegates to IPv4 logic)', () => {
+      expect(isPrivateIp('::ffff:10.0.0.1')).toBe(true);
+      expect(isPrivateIp('::ffff:127.0.0.1')).toBe(true);
+    });
+
+    it('zone identifiers are stripped (fe80::1%eth0 still private)', () => {
+      expect(isPrivateIp('fe80::1%eth0')).toBe(true);
+    });
+
+    it('garbage with colons but non-hex chars falls back to defensive default (private)', () => {
+      expect(isPrivateIp('not:an:address')).toBe(true);
     });
   });
 });

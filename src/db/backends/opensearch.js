@@ -14,6 +14,7 @@
 const { Client } = require('@opensearch-project/opensearch');
 const StorageBackend = require('./interface');
 const logger = require('../../utils/logger');
+const { isPrivateIp } = require('../../utils/ip-utils');
 
 // --- Index Mappings ---
 
@@ -223,12 +224,9 @@ class OpenSearchBackend extends StorageBackend {
     return { range: { received_at: { gte: since } } };
   }
 
-  _isPrivateIp(ip) {
-    if (!ip || typeof ip !== 'string') return true;
-    // Reuse the authoritative check from ip-utils
-    const { isPrivateIp } = require('../../utils/ip-utils');
-    return isPrivateIp(ip);
-  }
+  // _isPrivateIp removed — call the authoritative isPrivateIp from
+  // utils/ip-utils directly (hoisted require at file top to avoid the
+  // per-call require lookup in hot paths).
 
   /** Validate that a string looks like an IP (v4 or v6). OpenSearch's ip type rejects bad values. */
   _isValidIp(val) {
@@ -884,7 +882,7 @@ class OpenSearchBackend extends StorageBackend {
         };
       });
 
-      if (excludePrivate) rows = rows.filter(r => !this._isPrivateIp(r.ip));
+      if (excludePrivate) rows = rows.filter(r => !isPrivateIp(r.ip));
       return rows.slice(0, limit);
     } catch (err) {
       logger.error({ err }, 'OpenSearch getTopTalkers failed');
@@ -940,7 +938,7 @@ class OpenSearchBackend extends StorageBackend {
         };
       });
 
-      if (excludePrivate) rows = rows.filter(r => !this._isPrivateIp(r.ip));
+      if (excludePrivate) rows = rows.filter(r => !isPrivateIp(r.ip));
       return rows.slice(0, limit);
     } catch (err) {
       logger.error({ err }, 'OpenSearch getTopBlocked failed');
