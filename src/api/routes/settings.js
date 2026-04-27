@@ -169,15 +169,26 @@ router.put('/', async (req, res) => {
 // Returns the schema + current values, with sensitive entries masked.
 // ---------------------------------------------------------------------------
 
-router.get('/v2', async (req, res) => {
-  try {
-    const entries = listEntries().map((entry) => {
-      const dottedPath = entry.key.split('.');
-      let value = config;
-      for (const p of dottedPath) {
-        if (value == null) break;
-        value = value[p];
-      }
+// Settings keys that are not user-mutable through the UI.
+// security.masterKey is the encryption key itself — rotating it requires
+// re-encrypting every sensitive row, which is a separate workflow.
+const UNMUTABLE_KEYS = new Set(['security.masterKey']);
+
+function readCurrentValue(entry) {
+  const parts = entry.key.split('.');
+  let cur = config;
+  for (const p of parts) {
+    if (cur == null) return undefined;
+    cur = cur[p];
+  }
+  return cur;
+}
+
+function buildSchemaResponse() {
+  const entries = listEntries()
+    .filter((e) => !e.hidden)
+    .map((entry) => {
+      const value = readCurrentValue(entry);
       const masked = entry.sensitivity === 'private' && typeof value === 'string' && value
         ? cryptoUtil.maskSensitive(value)
         : value;
@@ -193,18 +204,108 @@ router.get('/v2', async (req, res) => {
         sensitivity: entry.sensitivity || 'public',
         envVar: entry.envVar || null,
         requiresRestart: !!entry.requiresRestart,
+        readOnly: UNMUTABLE_KEYS.has(entry.key),
         value: masked,
         isSet,
       };
     });
 
-    res.json({
-      categories: CATEGORY_ORDER,
-      entries,
-    });
+  return { categories: CATEGORY_ORDER, entries };
+}
+
+router.get('/v2', async (req, res) => {
+  try {
+    res.json(buildSchemaResponse());
   } catch (err) {
     logger.error({ err }, 'GET /api/settings/v2 failed');
     res.status(500).json({ error: 'Failed to get settings schema' });
+  }
+});
+
+/**
+ * PUT /api/settings/v2 — body: { key, value }
+ * Sets a single schema-tracked setting. Sensitive values are encrypted at
+ * rest. Returns the refreshed schema so the UI can render the new state.
+ */
+router.put('/v2', async (req, res) => {
+  try {
+    const { key, value } = req.body || {};
+    if (typeof key !== 'string') {
+      return res.status(400).json({ error: 'key (string) is required' });
+    }
+    if (UNMUTABLE_KEYS.has(key)) {
+      return res.status(403).json({ error: `${key} cannot be modified via the API. Master-key rotation is a separate workflow.` });
+    }
+    const entry = SCHEMA.find((e) => e.key === key);
+    if (!entry) {
+      return res.status(404).json({ error: `Unknown setting: ${key}` });
+    }
+
+    // Type validation
+    if (entry.type === 'number' && value !== '' && !Number.isFinite(Number(value))) {
+      return res.status(400).json({ error: `value must be a number for ${key}` });
+    }
+
+    await persistSetting(entry, value);
+    res.json({ ok: true, schema: buildSchemaResponse() });
+  } catch (err) {
+    logger.error({ err, key: req.body?.key }, 'PUT /api/settings/v2 failed');
+    res.status(500).json({ error: 'Failed to save setting' });
+  }
+});
+
+/**
+ * POST /api/settings/v2/reset — body: { key }
+ * Resets a setting to its default by deleting the DB row and reloading
+ * the value from .env/default. (Avoids HTTP DELETE-with-body for proxy
+ * compatibility.)
+ */
+router.post('/v2/reset', async (req, res) => {
+  try {
+    const { key } = req.body || {};
+    if (typeof key !== 'string') {
+      return res.status(400).json({ error: 'key (string) is required' });
+    }
+    if (UNMUTABLE_KEYS.has(key)) {
+      return res.status(403).json({ error: `${key} cannot be reset via the API.` });
+    }
+    const entry = SCHEMA.find((e) => e.key === key);
+    if (!entry) {
+      return res.status(404).json({ error: `Unknown setting: ${key}` });
+    }
+
+    const settingsBackend = storage.getSettingsBackend();
+    const dbKey = entry.legacyKey || entry.key;
+    // Best-effort delete: most backends don't expose a delete primitive,
+    // so we set to empty string which is treated as "not set" by the
+    // overlay logic, falling back to .env/default.
+    await settingsBackend.setSetting(dbKey, '');
+    config.applySettingChange(entry.key, entry.default);
+
+    res.json({ ok: true, schema: buildSchemaResponse() });
+  } catch (err) {
+    logger.error({ err, key: req.body?.key }, 'POST /api/settings/v2/reset failed');
+    res.status(500).json({ error: 'Failed to reset setting' });
+  }
+});
+
+/**
+ * POST /api/settings/v2/regenerate-token
+ * Generates a new auth.apiToken, encrypts it, persists it, and returns
+ * the plaintext value ONCE so the operator can copy it. Subsequent GETs
+ * will mask the value.
+ */
+router.post('/v2/regenerate-token', async (req, res) => {
+  try {
+    const newToken = cryptoUtil.generateApiToken();
+    const settingsBackend = storage.getSettingsBackend();
+    await settingsBackend.setSetting('auth.apiToken', cryptoUtil.encrypt(newToken));
+    config.applySettingChange('auth.apiToken', newToken);
+    logger.warn('API token rotated via /api/settings/v2/regenerate-token');
+    res.json({ ok: true, token: newToken });
+  } catch (err) {
+    logger.error({ err }, 'POST /api/settings/v2/regenerate-token failed');
+    res.status(500).json({ error: 'Failed to regenerate token' });
   }
 });
 

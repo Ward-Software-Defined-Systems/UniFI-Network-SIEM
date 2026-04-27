@@ -1,12 +1,10 @@
 import React, { useState, useEffect } from 'react';
 import { getHealth, fetchApi } from '../lib/api';
 import { CheckCircle, XCircle, Database, Server, Zap, ExternalLink } from 'lucide-react';
+import SchemaSettings from './settings/SchemaSettings';
 
 export default function Settings({ setRebuilding }) {
   const [health, setHealth] = useState(null);
-  const [abuseKey, setAbuseKey] = useState('');
-  const [hasExistingKey, setHasExistingKey] = useState(false);
-  const [saved, setSaved] = useState(false);
   const [confirmReset, setConfirmReset] = useState(false);
   const [resetDone, setResetDone] = useState(false);
   const [dbEngines, setDbEngines] = useState(null);
@@ -17,10 +15,6 @@ export default function Settings({ setRebuilding }) {
 
   useEffect(() => {
     getHealth().then(setHealth).catch(() => {});
-    // Load existing settings
-    fetchApi('/api/settings').then((s) => {
-      if (s.abuseIpDbKey) setHasExistingKey(true);
-    }).catch(() => {});
     // Load database engine info
     fetchApi('/api/settings/database-engines').then((data) => {
       setDbEngines(data);
@@ -42,22 +36,6 @@ export default function Settings({ setRebuilding }) {
       }
     }).catch(() => {});
   }, []);
-
-  const handleSaveAbuseKey = async () => {
-    try {
-      await fetch('/api/settings', {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ abuseIpDbKey: abuseKey }),
-      });
-      setSaved(true);
-      // Refresh health to show updated status
-      setTimeout(() => {
-        getHealth().then(setHealth).catch(() => {});
-        setSaved(false);
-      }, 2000);
-    } catch {}
-  };
 
   const enrichment = health?.enrichment || {};
 
@@ -263,29 +241,9 @@ export default function Settings({ setRebuilding }) {
         </ol>
       </div>
 
-      {/* AbuseIPDB Setup */}
-      <div className="bg-gray-900 border border-gray-800 rounded-lg p-5 space-y-3">
-        <h3 className="text-sm font-medium text-gray-300">AbuseIPDB API Key</h3>
-        <p className="text-xs text-gray-500">
-          Get a free API key (1,000 checks/day) at abuseipdb.com. Save it here or set <code className="text-gray-400">ABUSEIPDB_API_KEY</code> in <code className="text-gray-400">.env</code>. Takes effect immediately — no restart required.
-        </p>
-        <div className="flex gap-2">
-          <input
-            type="password"
-            value={abuseKey}
-            onChange={(e) => setAbuseKey(e.target.value)}
-            placeholder={hasExistingKey ? 'Key saved — enter new key to replace' : 'Enter API key'}
-            className="flex-1 px-3 py-2 text-sm bg-gray-800 border border-gray-700 rounded text-gray-200 placeholder-gray-500 focus:outline-none focus:border-blue-500"
-          />
-          <button
-            onClick={handleSaveAbuseKey}
-            className="px-4 py-2 text-sm bg-blue-600 text-white rounded hover:bg-blue-500 transition-colors"
-          >
-            Save
-          </button>
-        </div>
-        {saved && <p className="text-xs text-green-400">Saved! AbuseIPDB enrichment is now active.</p>}
-      </div>
+      {/* All schema-tracked operator settings (AbuseIPDB key, RDNS toggle,
+          performance tunables, WardSONDB/OpenSearch config, auth token, etc.) */}
+      <SchemaSettings />
 
       {/* System Info */}
       {health && (
