@@ -1714,6 +1714,13 @@ class WardsonDbBackend extends StorageBackend {
     return events;
   }
 
+  // --- Threat Hunt ---
+
+  async gatherHuntIntel(target, since) {
+    const { gatherHuntIntel } = require('../../threat-hunt/intel/wardsondb');
+    return gatherHuntIntel(this, target, since);
+  }
+
   // --- Enrichment Cache ---
   // Note: the plural getAllCachedEnrichments() (no callers anywhere in
   // the repo) was removed as part of L6 in Phase 7. Use the singular

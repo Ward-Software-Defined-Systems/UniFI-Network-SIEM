@@ -125,6 +125,18 @@ class StorageBackend {
     throw new Error(`${this.name}: getRecentGeoEvents() not implemented`);
   }
 
+  // --- Threat Hunt ---
+
+  /**
+   * Gather local intel for a threat-hunt target. Returns the canonical shape:
+   *   { cached, totalEvents, byAction, byType, topPorts, topSrcPorts, timeline,
+   *     firstSeen, lastSeen, relatedIPs, signatures, targetsHit, topDestinations,
+   *     topSources }
+   */
+  async gatherHuntIntel(target, since) {
+    throw new Error(`${this.name}: gatherHuntIntel() not implemented`);
+  }
+
   // --- Enrichment Cache ---
 
   /** Get cached enrichment for an IP. Returns cache row or null. */

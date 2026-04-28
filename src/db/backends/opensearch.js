@@ -1318,6 +1318,13 @@ class OpenSearchBackend extends StorageBackend {
     }
   }
 
+  // --- Threat Hunt ---
+
+  async gatherHuntIntel(target, since) {
+    const { gatherHuntIntel } = require('../../threat-hunt/intel/opensearch');
+    return gatherHuntIntel(this, target, since);
+  }
+
   // --- Enrichment Cache ---
 
   /** Batch lookup cache entries by IP using mget */

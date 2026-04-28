@@ -862,6 +862,13 @@ class SqliteBackend extends StorageBackend {
     `, [limit]);
   }
 
+  // --- Threat Hunt ---
+
+  async gatherHuntIntel(target, since) {
+    const { gatherHuntIntel } = require('../../threat-hunt/intel/sqlite');
+    return gatherHuntIntel(this, target, since);
+  }
+
   // --- Enrichment Cache ---
 
   async getCachedEnrichment(ip) {
