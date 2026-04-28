@@ -1,6 +1,14 @@
 const config = require('../../config');
 const { parseSSEStream } = require('../../utils/sse');
 const { throwSanitizedProviderError } = require('./util');
+const { buildSystemPrompt } = require('../prompt');
+
+// H2: pass the threat-hunt system prompt as a separate `role: 'system'`
+// message so it's not co-mingled with attacker-influenced data in the
+// user prompt body.
+function huntSystemMessage() {
+  return { role: 'system', content: buildSystemPrompt() };
+}
 
 async function invoke(prompt, key) {
   const res = await fetch('https://api.openai.com/v1/chat/completions', {
@@ -12,7 +20,7 @@ async function invoke(prompt, key) {
     body: JSON.stringify({
       model: config.threathunt.openaiModel,
       max_tokens: config.threathunt.openaiMaxTokens,
-      messages: [{ role: 'user', content: prompt }],
+      messages: [huntSystemMessage(), { role: 'user', content: prompt }],
     }),
   });
 
@@ -33,7 +41,7 @@ async function stream(prompt, key, sendEvent, signal) {
       model: config.threathunt.openaiModel,
       max_tokens: config.threathunt.openaiMaxTokens,
       stream: true,
-      messages: [{ role: 'user', content: prompt }],
+      messages: [huntSystemMessage(), { role: 'user', content: prompt }],
     }),
     signal,
   });

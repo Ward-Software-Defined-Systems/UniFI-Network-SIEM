@@ -247,8 +247,13 @@ async function gatherHuntIntel(backend, target, since) {
   let relatedIPs = [];
   try {
     const subnet = target.split('.').slice(0, 3).join('.');
+    // H3: full regex-metacharacter escape (not just dots) so a pathological
+    // `target` like `1.2.3$.4` can't smuggle anchors / quantifiers into the
+    // server-side regex. Matches the NEW-C1 escape in
+    // src/db/backends/wardsondb.js:_buildFilter for free-text search.
+    const escapedSubnet = subnet.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const subnetCacheResult = await post(`/${cacheCol}/query`, {
-      filter: { ip: { '$regex': `^${subnet.replace(/\./g, '\\.')}\\.` }, is_private: false },
+      filter: { ip: { '$regex': `^${escapedSubnet}\\.` }, is_private: false },
       limit: 100,
     });
     relatedIPs = (subnetCacheResult.data || [])

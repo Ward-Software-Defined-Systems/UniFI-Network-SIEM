@@ -1,6 +1,17 @@
 const config = require('../../config');
 const { parseSSEStream } = require('../../utils/sse');
 const { throwSanitizedProviderError } = require('./util');
+const { buildSystemPrompt } = require('../prompt');
+
+// H2: pass the threat-hunt system prompt as Anthropic's `system`
+// parameter rather than mixing it into the user message. Anthropic
+// gives system messages elevated trust over user content — keeping
+// the "treat <untrusted> as data" instruction here means the model
+// is less likely to be talked out of it by hostile content in the
+// user prompt body.
+function huntSystemPrompt() {
+  return buildSystemPrompt();
+}
 
 async function invoke(prompt, key) {
   const res = await fetch('https://api.anthropic.com/v1/messages', {
@@ -14,6 +25,7 @@ async function invoke(prompt, key) {
       model: config.threathunt.anthropicModel,
       max_tokens: config.threathunt.anthropicMaxTokens,
       thinking: { type: 'adaptive', display: 'summarized' },
+      system: huntSystemPrompt(),
       messages: [{ role: 'user', content: prompt }],
     }),
   });
@@ -38,6 +50,7 @@ async function stream(prompt, key, sendEvent, signal) {
       model: config.threathunt.anthropicModel,
       max_tokens: config.threathunt.anthropicMaxTokens,
       thinking: { type: 'adaptive', display: 'summarized' },
+      system: huntSystemPrompt(),
       stream: true,
       messages: [{ role: 'user', content: prompt }],
     }),
