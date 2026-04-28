@@ -11,6 +11,7 @@ const fs = require('fs');
 const StorageBackend = require('./interface');
 const logger = require('../../utils/logger');
 const { buildPrivateIpFilter } = require('../utils/private-ip-sql');
+const { accumulateRollups } = require('../rollups');
 
 class SqliteBackend extends StorageBackend {
   constructor(config = {}) {
@@ -480,91 +481,25 @@ class SqliteBackend extends StorageBackend {
   }
 
   _updateRollups(events) {
-    const nowMs = Date.now();
+    // Aggregate the batch via the shared pure function, then UPSERT each
+    // resulting row. Keeps SQLite + WardSONDB rollups in lockstep — the
+    // shared math lives in src/db/rollups.js.
+    const r = accumulateRollups(events);
 
-    // Pre-aggregate batch in JS, keyed by per-event bucket
-    const eventCounts = new Map();  // key: bucket5m|event_type|action → count
-    const ipCounts = new Map();     // key: bucket1h|ip|direction → { event, blocked, threat }
-    const portCounts = new Map();   // key: bucket1h|port|protocol → count
-    const sigCounts = new Map();    // key: bucket1h|signature|classification → count
-    const clientCounts = new Map(); // key: bucket1h|mac → { event, wifi, dhcp, firewall }
-
-    for (const evt of events) {
-      // Use event's received_at for bucket, fall back to now
-      const evtMs = evt.received_at ? new Date(evt.received_at).getTime() : nowMs;
-      const b5m = new Date(Math.floor(evtMs / 300000) * 300000).toISOString();
-      const b1h = new Date(Math.floor(evtMs / 3600000) * 3600000).toISOString();
-
-      const type = evt.event_type || 'unknown';
-      const action = evt.action || '';
-
-      // event_stats_5m
-      const ek = `${b5m}|${type}|${action}`;
-      eventCounts.set(ek, (eventCounts.get(ek) || 0) + 1);
-
-      // ip_stats_hourly
-      const isBlocked = action === 'block' ? 1 : 0;
-      const isThreat = type === 'threat' ? 1 : 0;
-      if (evt.src_ip) {
-        const sk = `${b1h}|${evt.src_ip}|src`;
-        const s = ipCounts.get(sk) || { event: 0, blocked: 0, threat: 0 };
-        s.event++; s.blocked += isBlocked; s.threat += isThreat;
-        ipCounts.set(sk, s);
-      }
-      if (evt.dst_ip) {
-        const dk = `${b1h}|${evt.dst_ip}|dst`;
-        const d = ipCounts.get(dk) || { event: 0, blocked: 0, threat: 0 };
-        d.event++; d.blocked += isBlocked; d.threat += isThreat;
-        ipCounts.set(dk, d);
-      }
-
-      // port_stats_hourly
-      if (evt.dst_port) {
-        const pk = `${b1h}|${evt.dst_port}|${evt.protocol || ''}`;
-        portCounts.set(pk, (portCounts.get(pk) || 0) + 1);
-      }
-
-      // sig_stats_hourly — include all threats, fallback signature for missing
-      if (type === 'threat') {
-        const sig = evt.ids_signature || '(no signature)';
-        const cls = evt.ids_classification || '';
-        const sigk = `${b1h}|${sig}|${cls}`;
-        sigCounts.set(sigk, (sigCounts.get(sigk) || 0) + 1);
-      }
-
-      // client_stats_hourly
-      const mac = evt.client_mac || evt.wifi_client_mac || evt.dhcp_mac;
-      if (mac) {
-        const ck = `${b1h}|${mac}`;
-        const c = clientCounts.get(ck) || { event: 0, wifi: 0, dhcp: 0, firewall: 0 };
-        c.event++;
-        if (type === 'wifi') c.wifi++;
-        if (type === 'dhcp') c.dhcp++;
-        if (type === 'firewall') c.firewall++;
-        clientCounts.set(ck, c);
-      }
+    for (const v of r.fiveMin.values()) {
+      this._rollupEventStats.run(v.bucket, v.event_type, v.action, v.count);
     }
-
-    // UPSERT aggregated counts
-    for (const [key, count] of eventCounts) {
-      const [bucket, type, action] = key.split('|');
-      this._rollupEventStats.run(bucket, type, action, count);
+    for (const v of r.ipHourly.values()) {
+      this._rollupIpStats.run(v.bucket, v.ip, v.direction, v.event_count, v.blocked_count, v.threat_count);
     }
-    for (const [key, counts] of ipCounts) {
-      const [bucket, ip, dir] = key.split('|');
-      this._rollupIpStats.run(bucket, ip, dir, counts.event, counts.blocked, counts.threat);
+    for (const v of r.portHourly.values()) {
+      this._rollupPortStats.run(v.bucket, parseInt(v.port, 10), v.protocol, v.count);
     }
-    for (const [key, count] of portCounts) {
-      const [bucket, port, protocol] = key.split('|');
-      this._rollupPortStats.run(bucket, parseInt(port, 10), protocol, count);
+    for (const v of r.sigHourly.values()) {
+      this._rollupSigStats.run(v.bucket, v.signature, v.classification, v.count);
     }
-    for (const [key, count] of sigCounts) {
-      const [bucket, sig, cls] = key.split('|');
-      this._rollupSigStats.run(bucket, sig, cls, count);
-    }
-    for (const [key, counts] of clientCounts) {
-      const [bucket, mac] = key.split('|');
-      this._rollupClientStats.run(bucket, mac, counts.event, counts.wifi, counts.dhcp, counts.firewall);
+    for (const v of r.clientHourly.values()) {
+      this._rollupClientStats.run(v.bucket, v.mac, v.event_count, v.wifi_count, v.dhcp_count, v.firewall_count);
     }
   }
 

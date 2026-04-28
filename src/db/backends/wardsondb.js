@@ -16,6 +16,7 @@
 const StorageBackend = require('./interface');
 const logger = require('../../utils/logger');
 const { isPrivateIp } = require('../../utils/ip-utils');
+const { accumulateRollups, mergeRollups, newRollupBuffers, align5m, align1h } = require('../rollups');
 // Use undici's own fetch (not Node's globalThis.fetch) so the per-client Agent
 // we construct from the same undici package has a matching request-handler
 // interface. Mixing Node's bundled undici with a standalone-undici Agent
@@ -166,17 +167,11 @@ class WardsonDbBackend extends StorageBackend {
   async _patch(path, body) { return this._request('PATCH', path, body); }
   async _delete(path) { return this._request('DELETE', path); }
 
-  // --- Bucket alignment (mirrors sqlite.js:494-495) ---
-
-  _align5m(iso) {
-    const ms = (iso ? new Date(iso) : new Date()).getTime();
-    return new Date(Math.floor(ms / 300000) * 300000).toISOString();
-  }
-
-  _align1h(iso) {
-    const ms = (iso ? new Date(iso) : new Date()).getTime();
-    return new Date(Math.floor(ms / 3600000) * 3600000).toISOString();
-  }
+  // Bucket alignment kept as instance methods for backward compatibility
+  // with internal callers; both delegate to the shared helpers in
+  // src/db/rollups.js so SQLite and WardSONDB stay in lockstep.
+  _align5m(iso) { return align5m(iso); }
+  _align1h(iso) { return align1h(iso); }
 
   // --- Partition helpers ---
 
@@ -266,112 +261,19 @@ class WardsonDbBackend extends StorageBackend {
   // --- Rollup buffers ---
 
   _newBuffers() {
-    return {
-      fiveMin: new Map(),     // key -> { bucket, event_type, action, count }
-      ipHourly: new Map(),    // key -> { bucket, ip, direction, event_count, blocked_count, threat_count }
-      portHourly: new Map(),  // key -> { bucket, port, protocol, count }
-      sigHourly: new Map(),   // key -> { bucket, signature, classification, count }
-      clientHourly: new Map(),// key -> { bucket, mac, event_count, wifi_count, dhcp_count, firewall_count }
-    };
+    return newRollupBuffers();
   }
 
   /**
-   * Accumulate rollup deltas in memory. Mirrors sqlite.js:481-568 _updateRollups.
-   * Private IPs are NOT filtered at write time — they're filtered at query time
-   * when callers pass excludePrivate (matches SQLite's HAVING-style semantics).
+   * Accumulate rollup deltas into the persistent in-memory buffer that
+   * the 5-second flush worker drains. Pure aggregation lives in
+   * src/db/rollups.js — this method is just the buffer-merge wrapper.
+   * Private IPs are NOT filtered at write time — they're filtered at
+   * query time when callers pass excludePrivate (matches SQLite's
+   * HAVING-style semantics).
    */
   _accumulateRollups(events) {
-    const bufs = this._rollupBuffers;
-    const now = Date.now();
-
-    for (const evt of events) {
-      const ms = evt.received_at ? new Date(evt.received_at).getTime() : now;
-      if (!Number.isFinite(ms)) continue;
-      const b5 = new Date(Math.floor(ms / 300000) * 300000).toISOString();
-      const b1 = new Date(Math.floor(ms / 3600000) * 3600000).toISOString();
-      const type = evt.event_type || 'unknown';
-      const action = evt.action || '';
-      const isBlocked = action === 'block' ? 1 : 0;
-      const isThreat = type === 'threat' ? 1 : 0;
-
-      // rollups-5m — every event
-      {
-        const key = `${b5}|${type}|${action}`;
-        const ex = bufs.fiveMin.get(key);
-        if (ex) ex.count++;
-        else bufs.fiveMin.set(key, { bucket: b5, event_type: type, action, count: 1 });
-      }
-
-      // rollups-ip-hourly — both directions, all IPs (filter at query time)
-      if (evt.src_ip) {
-        const key = `${b1}|${evt.src_ip}|src`;
-        const ex = bufs.ipHourly.get(key);
-        if (ex) {
-          ex.event_count++;
-          ex.blocked_count += isBlocked;
-          ex.threat_count += isThreat;
-        } else {
-          bufs.ipHourly.set(key, {
-            bucket: b1, ip: evt.src_ip, direction: 'src',
-            event_count: 1, blocked_count: isBlocked, threat_count: isThreat,
-          });
-        }
-      }
-      if (evt.dst_ip) {
-        const key = `${b1}|${evt.dst_ip}|dst`;
-        const ex = bufs.ipHourly.get(key);
-        if (ex) {
-          ex.event_count++;
-          ex.blocked_count += isBlocked;
-          ex.threat_count += isThreat;
-        } else {
-          bufs.ipHourly.set(key, {
-            bucket: b1, ip: evt.dst_ip, direction: 'dst',
-            event_count: 1, blocked_count: isBlocked, threat_count: isThreat,
-          });
-        }
-      }
-
-      // rollups-port-hourly — every event with dst_port (mirrors sqlite.js:521-524)
-      if (evt.dst_port != null) {
-        const protocol = evt.protocol || '';
-        const key = `${b1}|${evt.dst_port}|${protocol}`;
-        const ex = bufs.portHourly.get(key);
-        if (ex) ex.count++;
-        else bufs.portHourly.set(key, { bucket: b1, port: evt.dst_port, protocol, count: 1 });
-      }
-
-      // rollups-sig-hourly — threat events only, '(no signature)' fallback
-      if (type === 'threat') {
-        const sig = evt.ids_signature || '(no signature)';
-        const cls = evt.ids_classification || '';
-        const key = `${b1}|${sig}|${cls}`;
-        const ex = bufs.sigHourly.get(key);
-        if (ex) ex.count++;
-        else bufs.sigHourly.set(key, { bucket: b1, signature: sig, classification: cls, count: 1 });
-      }
-
-      // rollups-client-hourly — first-non-null MAC, pre-pivoted by event type
-      const mac = evt.client_mac || evt.wifi_client_mac || evt.dhcp_mac;
-      if (mac) {
-        const key = `${b1}|${mac}`;
-        const ex = bufs.clientHourly.get(key);
-        if (ex) {
-          ex.event_count++;
-          if (type === 'wifi') ex.wifi_count++;
-          else if (type === 'dhcp') ex.dhcp_count++;
-          else if (type === 'firewall') ex.firewall_count++;
-        } else {
-          bufs.clientHourly.set(key, {
-            bucket: b1, mac,
-            event_count: 1,
-            wifi_count: type === 'wifi' ? 1 : 0,
-            dhcp_count: type === 'dhcp' ? 1 : 0,
-            firewall_count: type === 'firewall' ? 1 : 0,
-          });
-        }
-      }
-    }
+    mergeRollups(this._rollupBuffers, accumulateRollups(events));
   }
 
   // --- Rollup flush ---
