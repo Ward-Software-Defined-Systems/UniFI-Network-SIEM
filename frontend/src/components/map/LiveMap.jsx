@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { MapContainer, TileLayer, CircleMarker, Polyline, Popup, useMap } from 'react-leaflet';
 import PeriodSelector from '../shared/PeriodSelector';
 import RefreshControls, { PausedIndicator } from '../shared/RefreshControls';
@@ -100,25 +100,33 @@ export default function LiveMap({ period, setPeriod, refreshRate, setRefreshRate
   const [loading, setLoading] = useState(false);
   const fetchRef = useRef(null);
 
-  const doFetch = useCallback(() => {
-    setLoading(true);
-    Promise.all([
-      getGeoEvents(period, 1000),
-      getRecentGeoEvents(50),
-    ]).then(([geo, recent]) => {
-      setGeoEvents(geo);
-      setRecentEvents(recent);
-    }).catch(() => {}).finally(() => setLoading(false));
-  }, [period]);
-
-  useEffect(() => { fetchRef.current = doFetch; }, [doFetch]);
-
   useEffect(() => {
+    let cancelled = false;
+
+    const doFetch = () => {
+      if (cancelled) return;
+      setLoading(true);
+      Promise.all([
+        getGeoEvents(period, 1000),
+        getRecentGeoEvents(50),
+      ]).then(([geo, recent]) => {
+        if (cancelled) return;
+        setGeoEvents(geo);
+        setRecentEvents(recent);
+      }).catch(() => {}).finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    };
+
+    fetchRef.current = doFetch;
     doFetch();
-    if (paused) return;
-    const interval = setInterval(() => fetchRef.current?.(), refreshRate);
-    return () => clearInterval(interval);
-  }, [doFetch, refreshRate, paused]);
+    if (paused) return () => { cancelled = true; };
+    const interval = setInterval(doFetch, refreshRate);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [period, refreshRate, paused]);
 
   const filteredEvents = geoEvents.filter(e => !isPrivateIp(e.ip));
   const hasData = filteredEvents.length > 0;

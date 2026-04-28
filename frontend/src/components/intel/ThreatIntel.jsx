@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { ChevronUp, ChevronDown } from 'lucide-react';
 import PeriodSelector from '../shared/PeriodSelector';
 import RefreshControls, { PausedIndicator } from '../shared/RefreshControls';
@@ -70,21 +70,28 @@ export default function ThreatIntel({ period, setPeriod, refreshRate, setRefresh
   const [loading, setLoading] = useState(false);
   const fetchRef = useRef(null);
 
-  const doFetch = useCallback(() => {
-    setLoading(true);
-    getThreatIntel(period, 200).then(d => {
-      setData(d);
-    }).catch(() => {}).finally(() => setLoading(false));
-  }, [period]);
-
-  useEffect(() => { fetchRef.current = doFetch; }, [doFetch]);
-
   useEffect(() => {
+    let cancelled = false;
+
+    const doFetch = () => {
+      if (cancelled) return;
+      setLoading(true);
+      getThreatIntel(period, 200).then(d => {
+        if (!cancelled) setData(d);
+      }).catch(() => {}).finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    };
+
+    fetchRef.current = doFetch;
     doFetch();
-    if (paused) return;
-    const interval = setInterval(() => fetchRef.current?.(), refreshRate);
-    return () => clearInterval(interval);
-  }, [doFetch, refreshRate, paused]);
+    if (paused) return () => { cancelled = true; };
+    const interval = setInterval(doFetch, refreshRate);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [period, refreshRate, paused]);
 
   const handleSort = (field) => {
     if (sortField === field) {

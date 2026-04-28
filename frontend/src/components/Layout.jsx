@@ -26,7 +26,9 @@ export default function Layout({ activeView, onViewChange, rebuilding: appRebuil
   }, [showRebuilding]);
 
   useEffect(() => {
+    let cancelled = false;
     const fetchHealth = () => getHealth().then((h) => {
+      if (cancelled) return;
       setHealth(h);
       // Track when server confirms rebuild mode before allowing clear
       if (h.rebuilding) {
@@ -39,7 +41,10 @@ export default function Layout({ activeView, onViewChange, rebuilding: appRebuil
     }).catch(() => {});
     fetchHealth();
     const interval = setInterval(fetchHealth, 10000);
-    return () => clearInterval(interval);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
   }, []);
 
   return (

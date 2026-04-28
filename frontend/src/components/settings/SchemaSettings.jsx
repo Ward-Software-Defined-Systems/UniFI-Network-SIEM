@@ -22,19 +22,26 @@ export default function SchemaSettings() {
   const [data, setData] = useState(null);   // { categories, entries }
   const [error, setError] = useState(null);
 
-  const reload = useCallback(async () => {
+  const reload = useCallback(async (cancelledRef) => {
     try {
       const res = await fetch('/api/settings/v2');
+      if (cancelledRef?.current) return;
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const body = await res.json();
+      if (cancelledRef?.current) return;
       setData(body);
       setError(null);
     } catch (err) {
+      if (cancelledRef?.current) return;
       setError(err.message || 'Failed to load settings');
     }
   }, []);
 
-  useEffect(() => { reload(); }, [reload]);
+  useEffect(() => {
+    const cancelledRef = { current: false };
+    reload(cancelledRef);
+    return () => { cancelledRef.current = true; };
+  }, [reload]);
 
   if (error) {
     return (

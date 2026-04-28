@@ -42,9 +42,11 @@ export default function ThreatHunt({ period, setPeriod }) {
 
   // Load settings on mount
   useEffect(() => {
+    let cancelled = false;
     fetch('/api/threat-hunt/settings')
       .then(r => r.json())
       .then(data => {
+        if (cancelled) return;
         setSettings(data);
         // If no keys configured, open settings panel
         if (!data.hasAnthropicKey && !data.hasOpenaiKey && !data.hasGeminiKey) {
@@ -52,6 +54,7 @@ export default function ThreatHunt({ period, setPeriod }) {
         }
       })
       .catch(() => {});
+    return () => { cancelled = true; };
   }, []);
 
   const saveSettings = async () => {

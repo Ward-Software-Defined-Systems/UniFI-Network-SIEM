@@ -14,13 +14,13 @@ export default function Settings({ setRebuilding }) {
   const [engineSaveMsg, setEngineSaveMsg] = useState('');
 
   useEffect(() => {
-    getHealth().then(setHealth).catch(() => {});
-    // Load database engine info
+    let cancelled = false;
+    getHealth().then((h) => { if (!cancelled) setHealth(h); }).catch(() => {});
     fetchApi('/api/settings/database-engines').then((data) => {
+      if (cancelled) return;
       setDbEngines(data);
       const engine = data.activeEngine || 'sqlite';
       setSelectedEngine(engine);
-      // Merge saved config with defaults so all fields have values
       const saved = data.engineConfig || {};
       const activeBackend = data.backends.find(b => b.id === engine);
       if (activeBackend?.configFields) {
@@ -35,6 +35,7 @@ export default function Settings({ setRebuilding }) {
         setEngineConfig(saved);
       }
     }).catch(() => {});
+    return () => { cancelled = true; };
   }, []);
 
   const enrichment = health?.enrichment || {};
