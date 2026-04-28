@@ -116,7 +116,28 @@ function createSyslogServer(port, onEvent) {
   });
 
   server.bind(port, () => {
-    logger.info({ port }, 'Syslog UDP server listening');
+    // H8: bump SO_RCVBUF so the kernel doesn't silently drop UDP bursts
+    // at thousands of events/sec. The default ~256KB queue overflows
+    // when the parser briefly stalls (large transactions, GC pauses).
+    // Kernel may cap below the requested target — check net.core.rmem_max
+    // and bump if `actual < target`.
+    let recvBufferBytes = null;
+    try {
+      const target = config.network.syslogRecvBufferBytes;
+      if (target > 0) {
+        server.setRecvBufferSize(target);
+        recvBufferBytes = server.getRecvBufferSize();
+        if (recvBufferBytes < target) {
+          logger.warn(
+            { actual: recvBufferBytes, target },
+            'UDP recvBufferSize was capped by the kernel — raise net.core.rmem_max if you see drops under burst load',
+          );
+        }
+      }
+    } catch (err) {
+      logger.warn({ err: err.message }, 'Failed to set UDP recvBufferSize — using kernel default');
+    }
+    logger.info({ port, recvBufferBytes }, 'Syslog UDP server listening');
     // Pre-compute the allowlist and start the summary timers
     getAllowlist();
     startDropSummary();

@@ -154,6 +154,12 @@ class OpenSearchBackend extends StorageBackend {
     this.bulkSize = config.bulkSize || 50;
     this.docCount = null;
     this.ready = false;
+    // M6: set true while resetData is dropping/recreating indexes so
+    // stats methods short-circuit (mirrors WardSONDB's _isCollectionEmpty
+    // pattern). Without this, queries during the reset window can hit
+    // partially-deleted indexes and throw — and the rebuilding banner
+    // wouldn't appear until the next health poll catches up.
+    this._rebuilding = false;
   }
 
   static get metadata() {
@@ -217,6 +223,10 @@ class OpenSearchBackend extends StorageBackend {
   // --- Private Helpers ---
 
   _isCollectionEmpty() {
+    // M6: treat the reset window as "no data yet" so stats endpoints
+    // return empty payloads instead of trying to query indexes that
+    // are mid-recreate.
+    if (this._rebuilding) return true;
     return this.docCount === 0;
   }
 
@@ -1452,10 +1462,15 @@ class OpenSearchBackend extends StorageBackend {
 
       // Yellow is expected for single-node (replicas can't be assigned)
       const ok = clusterStatus !== 'red';
+      // M6: surface the reset-window rebuild as write_pressure: high so
+      // the dashboard banner appears immediately (rather than waiting
+      // for the next ingestion-driven write_pressure observation).
+      const writePressure = (this._rebuilding || clusterStatus === 'red') ? 'high' : 'normal';
 
       return {
         ok,
-        writePressure: clusterStatus === 'red' ? 'high' : 'normal',
+        writePressure,
+        rebuilding: this._rebuilding,
         details: {
           backend: 'opensearch',
           clusterStatus,
@@ -1504,20 +1519,28 @@ class OpenSearchBackend extends StorageBackend {
   }
 
   async resetData() {
-    // Delete and recreate both indexes
+    // M6: flag the rebuild window so stats methods short-circuit and
+    // healthCheck reports rebuilding. Cleared in the finally block —
+    // even on failure, leaving the flag stuck would silently break
+    // the dashboard.
+    this._rebuilding = true;
     try {
-      await this.client.indices.delete({
-        index: [this.eventsIndex, this.cacheIndex],
-        ignore_unavailable: true,
-      });
-    } catch {
-      // Indexes may not exist
-    }
+      try {
+        await this.client.indices.delete({
+          index: [this.eventsIndex, this.cacheIndex],
+          ignore_unavailable: true,
+        });
+      } catch {
+        // Indexes may not exist
+      }
 
-    await this._ensureIndex(this.eventsIndex, EVENTS_MAPPING);
-    await this._ensureIndex(this.cacheIndex, CACHE_MAPPING);
-    this.docCount = 0;
-    this.indexesReady = Promise.resolve();
+      await this._ensureIndex(this.eventsIndex, EVENTS_MAPPING);
+      await this._ensureIndex(this.cacheIndex, CACHE_MAPPING);
+      this.docCount = 0;
+      this.indexesReady = Promise.resolve();
+    } finally {
+      this._rebuilding = false;
+    }
   }
 
   // --- Settings (delegated to SQLite by storage manager) ---

@@ -37,11 +37,13 @@ function parseFirewall(message, header) {
   const descrMatch = message.match(DESCR_RE);
   const ruleDescription = descrMatch ? descrMatch[1] : null;
 
-  // Extract key=value pairs
+  // Extract key=value pairs. Use matchAll instead of exec/lastIndex —
+  // exec mutates the global regex's lastIndex, so an exception thrown
+  // mid-loop would leave it at a stale offset and break the next call.
+  // matchAll is stateless. (L10)
   const fields = {};
-  let kvMatch;
-  while ((kvMatch = KV_RE.exec(message)) !== null) {
-    fields[kvMatch[1]] = kvMatch[2];
+  for (const m of message.matchAll(KV_RE)) {
+    fields[m[1]] = m[2];
   }
 
   // Extract TCP flags

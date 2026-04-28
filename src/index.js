@@ -278,7 +278,7 @@ async function main() {
   // Graceful shutdown
   const shutdown = async () => {
     logger.info('Shutting down...');
-    shutdownWorker();
+    await shutdownWorker();
     await flushQueue();
     clearInterval(retentionInterval);
     clearInterval(statsInterval);

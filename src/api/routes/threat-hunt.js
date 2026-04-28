@@ -122,7 +122,28 @@ router.post('/investigate-stream', async (req, res) => {
   res.setHeader('Connection', 'keep-alive');
   res.flushHeaders();
 
+  // M13: disable per-request and per-socket timeouts on the SSE stream.
+  // Long Threat Hunt streams (128K tokens + adaptive thinking) routinely
+  // exceed the global server.timeout (5min default). Without this the
+  // SSE socket gets killed mid-analysis by the HTTPS layer.
+  req.setTimeout(0);
+  res.setTimeout(0);
+
+  // H13: client-disconnect cancellation. If the operator closes the
+  // dashboard tab mid-hunt, abort the upstream LLM fetch instead of
+  // letting it stream into the void (wasted tokens, wasted bandwidth,
+  // memory bloat in the buffered SSE reader).
+  const controller = new AbortController();
+  let aborted = false;
+  req.on('close', () => {
+    if (!res.writableEnded) {
+      aborted = true;
+      controller.abort();
+    }
+  });
+
   const sendEvent = (event, data) => {
+    if (aborted || res.writableEnded) return;
     res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
   };
 
@@ -147,24 +168,29 @@ router.post('/investigate-stream', async (req, res) => {
 
     switch (provider) {
       case 'anthropic':
-        await callAnthropicStream(prompt, key, sendEvent);
+        await callAnthropicStream(prompt, key, sendEvent, controller.signal);
         break;
       case 'openai':
-        await callOpenAIStream(prompt, key, sendEvent);
+        await callOpenAIStream(prompt, key, sendEvent, controller.signal);
         break;
       case 'gemini':
-        await callGeminiStream(prompt, key, sendEvent);
+        await callGeminiStream(prompt, key, sendEvent, controller.signal);
         break;
       default:
         sendEvent('error', { error: `Unknown provider: ${provider}` });
     }
 
     sendEvent('done', {});
-    res.end();
+    if (!res.writableEnded) res.end();
   } catch (err) {
+    if (aborted || err.name === 'AbortError') {
+      // Client disconnected — silently end without trying to write.
+      logger.debug({ target }, 'Threat hunt SSE aborted by client disconnect');
+      return;
+    }
     logger.warn({ err, target }, 'Threat hunt streaming investigation failed');
     sendEvent('error', { error: err.message || 'Investigation failed' });
-    res.end();
+    if (!res.writableEnded) res.end();
   }
 });
 
@@ -891,11 +917,13 @@ async function callGemini(prompt, key) {
 async function* parseSSEStream(body) {
   const decoder = new TextDecoder();
   let buffer = '';
+  // M16: lifted out of the for-await loop so an `event:` line whose
+  // matching `data:` line lands in the next chunk still pairs correctly.
+  let eventType = null;
   for await (const chunk of body) {
     buffer += decoder.decode(chunk, { stream: true });
     const lines = buffer.split('\n');
     buffer = lines.pop(); // keep incomplete line in buffer
-    let eventType = null;
     for (const line of lines) {
       if (line.startsWith('event: ')) {
         eventType = line.slice(7).trim();
@@ -912,7 +940,7 @@ async function* parseSSEStream(body) {
   }
 }
 
-async function callAnthropicStream(prompt, key, sendEvent) {
+async function callAnthropicStream(prompt, key, sendEvent, signal) {
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: {
@@ -927,6 +955,7 @@ async function callAnthropicStream(prompt, key, sendEvent) {
       stream: true,
       messages: [{ role: 'user', content: prompt }],
     }),
+    signal,
   });
 
   if (!res.ok) {
@@ -954,7 +983,7 @@ async function callAnthropicStream(prompt, key, sendEvent) {
   }
 }
 
-async function callOpenAIStream(prompt, key, sendEvent) {
+async function callOpenAIStream(prompt, key, sendEvent, signal) {
   const res = await fetch('https://api.openai.com/v1/chat/completions', {
     method: 'POST',
     headers: {
@@ -967,6 +996,7 @@ async function callOpenAIStream(prompt, key, sendEvent) {
       stream: true,
       messages: [{ role: 'user', content: prompt }],
     }),
+    signal,
   });
 
   if (!res.ok) {
@@ -982,7 +1012,7 @@ async function callOpenAIStream(prompt, key, sendEvent) {
   }
 }
 
-async function callGeminiStream(prompt, key, sendEvent) {
+async function callGeminiStream(prompt, key, sendEvent, signal) {
   const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${config.threathunt.geminiModel}:streamGenerateContent?alt=sse&key=${key}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -990,6 +1020,7 @@ async function callGeminiStream(prompt, key, sendEvent) {
       contents: [{ parts: [{ text: prompt }] }],
       generationConfig: { maxOutputTokens: config.threathunt.geminiMaxTokens },
     }),
+    signal,
   });
 
   if (!res.ok) {

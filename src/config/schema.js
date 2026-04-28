@@ -32,6 +32,10 @@ const SCHEMA = [
   { key: 'network.syslogAllowedSources', envVar: 'SYSLOG_ALLOWED_SOURCES',
     type: 'string', default: '', category: 'network',
     description: 'Comma-separated list of source IPs or IPv4 CIDRs allowed to send syslog (e.g. "10.0.0.0/8,172.16.4.1"). Empty = allow all (default). Live-reloaded — no restart needed.' },
+  { key: 'network.syslogRecvBufferBytes', envVar: 'SYSLOG_RECV_BUFFER_BYTES',
+    type: 'number', default: 8 * 1024 * 1024, category: 'network',
+    description: 'Target SO_RCVBUF for the UDP syslog socket (8MB default). At thousands of events/sec the OS default (~256KB) overflows and the kernel silently drops packets. Kernel may cap below request — check `net.core.rmem_max`.',
+    requiresRestart: true },
 
   // ----------------------------------------------------------------- storage
   { key: 'db.path', envVar: 'DB_PATH', type: 'string', default: './data/events.db',
@@ -61,6 +65,9 @@ const SCHEMA = [
   { key: 'enrichment.concurrency', envVar: 'ENRICHMENT_CONCURRENCY', type: 'number',
     default: 5, category: 'enrichment',
     description: 'Max parallel enrichment lookups' },
+  { key: 'enrichment.queueMaxDepth', envVar: 'ENRICHMENT_QUEUE_MAX_DEPTH', type: 'number',
+    default: 50000, category: 'enrichment',
+    description: 'High-watermark for the enrichment update queue. When the backend (OpenSearch / WardSONDB) falls behind ingest, the oldest queued updates are dropped rather than letting the queue grow unbounded.' },
 
   // ------------------------------------------------------------- performance
   { key: 'performance.insertBatchSize', envVar: 'INSERT_BATCH_SIZE',

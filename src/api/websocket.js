@@ -106,6 +106,12 @@ function broadcastEvent(event) {
   }
 }
 
+// H9: per-client backpressure threshold. If the WebSocket's outgoing
+// buffer exceeds this, the client is treated as slow — we skip the
+// current flush for that client rather than letting the buffer grow
+// unbounded.
+const SLOW_CLIENT_BUFFER_THRESHOLD = 4 * 1024 * 1024;
+
 function flushBroadcast() {
   broadcastTimer = null;
   if (!wss || broadcastQueue.length === 0) return;
@@ -113,25 +119,40 @@ function flushBroadcast() {
   const events = broadcastQueue;
   broadcastQueue = [];
 
+  // H9: cluster clients by filter signature so the matching + JSON
+  // serialization runs once per UNIQUE filter rather than once per
+  // client. At 1000 events/sec × 5 clients with the default no-filter,
+  // this collapses 5000 stringify calls/sec into 1000.
+  const clusters = new Map();
   for (const client of wss.clients) {
     if (client.readyState !== 1) continue; // OPEN
-
     const filter = clientFilters.get(client) || {};
-    const matching = events.filter(e => matchesFilter(e, filter));
-
-    if (matching.length === 0) continue;
-
-    try {
-      for (const event of matching) {
+    const sig = JSON.stringify(filter);
+    let cluster = clusters.get(sig);
+    if (!cluster) {
+      const matching = events.filter(e => matchesFilter(e, filter));
+      const messages = matching.map(event => {
         sequence++;
-        client.send(JSON.stringify({
-          type: 'event',
-          seq: sequence,
-          data: event,
-        }));
+        return JSON.stringify({ type: 'event', seq: sequence, data: event });
+      });
+      cluster = { messages, clients: [] };
+      clusters.set(sig, cluster);
+    }
+    cluster.clients.push(client);
+  }
+
+  for (const cluster of clusters.values()) {
+    if (cluster.messages.length === 0) continue;
+    for (const client of cluster.clients) {
+      // H9: skip backpressured clients. The next flush will retry; if
+      // the client stays backed up they'll eventually time out and be
+      // evicted by the underlying ws library.
+      if (client.bufferedAmount > SLOW_CLIENT_BUFFER_THRESHOLD) continue;
+      try {
+        for (const msg of cluster.messages) client.send(msg);
+      } catch {
+        // client disconnected mid-send
       }
-    } catch {
-      // client disconnected mid-send
     }
   }
 }
