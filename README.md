@@ -220,18 +220,18 @@ All other settings (syslog port, retention, AbuseIPDB key, WardSONDB tunables, O
 
 > **WardSONDB query timeouts:** Query duration is controlled by WardSONDB's server-side `--query-timeout` flag (default 30s). For large datasets or Threat Hunt queries, launch WardSONDB with `--query-timeout 120` or higher. By default the SIEM has no client-side query timeout — this is intentional. If you need to override per-request (e.g. unreliable network, long-running server-side queries you want to cap), set `WARDSONDB_QUERY_TIMEOUT_MS` in `.env` as an escape hatch.
 
-> **Recommended WardSONDB launch flags (NEW-P9):** for production SIEM workloads (verified against `wardsondb --help`):
+> **Recommended WardSONDB launch flags (NEW-P9):** for production SIEM workloads. The bitmap-fields list below reflects what the reference deployment is actually running — every entry has been validated against real query patterns. The only addition for Phase 10 is `delta`, which is required so compaction can filter `delta: true/false` without scanning the rollup collections.
 >
 > ```bash
 > ulimit -n 65536 && wardsondb \
 >   --storage-engine rocksdb \
->   --bitmap-fields event_type,received_at,network.action,network.src_ip,network.dst_ip,network.dst_port,ids.signature,ids.classification,client_mac,wifi_client_mac,dhcp_mac,enrichment.src.geo_country,enrichment.dst.geo_country,enrichment.src.is_private,enrichment.dst.is_private,delta \
+>   --bitmap-fields "event_type,network.action,severity,network.protocol,source_format,is_private,geo_country,geo_city,network.direction,direction,ids.classification,classification,hostname,wifi.action,bucket,protocol,delta" \
 >   --query-timeout 120
 > ```
 >
-> Notes on each flag:
+> Notes:
 > - `--storage-engine` is required (no default). Pick `rocksdb` for the SIEM's read-heavy + steady-write workload.
-> - `--bitmap-fields` includes `delta` because Phase 10 compaction filters on `delta: true/false` to delete deltas while preserving canonical rollup docs — without an index this is a full-collection scan.
+> - `--bitmap-fields` is a single comma-separated list. Some entries are dotted (`network.action`, `ids.classification`) for the nested event-document fields; others are flat (`is_private`, `geo_country`, `bucket`) because they live on the cache or rollup collections. Bitmap accelerates equality filters on low-cardinality fields up to `--bitmap-max-cardinality` (default 1000) — fields that exceed the cap are auto-disabled, so leaving extra entries is harmless. **`delta` is the new Phase 10 requirement** — Phase 10 compaction (`_compactRollups`) filters on `delta: true/false` to delete deltas while preserving canonical rollup docs.
 > - `--query-timeout 120` covers Threat Hunt fan-out across many partitions; the default 30s isn't enough for multi-partition aggregations.
 > - `ulimit -n 65536` is required per the `--help` "FILE DESCRIPTORS" notice — defaults are 256 (macOS) / 1024 (Linux), too low for production.
 >
