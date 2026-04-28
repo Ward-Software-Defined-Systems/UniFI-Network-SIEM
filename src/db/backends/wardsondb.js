@@ -81,10 +81,6 @@ class WardsonDbBackend extends StorageBackend {
 
     // Cached doc count across event partitions, used for empty-DB short-circuit
     this._cachedDocCount = null;
-
-    // Enrichment cache map (30s TTL), used by stats joins and event overlay
-    this._cacheMap = null;
-    this._cacheMapTs = 0;
   }
 
   static get metadata() {
@@ -996,8 +992,10 @@ class WardsonDbBackend extends StorageBackend {
     const limit = Math.min(parseInt(filters.limit || '50', 10), 500);
     let offset = parseInt(filters.offset || '0', 10);
     const queryFilter = this._buildFilter(filters);
-    const cacheMap = await this._getCacheMap();
 
+    // M9: collect raw docs first, then look up cache for the IPs we
+    // actually saw. Avoids the previous bulk-load that pulled up to
+    // 100K cache rows for a query returning at most 500 events.
     const queryPartition = async (partition, remaining) => {
       const result = await this._post(`/${partition}/query`, {
         filter: queryFilter,
@@ -1006,12 +1004,20 @@ class WardsonDbBackend extends StorageBackend {
         offset,
       });
       const docs = result.data || [];
-      // Approximate offset across boundaries: decrement what this partition consumed
       if (offset > 0) offset = Math.max(0, offset - docs.length);
-      return docs.map(d => this._documentToEvent(d, cacheMap));
+      return docs;
     };
 
-    const events = await this._queryAcrossPartitions(queryPartition, filters.since, filters.until, limit);
+    const docs = await this._queryAcrossPartitions(queryPartition, filters.since, filters.until, limit);
+
+    const ipSet = new Set();
+    for (const doc of docs) {
+      if (doc.network?.src_ip) ipSet.add(doc.network.src_ip);
+      if (doc.network?.dst_ip) ipSet.add(doc.network.dst_ip);
+    }
+    const cacheMap = await this._lookupCacheForIps(ipSet);
+
+    const events = docs.map(d => this._documentToEvent(d, cacheMap));
     return { events };
   }
 
@@ -1023,25 +1029,35 @@ class WardsonDbBackend extends StorageBackend {
     const UUIDV7_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
     if (typeof id !== 'string' || !UUIDV7_RE.test(id)) return null;
 
-    const cacheMap = await this._getCacheMap();
     const partition = this._partitionFromId(id);
+    let doc = null;
 
     if (partition && this._partitions.has(partition)) {
       const result = await this._get(`/${partition}/docs/${encodeURIComponent(id)}`);
-      if (!result._notFound) return this._documentToEvent(result.data, cacheMap);
+      if (!result._notFound) doc = result.data;
     }
 
-    // M17: bounded fallback to the 7 most-recent partitions only. A
-    // valid UUIDv7 whose partition isn't in this._partitions is a rare
-    // race (server restart between _partitions refresh and the GET);
-    // unbounded scanning was the worst-case hang path.
-    for (const p of this._partitionsNewestFirst().slice(0, 7)) {
-      try {
-        const r = await this._get(`/${p}/docs/${encodeURIComponent(id)}`);
-        if (!r._notFound) return this._documentToEvent(r.data, cacheMap);
-      } catch {}
+    if (!doc) {
+      // M17: bounded fallback to the 7 most-recent partitions only. A
+      // valid UUIDv7 whose partition isn't in this._partitions is a rare
+      // race (server restart between _partitions refresh and the GET);
+      // unbounded scanning was the worst-case hang path.
+      for (const p of this._partitionsNewestFirst().slice(0, 7)) {
+        try {
+          const r = await this._get(`/${p}/docs/${encodeURIComponent(id)}`);
+          if (!r._notFound) { doc = r.data; break; }
+        } catch {}
+      }
     }
-    return null;
+    if (!doc) return null;
+
+    // M9: targeted cache lookup for just this doc's IPs (≤2).
+    const ips = [];
+    if (doc.network?.src_ip) ips.push(doc.network.src_ip);
+    if (doc.network?.dst_ip) ips.push(doc.network.dst_ip);
+    const cacheMap = await this._lookupCacheForIps(ips);
+
+    return this._documentToEvent(doc, cacheMap);
   }
 
   async getEventCount() {
@@ -1208,21 +1224,33 @@ class WardsonDbBackend extends StorageBackend {
     return Array.from(buckets.values());
   }
 
-  async _getCacheMap() {
-    if (this._cacheMapTs && Date.now() - this._cacheMapTs < 30000) return this._cacheMap;
-    const CAP = 100000;
-    const result = await this._post(`/${this.cacheCollection}/query`, {
-      filter: { is_private: false },
-      limit: CAP,
-    });
-    const data = result.data || [];
-    if (data.length >= CAP) {
-      logger.warn({ loaded: data.length, cap: CAP },
-        'WardSONDB _getCacheMap hit cap — some enrichment data may be missing from event/stats joins');
+  /**
+   * M9: targeted cache lookup for a specific set of IPs. Replaces the
+   * previous bulk _getCacheMap which loaded up to 100K rows on every 30s
+   * expiration (a no-op above the API's 10K hard limit, and wasteful
+   * even below it). Chunks the $in filter at 500 IPs to fit within
+   * server-side query payload caps. Empty input returns an empty Map
+   * immediately — no network round-trip.
+   */
+  async _lookupCacheForIps(ips) {
+    const map = new Map();
+    if (!ips) return map;
+    const unique = ips instanceof Set ? [...ips] : [...new Set(ips)];
+    if (unique.length === 0) return map;
+    const CHUNK = 500;
+    for (let i = 0; i < unique.length; i += CHUNK) {
+      const chunk = unique.slice(i, i + CHUNK);
+      try {
+        const res = await this._post(`/${this.cacheCollection}/query`, {
+          filter: { ip: { '$in': chunk } },
+          limit: chunk.length,
+        });
+        for (const d of (res.data || [])) map.set(d.ip, d);
+      } catch (err) {
+        logger.debug({ err: err.message, chunk: chunk.length }, '_lookupCacheForIps chunk failed');
+      }
     }
-    this._cacheMap = new Map(data.map(d => [d.ip, d]));
-    this._cacheMapTs = Date.now();
-    return this._cacheMap;
+    return map;
   }
 
   async getTopTalkers(since, direction, limit, excludePrivate) {
@@ -1239,8 +1267,11 @@ class WardsonDbBackend extends StorageBackend {
       ],
     });
 
-    const cacheMap = await this._getCacheMap();
-    let rows = (result.data || []).map(r => {
+    // M9: targeted lookup for just the top-N rollup IPs.
+    const aggRows = result.data || [];
+    const ipSet = new Set(aggRows.map(r => r._id).filter(Boolean));
+    const cacheMap = await this._lookupCacheForIps(ipSet);
+    let rows = aggRows.map(r => {
       const c = cacheMap.get(r._id) || {};
       return {
         ip: r._id,
@@ -1269,8 +1300,11 @@ class WardsonDbBackend extends StorageBackend {
       ],
     });
 
-    const cacheMap = await this._getCacheMap();
-    let rows = (result.data || []).map(r => {
+    // M9: targeted lookup for just the top-N rollup IPs.
+    const aggRows = result.data || [];
+    const ipSet = new Set(aggRows.map(r => r._id).filter(Boolean));
+    const cacheMap = await this._lookupCacheForIps(ipSet);
+    let rows = aggRows.map(r => {
       const c = cacheMap.get(r._id) || {};
       return {
         ip: r._id,
@@ -1472,14 +1506,26 @@ class WardsonDbBackend extends StorageBackend {
       });
 
     // --- Period summary ---
-    const periodIpsRes = await this._post(`/${this.rollupIpHourly}/aggregate`, {
-      pipeline: [
-        { '$match': { bucket: { '$gte': since } } },
-        { '$group': { '_id': 'ip' } },
-        { '$limit': 10000 },
-      ],
-    });
-    const periodIps = (periodIpsRes.data || []).map(r => r._id).filter(Boolean);
+    // NEW-P2: /distinct over the indexed `ip` field is index-only when no
+    // filter touches a non-indexed column; even with the bucket filter
+    // it's cheaper than $group{_id:ip} on a busy rollup collection.
+    // M14: surface truncation so the UI can warn that the period summary
+    // undercounts. The 10K cap is the WardSONDB API hard limit per
+    // API.md:1657 — we can't get more even by raising it.
+    const PERIOD_IPS_CAP = 10000;
+    const periodIpsRes = await this._post(`/${this.rollupIpHourly}/distinct`, {
+      field: 'ip',
+      filter: { bucket: { '$gte': since } },
+      limit: PERIOD_IPS_CAP,
+    }).catch(() => ({ data: { values: [], truncated: false } }));
+    const periodIps = (periodIpsRes.data?.values || []).filter(Boolean);
+    const periodIpsTruncated = periodIpsRes.data?.truncated === true
+      || periodIps.length >= PERIOD_IPS_CAP;
+    if (periodIpsTruncated) {
+      logger.warn({
+        cap: PERIOD_IPS_CAP, periodIps: periodIps.length, since,
+      }, 'WardSONDB getThreatIntel periodIps truncated — period summary may undercount');
+    }
 
     let periodSummary = { enriched: 0, flagged: 0, highThreat: 0, countries: 0 };
     if (periodIps.length > 0) {
@@ -1499,7 +1545,13 @@ class WardsonDbBackend extends StorageBackend {
           if (d.geo_country) countriesSet.add(d.geo_country);
         }
       }
-      periodSummary = { enriched, flagged, highThreat: highThreatCount, countries: countriesSet.size };
+      periodSummary = {
+        enriched, flagged, highThreat: highThreatCount, countries: countriesSet.size,
+        // M14: propagate truncation flag so the UI can render a banner
+        // when the period summary undercounts (busy 30d windows with
+        // >10K unique IPs).
+        truncated: periodIpsTruncated,
+      };
     }
 
     // H11: diagnostic log demoted to debug. Was info to help debug
@@ -1844,8 +1896,6 @@ class WardsonDbBackend extends StorageBackend {
     // Reset in-memory state
     this._partitions.clear();
     this._rollupBuffers = this._newBuffers();
-    this._cacheMap = null;
-    this._cacheMapTs = 0;
     this._cachedDocCount = 0;
 
     // Recreate today's partition + indexes
