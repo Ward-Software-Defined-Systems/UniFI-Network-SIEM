@@ -220,16 +220,22 @@ All other settings (syslog port, retention, AbuseIPDB key, WardSONDB tunables, O
 
 > **WardSONDB query timeouts:** Query duration is controlled by WardSONDB's server-side `--query-timeout` flag (default 30s). For large datasets or Threat Hunt queries, launch WardSONDB with `--query-timeout 120` or higher. By default the SIEM has no client-side query timeout — this is intentional. If you need to override per-request (e.g. unreliable network, long-running server-side queries you want to cap), set `WARDSONDB_QUERY_TIMEOUT_MS` in `.env` as an escape hatch.
 
-> **Recommended WardSONDB launch flags (NEW-P9):** for production SIEM workloads:
+> **Recommended WardSONDB launch flags (NEW-P9):** for production SIEM workloads (verified against `wardsondb --help`):
 >
 > ```bash
-> wardsondb \
+> ulimit -n 65536 && wardsondb \
+>   --storage-engine rocksdb \
 >   --bitmap-fields event_type,received_at,network.action,network.src_ip,network.dst_ip,network.dst_port,ids.signature,ids.classification,client_mac,wifi_client_mac,dhcp_mac,enrichment.src.geo_country,enrichment.dst.geo_country,enrichment.src.is_private,enrichment.dst.is_private,delta \
->   --query-timeout 120 \
->   --verified-trim
+>   --query-timeout 120
 > ```
 >
-> The `delta` field is added to the bitmap list because Phase 10 compaction filters on `delta: true/false` to delete deltas while preserving canonical rollup docs — without an index this is a full-collection scan. `--verified-trim` keeps storage bounded as partition-drop retention runs. `--query-timeout 120` covers Threat Hunt fan-out across many partitions.
+> Notes on each flag:
+> - `--storage-engine` is required (no default). Pick `rocksdb` for the SIEM's read-heavy + steady-write workload.
+> - `--bitmap-fields` includes `delta` because Phase 10 compaction filters on `delta: true/false` to delete deltas while preserving canonical rollup docs — without an index this is a full-collection scan.
+> - `--query-timeout 120` covers Threat Hunt fan-out across many partitions; the default 30s isn't enough for multi-partition aggregations.
+> - `ulimit -n 65536` is required per the `--help` "FILE DESCRIPTORS" notice — defaults are 256 (macOS) / 1024 (Linux), too low for production.
+>
+> Other flags worth tuning at scale (defaults shown): `--cache-size-mb 64`, `--write-buffer-mb 64`, `--memtable-mb 8`, `--flush-workers 2`, `--compaction-workers 2`, `--bitmap-max-cardinality 1000`. Increase memory-related flags proportionally to available RAM if you see disk read pressure or compaction lag.
 >
 > **Phase 10 rollup model:** rollup writes are now append-only via `/{col}/docs/_bulk`. Each flush emits delta documents tagged `delta: true` with deterministic `_id = ${bucket}|${keys}|${flushId}`. A 30-minute compaction job folds delta docs older than 1h into a single canonical doc per `(bucket, keys)` (`_id = ...|c`, `delta: false`) and `_delete_by_query` removes the deltas. Queries (`$group + $sum`) are unchanged — they correctly sum across deltas + canonical regardless of compaction state.
 
