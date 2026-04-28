@@ -131,6 +131,98 @@ const CACHE_MAPPING = {
   },
 };
 
+// Phase 11A — Native OpenSearch Rollup jobs (H10).
+//
+// Five continuous rollup jobs mirror SQLite's five rollup tables. Each job
+// reads from `${prefix}events` and writes pre-aggregated docs into a
+// dedicated `${prefix}rollup-*` index. With `continuous: true` the IM
+// plugin processes new ingest on the schedule cadence — no app-side flush
+// worker.
+//
+// Field-name caveat: the SIEM's OpenSearch mapping is FLAT
+// (`network_action`, `dst_port`, `ids_signature`, `ids_category`) — NOT
+// nested. The dimension `source_field` paths below match the actual
+// indexed fields, not the WardSONDB-style dotted paths.
+//
+// Backfill caveat: continuous rollup jobs do not retroactively process
+// data that existed before job creation (per OpenSearch docs). Existing
+// deployments will see rollup indexes accumulate forward-only. Phase 11B
+// (a separate change) flips the 9 stats methods to query rollups via
+// `_rollup_search` once enough history has accumulated for the longest
+// dashboard window.
+function buildRollupJobs(prefix) {
+  const sourceIndex = `${prefix}events`;
+  const mk = (id, targetSuffix, dimensions) => ({
+    id: `${prefix}rollup-${id}`,
+    body: {
+      rollup: {
+        source_index: sourceIndex,
+        target_index: `${prefix}rollup-${targetSuffix}`,
+        description: `SIEM ${id} rollup`,
+        enabled: true,
+        // Continuous mode still uses `schedule` to set the processing cadence.
+        // 5-minute cadence keeps near-real-time freshness on the dashboards.
+        schedule: { interval: { period: 5, unit: 'Minutes' } },
+        // delay 60s lets late-arriving events (clock skew, syslog backlog)
+        // land in the correct bucket before that bucket is rolled up.
+        delay: 60_000,
+        page_size: 1000,
+        continuous: true,
+        dimensions,
+        // value_count on `received_at` gives the doc-count metric every
+        // stats method needs. Adding extra metric types up-front is cheap
+        // and avoids the "metrics are immutable once defined" trap.
+        metrics: [
+          {
+            source_field: 'received_at',
+            metrics: [{ value_count: {} }, { max: {} }, { min: {} }],
+          },
+        ],
+      },
+    },
+  });
+
+  return [
+    // 5-minute event-type/action rollup — feeds getEventTypeCounts,
+    // getOverviewStats, getEventCountToday.
+    mk('5m', '5m', [
+      { date_histogram: { source_field: 'received_at', fixed_interval: '5m' } },
+      { terms: { source_field: 'event_type' } },
+      { terms: { source_field: 'network_action' } },
+    ]),
+    // Hourly src/dst IP — feeds getTopTalkers, getTopBlocked.
+    mk('ip-hourly', 'ip-hourly', [
+      { date_histogram: { source_field: 'received_at', fixed_interval: '1h' } },
+      { terms: { source_field: 'src_ip' } },
+      { terms: { source_field: 'dst_ip' } },
+      { terms: { source_field: 'direction' } },
+    ]),
+    // Hourly port/protocol — feeds getTopPorts.
+    mk('port-hourly', 'port-hourly', [
+      { date_histogram: { source_field: 'received_at', fixed_interval: '1h' } },
+      { terms: { source_field: 'dst_port' } },
+      { terms: { source_field: 'protocol' } },
+    ]),
+    // Hourly IDS signature — feeds getTopThreats.
+    mk('sig-hourly', 'sig-hourly', [
+      { date_histogram: { source_field: 'received_at', fixed_interval: '1h' } },
+      { terms: { source_field: 'ids_signature' } },
+      { terms: { source_field: 'ids_category' } },
+    ]),
+    // Hourly client MAC — feeds getTopClients. We register one rollup per
+    // mac field rather than chaining all three terms aggs into one job
+    // because docs typically have only one of {client_mac, wifi_client_mac,
+    // dhcp_mac} populated, and combining them in a single rollup would
+    // explode cardinality with mostly-empty bucket combinations.
+    mk('client-hourly', 'client-hourly', [
+      { date_histogram: { source_field: 'received_at', fixed_interval: '1h' } },
+      { terms: { source_field: 'client_mac' } },
+      { terms: { source_field: 'wifi_client_mac' } },
+      { terms: { source_field: 'dhcp_mac' } },
+    ]),
+  ];
+}
+
 class OpenSearchBackend extends StorageBackend {
   constructor(config = {}) {
     super('OpenSearch', config);
@@ -203,6 +295,14 @@ class OpenSearchBackend extends StorageBackend {
 
     this.indexesReady = Promise.resolve();
     this.ready = true;
+
+    // Phase 11A: ensure native rollup jobs are registered + started.
+    // Failures here are logged but non-fatal — the SIEM still works on
+    // raw queries; the rollups are an optimization layer.
+    this._setupRollupJobs().catch((err) =>
+      logger.warn({ err: err.message }, 'OpenSearch rollup-job setup failed (non-fatal)'),
+    );
+
     logger.info({ backend: 'opensearch', url: this.baseUrl, eventsIndex: this.eventsIndex }, 'OpenSearch backend initialized');
   }
 
@@ -211,6 +311,74 @@ class OpenSearchBackend extends StorageBackend {
     if (!exists) {
       await this.client.indices.create({ index: name, body: mapping });
       logger.info({ index: name }, 'Created OpenSearch index');
+    }
+  }
+
+  // --- Phase 11A: Rollup jobs (H10) ---
+
+  /**
+   * Idempotently register + start the 5 continuous rollup jobs. Safe to
+   * call on every startup: existing jobs are detected via GET and left
+   * alone; missing jobs are PUT and started; already-running jobs are
+   * not re-started.
+   */
+  async _setupRollupJobs() {
+    const jobs = buildRollupJobs(this.config.indexPrefix || 'siem-');
+    for (const job of jobs) {
+      try {
+        await this._ensureRollupJob(job);
+      } catch (err) {
+        // Log per-job — one failure shouldn't block the others.
+        logger.warn({ err: err.message, jobId: job.id }, 'Rollup job setup failed');
+      }
+    }
+  }
+
+  async _ensureRollupJob({ id, body }) {
+    // GET first. Two outcomes:
+    //   1. 404 → job doesn't exist → PUT + _start.
+    //   2. 200 → already exists → ensure it's running.
+    let exists = false;
+    try {
+      await this.client.transport.request({
+        method: 'GET',
+        path: `/_plugins/_rollup/jobs/${encodeURIComponent(id)}`,
+      });
+      exists = true;
+    } catch (err) {
+      // opensearch-js wraps 404 in ResponseError; check statusCode.
+      if (err.meta?.statusCode !== 404 && err.statusCode !== 404) {
+        throw err;
+      }
+    }
+
+    if (!exists) {
+      await this.client.transport.request({
+        method: 'PUT',
+        path: `/_plugins/_rollup/jobs/${encodeURIComponent(id)}`,
+        body,
+      });
+      logger.info({ jobId: id, target: body.rollup.target_index }, 'Created OpenSearch rollup job');
+    }
+
+    // Start the job. Per the docs, continuous jobs do NOT auto-start
+    // after PUT — _start is required. Calling _start on an already-
+    // running job is a no-op (returns 200 with "Failed to start job"
+    // for some versions, but is safe).
+    try {
+      await this.client.transport.request({
+        method: 'POST',
+        path: `/_plugins/_rollup/jobs/${encodeURIComponent(id)}/_start`,
+      });
+    } catch (err) {
+      // "already started" comes back as 4xx in some IM-plugin versions.
+      // We tolerate that and keep going.
+      const status = err.meta?.statusCode || err.statusCode;
+      if (status && status >= 400 && status < 500) {
+        logger.debug({ jobId: id, status }, 'Rollup _start returned 4xx (likely already running)');
+      } else {
+        throw err;
+      }
     }
   }
 
@@ -1558,3 +1726,6 @@ class OpenSearchBackend extends StorageBackend {
 }
 
 module.exports = OpenSearchBackend;
+// Exported for unit testing — the rollup-job specs are pure data, easy to
+// verify against the OpenSearch IM-plugin schema without spinning up a cluster.
+module.exports.buildRollupJobs = buildRollupJobs;

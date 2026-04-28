@@ -239,6 +239,8 @@ All other settings (syslog port, retention, AbuseIPDB key, WardSONDB tunables, O
 >
 > **Phase 10 rollup model:** rollup writes are now append-only via `/{col}/docs/_bulk`. Each flush emits delta documents tagged `delta: true` with deterministic `_id = ${bucket}|${keys}|${flushId}`. A 30-minute compaction job folds delta docs older than 1h into a single canonical doc per `(bucket, keys)` (`_id = ...|c`, `delta: false`) and `_delete_by_query` removes the deltas. Queries (`$group + $sum`) are unchanged — they correctly sum across deltas + canonical regardless of compaction state.
 
+> **OpenSearch native rollup jobs (Phase 11A — H10):** the OpenSearch backend now creates five continuous rollup jobs on startup — `siem-rollup-{5m,ip-hourly,port-hourly,sig-hourly,client-hourly}` — paralleling SQLite's rollup tables and feeding the Index Management plugin's server-side rollup engine. New ingest is rolled up automatically every 5 minutes (60s delay buffer for late-arriving events). **Continuous rollup jobs do not backfill data that existed before they were created** — rollup indexes accumulate forward-only. Until enough history has accumulated for your longest dashboard window, the SIEM continues serving stats from raw `siem-events`; the speed-up landings as a follow-up (Phase 11B). Inspect a job's progress with `GET /_plugins/_rollup/jobs/<id>/_explain`; pause one with `POST /_plugins/_rollup/jobs/<id>/_stop`.
+
 ## Project Structure
 
 ```
