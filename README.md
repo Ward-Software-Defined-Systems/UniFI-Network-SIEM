@@ -220,7 +220,7 @@ All other settings (syslog port, retention, AbuseIPDB key, WardSONDB tunables, O
 
 > **WardSONDB query timeouts:** Query duration is controlled by WardSONDB's server-side `--query-timeout` flag (default 30s). For large datasets or Threat Hunt queries, launch WardSONDB with `--query-timeout 120` or higher. By default the SIEM has no client-side query timeout — this is intentional. If you need to override per-request (e.g. unreliable network, long-running server-side queries you want to cap), set `WARDSONDB_QUERY_TIMEOUT_MS` in `.env` as an escape hatch.
 
-> **Recommended WardSONDB launch flags (NEW-P9):** for production SIEM workloads. The bitmap-fields list below reflects what the reference deployment is actually running — every entry has been validated against real query patterns. The only addition for Phase 10 is `delta`, which is required so compaction can filter `delta: true/false` without scanning the rollup collections.
+> **Recommended WardSONDB launch flags (NEW-P9):** for production SIEM workloads. The bitmap-fields list below reflects what the reference deployment is actually running — every entry has been validated against real query patterns. `delta` is appended for the Phase 10 rollup model (see notes).
 >
 > ```bash
 > ulimit -n 65536 && wardsondb \
@@ -231,7 +231,8 @@ All other settings (syslog port, retention, AbuseIPDB key, WardSONDB tunables, O
 >
 > Notes:
 > - `--storage-engine` is required (no default). Pick `rocksdb` for the SIEM's read-heavy + steady-write workload.
-> - `--bitmap-fields` is a single comma-separated list. Some entries are dotted (`network.action`, `ids.classification`) for the nested event-document fields; others are flat (`is_private`, `geo_country`, `bucket`) because they live on the cache or rollup collections. Bitmap accelerates equality filters on low-cardinality fields up to `--bitmap-max-cardinality` (default 1000) — fields that exceed the cap are auto-disabled, so leaving extra entries is harmless. **`delta` is the new Phase 10 requirement** — Phase 10 compaction (`_compactRollups`) filters on `delta: true/false` to delete deltas while preserving canonical rollup docs.
+> - `--bitmap-fields` is a single comma-separated list. Some entries are dotted (`network.action`, `ids.classification`) for the nested event-document fields; others are flat (`is_private`, `geo_country`, `bucket`) because they live on the cache or rollup collections. Bitmap accelerates equality filters on low-cardinality fields up to `--bitmap-max-cardinality` (default 1000) — fields that exceed the cap are auto-disabled, so leaving extra entries is harmless.
+> - `delta` is a field that Phase 10's append-only rollup model writes onto every flushed delta document (`delta: true`) and onto canonical docs from compaction (`delta: false`). Compaction filters on `{ bucket, delta: true }` to identify docs to delete after the canonical is written. **This works correctly whether or not `delta` is in `--bitmap-fields`** — the field is in `--bitmap-fields` here as a likely perf hint (cardinality 2, well under the cap, doesn't burn a useful slot). Whether bitmap actually accelerates the boolean filter vs the existing `bucket` bitmap pruning is unverified — measure `duration_ms` on `_delete_by_query` to confirm before/after.
 > - `--query-timeout 120` covers Threat Hunt fan-out across many partitions; the default 30s isn't enough for multi-partition aggregations.
 > - `ulimit -n 65536` is required per the `--help` "FILE DESCRIPTORS" notice — defaults are 256 (macOS) / 1024 (Linux), too low for production.
 >
