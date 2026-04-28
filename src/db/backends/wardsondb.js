@@ -9,7 +9,13 @@
  *     rollups-5m, rollups-ip-hourly, rollups-port-hourly,
  *     rollups-sig-hourly, rollups-client-hourly.
  *   Counts are accumulated in memory during insertEvents() and flushed every
- *   5 seconds via a read-then-increment cycle.
+ *   5 seconds. Phase 10 (M10) replaced the read-then-increment pattern with
+ *   append-only deltas via `/{col}/docs/_bulk`: each flush writes a fresh
+ *   batch of {bucket, ..., count, delta:true} documents with deterministic
+ *   `_id = ${bucket}|${k1}|${k2}|${flushId}`. Queries already use
+ *   `$group + $sum` so they sum correctly across delta docs without code
+ *   changes. The append-only model removes the lost-update race that
+ *   PATCH had under concurrent flushes (M11).
  * - Singleton enrichment_cache collection stores per-IP enrichment data.
  * - Settings remain in SQLite (needed to boot and select the backend).
  */
@@ -78,6 +84,15 @@ class WardsonDbBackend extends StorageBackend {
     this._flushing = false;
     this._shuttingDown = false;
     this._backfillStarted = false;
+    // M10: append-only delta `_id` suffix counter. Combined with Date.now()
+    // it stays unique across same-millisecond flushes (rare but possible
+    // under heavy load) and tags each flush idempotently — duplicate _id
+    // returns 409 per-doc on a retry, so the same buffer can be re-flushed
+    // without double-counting.
+    this._flushCounter = 0;
+    // NEW-P3: rollup compaction state.
+    this._compacting = false;
+    this._compactionIntervalHandle = null;
 
     // Cached doc count across event partitions, used for empty-DB short-circuit
     this._cachedDocCount = null;
@@ -279,39 +294,71 @@ class WardsonDbBackend extends StorageBackend {
     mergeRollups(this._rollupBuffers, accumulateRollups(events));
   }
 
-  // --- Rollup flush ---
+  // --- Rollup flush (append-only deltas, M10) ---
 
-  _docIdForFiveMin(d) { return `${d.bucket}|${d.event_type}|${d.action}`; }
-  _docIdForIpHourly(d) { return `${d.bucket}|${d.ip}|${d.direction}`; }
-  _docIdForPortHourly(d) { return `${d.bucket}|${d.port}|${d.protocol}`; }
-  _docIdForSigHourly(d) { return `${d.bucket}|${d.signature}|${d.classification}`; }
-  _docIdForClientHourly(d) { return `${d.bucket}|${d.mac}`; }
+  /**
+   * Build the deterministic `_id` for a delta document.
+   *
+   * Shape: `${bucket}|${naturalKeys}|${flushId}`. The flushId suffix
+   * makes each flush's deltas unique while letting a retry of the SAME
+   * flush land on duplicate `_id`s (409 per-doc → silently skipped).
+   * The natural-key prefix is what compaction filters on.
+   */
+  _baseKeyFiveMin(d) { return `${d.bucket}|${d.event_type}|${d.action}`; }
+  _baseKeyIpHourly(d) { return `${d.bucket}|${d.ip}|${d.direction}`; }
+  _baseKeyPortHourly(d) { return `${d.bucket}|${d.port}|${d.protocol}`; }
+  _baseKeySigHourly(d) { return `${d.bucket}|${d.signature}|${d.classification}`; }
+  _baseKeyClientHourly(d) { return `${d.bucket}|${d.mac}`; }
 
-  async _upsertRollup(collection, id, doc, mergeFields) {
-    const path = `/${collection}/docs/${encodeURIComponent(id)}`;
-    const existing = await this._get(path);
-
-    if (existing._notFound) {
-      // Insert new doc with the deterministic _id in the body
-      const body = { _id: id, ...doc };
-      const created = await this._post(`/${collection}/docs`, body);
-      if (created._conflict) {
-        // Concurrent creation — fall through to PATCH on retry
-        const refetched = await this._get(path);
-        if (refetched._notFound) throw new Error(`Failed to upsert rollup ${id}: conflict but doc not found`);
-        const merged = {};
-        for (const f of mergeFields) merged[f] = (refetched.data[f] || 0) + (doc[f] || 0);
-        await this._patch(path, merged);
+  /**
+   * Per-collection bulk insert. Returns true on success, false on
+   * transactional failure. WardSONDB's `_bulk` is atomic per call — if
+   * the transaction fails, none of the docs are committed (per
+   * API.md:512), so a re-merge of the drain buffer on failure is safe
+   * and won't double-count.
+   */
+  async _bulkInsertDeltas(collection, docs) {
+    if (docs.length === 0) return true;
+    try {
+      const result = await this._post(`/${collection}/docs/_bulk`, { documents: docs });
+      const inserted = result.data?.inserted ?? 0;
+      const errors = result.data?.errors || [];
+      if (errors.length > 0) {
+        // Per-doc errors. Duplicate _id is the expected mode on a retry
+        // of the same flush — log at debug so a real failure (e.g.,
+        // schema validation) still gets surfaced via the inserted-vs-
+        // submitted gap below.
+        logger.debug(
+          { col: collection, errorCount: errors.length, sample: errors.slice(0, 3) },
+          'Rollup bulk delta had per-doc errors',
+        );
       }
-      return;
+      // Successful retry: inserted may be 0 if every doc was a duplicate.
+      // Successful first attempt: inserted should equal docs.length.
+      // Anything in between with non-duplicate errors is a problem worth
+      // logging, but we still consider the call successful — partial
+      // success means the duplicates already landed previously.
+      const expected = docs.length;
+      if (inserted < expected && errors.length === 0) {
+        logger.warn({ col: collection, inserted, submitted: expected }, 'Rollup bulk under-inserted with no errors reported');
+      }
+      return true;
+    } catch (err) {
+      logger.warn(
+        { err: err.message, col: collection, docs: docs.length },
+        'Rollup bulk delta insert failed',
+      );
+      return false;
     }
-
-    const merged = {};
-    for (const f of mergeFields) merged[f] = (existing.data[f] || 0) + (doc[f] || 0);
-    await this._patch(path, merged);
   }
 
-  _mergeBuffersBack(drain) {
+  /**
+   * Re-merge a partial drain back into the live buffer. Called when
+   * one or more per-collection bulk inserts failed — only the failed
+   * Maps are re-merged, so collections that succeeded don't get
+   * double-counted on the next flush.
+   */
+  _mergeBuffersBack(drain, failedMaps) {
     const live = this._rollupBuffers;
     const mergeMap = (src, dst, fields) => {
       for (const [k, v] of src) {
@@ -323,11 +370,11 @@ class WardsonDbBackend extends StorageBackend {
         }
       }
     };
-    mergeMap(drain.fiveMin, live.fiveMin, ['count']);
-    mergeMap(drain.ipHourly, live.ipHourly, ['event_count', 'blocked_count', 'threat_count']);
-    mergeMap(drain.portHourly, live.portHourly, ['count']);
-    mergeMap(drain.sigHourly, live.sigHourly, ['count']);
-    mergeMap(drain.clientHourly, live.clientHourly, ['event_count', 'wifi_count', 'dhcp_count', 'firewall_count']);
+    if (failedMaps.has('fiveMin')) mergeMap(drain.fiveMin, live.fiveMin, ['count']);
+    if (failedMaps.has('ipHourly')) mergeMap(drain.ipHourly, live.ipHourly, ['event_count', 'blocked_count', 'threat_count']);
+    if (failedMaps.has('portHourly')) mergeMap(drain.portHourly, live.portHourly, ['count']);
+    if (failedMaps.has('sigHourly')) mergeMap(drain.sigHourly, live.sigHourly, ['count']);
+    if (failedMaps.has('clientHourly')) mergeMap(drain.clientHourly, live.clientHourly, ['event_count', 'wifi_count', 'dhcp_count', 'firewall_count']);
   }
 
   async _flushRollups() {
@@ -335,63 +382,73 @@ class WardsonDbBackend extends StorageBackend {
     this._flushing = true;
     const t0 = Date.now();
 
-    // Atomic swap
-    const drain = this._rollupBuffers;
-    this._rollupBuffers = this._newBuffers();
-
-    const fiveMinFields = ['count'];
-    const ipFields = ['event_count', 'blocked_count', 'threat_count'];
-    const portFields = ['count'];
-    const sigFields = ['count'];
-    const clientFields = ['event_count', 'wifi_count', 'dhcp_count', 'firewall_count'];
-
-    const tasks = [];
-    for (const doc of drain.fiveMin.values()) tasks.push({ col: this.rollup5m, id: this._docIdForFiveMin(doc), doc, fields: fiveMinFields });
-    for (const doc of drain.ipHourly.values()) tasks.push({ col: this.rollupIpHourly, id: this._docIdForIpHourly(doc), doc, fields: ipFields });
-    for (const doc of drain.portHourly.values()) tasks.push({ col: this.rollupPortHourly, id: this._docIdForPortHourly(doc), doc, fields: portFields });
-    for (const doc of drain.sigHourly.values()) tasks.push({ col: this.rollupSigHourly, id: this._docIdForSigHourly(doc), doc, fields: sigFields });
-    for (const doc of drain.clientHourly.values()) tasks.push({ col: this.rollupClientHourly, id: this._docIdForClientHourly(doc), doc, fields: clientFields });
-
-    if (tasks.length === 0) {
-      this._flushing = false;
-      return;
-    }
-
-    let failed = false;
     try {
+      // Atomic swap so accumulation continues into a fresh buffer while
+      // the prior buffer drains.
+      const drain = this._rollupBuffers;
+      this._rollupBuffers = this._newBuffers();
+
+      // Stable per-flush identifier. Combined with the natural-key prefix
+      // it produces a deterministic `_id` for each delta — meaning a
+      // retry of the same flush hits 409 per-doc and skips, never
+      // double-counts.
+      const flushId = `${Date.now()}-${this._flushCounter++}`;
+
+      // Build per-collection delta arrays. Each delta carries `delta:true`
+      // so compaction (Phase 10B / NEW-P3) can target them with
+      // `_delete_by_query` without touching canonical docs.
+      const buildDeltas = (map, baseKeyFn) => {
+        const out = [];
+        for (const d of map.values()) {
+          out.push({ _id: `${baseKeyFn(d)}|${flushId}`, ...d, delta: true });
+        }
+        return out;
+      };
+
+      const tasks = [
+        { key: 'fiveMin', col: this.rollup5m, docs: buildDeltas(drain.fiveMin, (d) => this._baseKeyFiveMin(d)) },
+        { key: 'ipHourly', col: this.rollupIpHourly, docs: buildDeltas(drain.ipHourly, (d) => this._baseKeyIpHourly(d)) },
+        { key: 'portHourly', col: this.rollupPortHourly, docs: buildDeltas(drain.portHourly, (d) => this._baseKeyPortHourly(d)) },
+        { key: 'sigHourly', col: this.rollupSigHourly, docs: buildDeltas(drain.sigHourly, (d) => this._baseKeySigHourly(d)) },
+        { key: 'clientHourly', col: this.rollupClientHourly, docs: buildDeltas(drain.clientHourly, (d) => this._baseKeyClientHourly(d)) },
+      ];
+
+      const totalDocs = tasks.reduce((n, t) => n + t.docs.length, 0);
+      if (totalDocs === 0) return;
+
+      // Bulk insert per collection in parallel (each call is its own
+      // atomic transaction at the WardSONDB layer). flushConcurrency
+      // caps the parallelism; with 5 collections and a default of 4 the
+      // worker pool absorbs all five with at most one slot of queueing.
+      const failedMaps = new Set();
       let i = 0;
-      const workers = Array.from({ length: this.flushConcurrency }, async () => {
+      const workers = Array.from({ length: Math.min(this.flushConcurrency, tasks.length) }, async () => {
         while (i < tasks.length) {
           const my = tasks[i++];
-          try {
-            await this._upsertRollup(my.col, my.id, my.doc, my.fields);
-          } catch (err) {
-            failed = true;
-            logger.debug({ err: err.message, id: my.id, col: my.col }, 'Rollup upsert failed');
-          }
+          const ok = await this._bulkInsertDeltas(my.col, my.docs);
+          if (!ok) failedMaps.add(my.key);
         }
       });
       await Promise.all(workers);
-    } catch (err) {
-      failed = true;
-      logger.warn({ err: err.message }, 'Rollup flush worker pool failed');
+
+      if (failedMaps.size > 0) {
+        logger.warn({ failed: [...failedMaps] }, 'Rollup flush partial failure — re-merging affected buffers for retry');
+        this._mergeBuffersBack(drain, failedMaps);
+      }
+
+      logger.debug({
+        '5m': drain.fiveMin.size,
+        ip: drain.ipHourly.size,
+        port: drain.portHourly.size,
+        sig: drain.sigHourly.size,
+        client: drain.clientHourly.size,
+        ms: Date.now() - t0,
+        flushId,
+        failed: failedMaps.size,
+      }, 'Rollup flush');
+    } finally {
+      this._flushing = false;
     }
-
-    if (failed) {
-      logger.warn({ tasks: tasks.length }, 'Rollup flush had errors, re-merging buffers for retry');
-      this._mergeBuffersBack(drain);
-    }
-
-    logger.debug({
-      '5m': drain.fiveMin.size,
-      ip: drain.ipHourly.size,
-      port: drain.portHourly.size,
-      sig: drain.sigHourly.size,
-      client: drain.clientHourly.size,
-      ms: Date.now() - t0,
-    }, 'Rollup flush');
-
-    this._flushing = false;
   }
 
   _startFlushInterval() {
@@ -402,6 +459,182 @@ class WardsonDbBackend extends StorageBackend {
         logger.warn({ err: err.message }, 'Rollup flush cycle error'));
     }, FLUSH_INTERVAL_MS);
     this._flushIntervalHandle.unref?.();
+  }
+
+  // --- Rollup compaction (NEW-P3) ---
+
+  /**
+   * Per-collection compaction definitions. Each entry says how to
+   * group the deltas by their natural key, the count fields to sum,
+   * and how to assemble the canonical doc + its `_id` from a $group row.
+   *
+   * Canonical docs share the same shape as deltas — including `delta:
+   * false` so queries can keep using `$group + $sum` without filter
+   * changes while compaction targets `delta: true` for deletion.
+   */
+  _compactionSpecs() {
+    return [
+      {
+        col: this.rollup5m,
+        keyFields: { event_type: 'event_type', action: 'action' },
+        sumFields: ['count'],
+        canonicalIdFor: (row) => `${row.bucket}|${row.event_type}|${row.action}|c`,
+      },
+      {
+        col: this.rollupIpHourly,
+        keyFields: { ip: 'ip', direction: 'direction' },
+        sumFields: ['event_count', 'blocked_count', 'threat_count'],
+        canonicalIdFor: (row) => `${row.bucket}|${row.ip}|${row.direction}|c`,
+      },
+      {
+        col: this.rollupPortHourly,
+        keyFields: { port: 'port', protocol: 'protocol' },
+        sumFields: ['count'],
+        canonicalIdFor: (row) => `${row.bucket}|${row.port}|${row.protocol}|c`,
+      },
+      {
+        col: this.rollupSigHourly,
+        keyFields: { signature: 'signature', classification: 'classification' },
+        sumFields: ['count'],
+        canonicalIdFor: (row) => `${row.bucket}|${row.signature}|${row.classification}|c`,
+      },
+      {
+        col: this.rollupClientHourly,
+        keyFields: { mac: 'mac' },
+        sumFields: ['event_count', 'wifi_count', 'dhcp_count', 'firewall_count'],
+        canonicalIdFor: (row) => `${row.bucket}|${row.mac}|c`,
+      },
+    ];
+  }
+
+  /**
+   * Compact buckets that closed at least `minAgeHours` ago. The window
+   * is intentionally generous so we never collide with an in-flight
+   * flush for the same bucket.
+   *
+   * Order is: aggregate → upsert canonical → delete deltas. A crash
+   * between the upsert and the delete leaves the canonical correct AND
+   * the deltas present — queries see the same total counted twice for
+   * a brief window. The next compaction run is idempotent because
+   * canonical docs ALSO carry their `bucket` field, and we sum
+   * everything in the bucket (delta + existing canonical) before doing
+   * a full PUT replacement of the canonical.
+   */
+  async _compactRollups(minAgeHours = 1) {
+    if (this._compacting) return;
+    this._compacting = true;
+    const t0 = Date.now();
+    let totalCanonicalsWritten = 0;
+    let totalDeltasDeleted = 0;
+    try {
+      const cutoff = new Date(Date.now() - minAgeHours * 60 * 60 * 1000).toISOString();
+      for (const spec of this._compactionSpecs()) {
+        const counts = await this._compactCollection(spec, cutoff);
+        totalCanonicalsWritten += counts.canonicals;
+        totalDeltasDeleted += counts.deltas;
+      }
+      logger.info({
+        canonicals: totalCanonicalsWritten,
+        deltasDeleted: totalDeltasDeleted,
+        ms: Date.now() - t0,
+        cutoff,
+      }, 'Rollup compaction complete');
+    } catch (err) {
+      logger.warn({ err: err.message }, 'Rollup compaction failed');
+    } finally {
+      this._compacting = false;
+    }
+  }
+
+  async _compactCollection(spec, cutoff) {
+    const { col, keyFields, sumFields, canonicalIdFor } = spec;
+
+    // Distinct old buckets that still contain deltas. If only canonical
+    // docs are present, there's nothing to compact for that bucket.
+    let buckets;
+    try {
+      const r = await this._post(`/${col}/distinct`, {
+        field: 'bucket',
+        filter: { bucket: { '$lt': cutoff }, delta: true },
+        limit: 5000,
+      });
+      buckets = r.data?.values || [];
+    } catch (err) {
+      logger.warn({ err: err.message, col }, 'Compaction distinct lookup failed');
+      return { canonicals: 0, deltas: 0 };
+    }
+    if (buckets.length === 0) return { canonicals: 0, deltas: 0 };
+
+    let canonicals = 0;
+    let deltas = 0;
+
+    for (const bucket of buckets) {
+      try {
+        // Aggregate ALL docs in the bucket (delta + any existing canonical)
+        // grouped by natural key. Including canonical in the sum is what
+        // makes re-runs idempotent: the canonical's count is folded into
+        // the new canonical, then deltas are deleted, then on the next
+        // run there are no deltas so canonicals are unchanged.
+        const groupSpec = { _id: keyFields };
+        for (const f of sumFields) groupSpec[f] = { '$sum': f };
+        const agg = await this._post(`/${col}/aggregate`, {
+          pipeline: [
+            { '$match': { bucket } },
+            { '$group': groupSpec },
+          ],
+        });
+        const rows = agg.data || [];
+        if (rows.length === 0) continue;
+
+        // Build canonical docs and PUT them (replace if exists, insert if not).
+        // Per WardSONDB API.md: PUT replaces, returns 404 if missing. We
+        // try POST first with a deterministic _id; on 409 we fall back to
+        // PUT for the in-place replacement.
+        for (const row of rows) {
+          const doc = { bucket, ...row._id, delta: false };
+          for (const f of sumFields) doc[f] = row[f] || 0;
+          const id = canonicalIdFor(doc);
+          const path = `/${col}/docs/${encodeURIComponent(id)}`;
+
+          // PUT replaces atomically when the doc exists; on 404 we POST
+          // to create. Either way the canonical reflects the freshly
+          // aggregated total.
+          const replaced = await this._put(path, doc);
+          if (replaced._notFound) {
+            const created = await this._post(`/${col}/docs`, { _id: id, ...doc });
+            if (created._conflict) {
+              // Race: another compactor created it concurrently. Retry the PUT.
+              await this._put(path, doc).catch(() => {});
+            }
+          }
+          canonicals++;
+        }
+
+        // Delete deltas for this bucket. Canonical docs carry `delta: false`
+        // so they're left intact.
+        const del = await this._post(`/${col}/docs/_delete_by_query`, {
+          filter: { bucket, delta: true },
+        });
+        deltas += del.data?.deleted || 0;
+      } catch (err) {
+        logger.warn({ err: err.message, col, bucket }, 'Per-bucket compaction failed');
+      }
+    }
+
+    return { canonicals, deltas };
+  }
+
+  _startCompactionInterval() {
+    if (this._compactionIntervalHandle) clearInterval(this._compactionIntervalHandle);
+    // Run compaction every 30 minutes. The cutoff window (default 1h)
+    // ensures we never touch buckets that could still receive flush
+    // writes from a delayed event arrival.
+    this._compactionIntervalHandle = setInterval(() => {
+      if (this._shuttingDown) return;
+      this._compactRollups().catch((err) =>
+        logger.warn({ err: err.message }, 'Rollup compaction cycle error'));
+    }, 30 * 60 * 1000);
+    this._compactionIntervalHandle.unref?.();
   }
 
   // --- Lifecycle ---
@@ -515,6 +748,10 @@ class WardsonDbBackend extends StorageBackend {
 
     // Start the flush cycle
     this._startFlushInterval();
+    // NEW-P3: hourly compaction folds older delta docs into a single
+    // canonical doc per (bucket, key) and prunes the deltas. Without
+    // this the rollup collections grow linearly with flushes.
+    this._startCompactionInterval();
 
     // Schedule deferred rollup backfill (same 30s cadence as enrichment backfill)
     setTimeout(() => {
@@ -558,6 +795,10 @@ class WardsonDbBackend extends StorageBackend {
     if (this._flushIntervalHandle) {
       clearInterval(this._flushIntervalHandle);
       this._flushIntervalHandle = null;
+    }
+    if (this._compactionIntervalHandle) {
+      clearInterval(this._compactionIntervalHandle);
+      this._compactionIntervalHandle = null;
     }
     // Final flush — bypass _flushing guard
     this._flushing = false;

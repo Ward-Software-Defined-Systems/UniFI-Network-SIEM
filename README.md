@@ -23,7 +23,7 @@ A self-contained, **AI-powered** Node.js application that collects syslog from U
 - **HTTPS by default** — auto-generated self-signed TLS certificate
 - **Pluggable storage backends** — SQLite (built-in default), WardSONDB (Beta), OpenSearch (Beta). OpenSearch runs via Docker with native aggregations (no rollup tables), batched enrichment backfill with `update_by_query`, and full Threat Hunt support. WardSONDB runs remotely over HTTPS with a per-client undici dispatcher for connect-timeout tuning
 - **SQLite storage** — WAL mode, batched inserts, automatic retention cleanup, worker thread enrichment. Materialized rollup tables (event_stats_5m, ip/port/sig/client_stats_hourly) are updated atomically on insert for sub-second dashboard stats at scale (tested to 8M+ events). A dedicated stats worker thread keeps the event loop responsive during queries. Existing databases self-heal on restart: legacy indexes are automatically dropped and replaced with optimized compound indexes, and rollup tables are backfilled from existing events on first upgrade
-- **WardSONDB storage** — daily event partitions (`events-YYYY-MM-DD`) with partition-drop retention (no `_delete_by_query` on event data), five pre-aggregated rollup collections matching SQLite's schemas exactly (`rollups-5m`, `rollups-ip-hourly`, `rollups-port-hourly`, `rollups-sig-hourly`, `rollups-client-hourly`) flushed every 5 seconds via read-then-increment. Dashboard stats, Live Map, and Threat Intel all query rollups exclusively; Threat Hunt fans out across the partitions overlapping the selected period with per-partition result merging. Running live at 12M+ events — still iterating on optimizations
+- **WardSONDB storage** — daily event partitions (`events-YYYY-MM-DD`) with partition-drop retention (no `_delete_by_query` on event data), five pre-aggregated rollup collections matching SQLite's schemas exactly (`rollups-5m`, `rollups-ip-hourly`, `rollups-port-hourly`, `rollups-sig-hourly`, `rollups-client-hourly`). Phase 10 replaced the original read-then-PATCH flush with append-only `_bulk` deltas — each 5s flush emits new docs (`delta: true`) and a 30-minute compaction job folds older deltas into a canonical doc (`delta: false`). Dashboard stats, Live Map, and Threat Intel all query rollups exclusively; Threat Hunt fans out across the partitions overlapping the selected period with per-partition result merging. Running live at 12M+ events
 - **Zero external services** — everything runs in one process
 
 ## Screenshots
@@ -219,6 +219,19 @@ All other settings (syslog port, retention, AbuseIPDB key, WardSONDB tunables, O
 > **⚠️ Important:** Settings and configuration are always stored in the local SQLite database (`data/events.db`), regardless of which storage backend is active. Do not delete this file even when using WardSONDB or OpenSearch — it contains your backend configuration, API keys, and other settings needed to boot the application. Changing the storage backend requires a SIEM restart to take effect.
 
 > **WardSONDB query timeouts:** Query duration is controlled by WardSONDB's server-side `--query-timeout` flag (default 30s). For large datasets or Threat Hunt queries, launch WardSONDB with `--query-timeout 120` or higher. By default the SIEM has no client-side query timeout — this is intentional. If you need to override per-request (e.g. unreliable network, long-running server-side queries you want to cap), set `WARDSONDB_QUERY_TIMEOUT_MS` in `.env` as an escape hatch.
+
+> **Recommended WardSONDB launch flags (NEW-P9):** for production SIEM workloads:
+>
+> ```bash
+> wardsondb \
+>   --bitmap-fields event_type,received_at,network.action,network.src_ip,network.dst_ip,network.dst_port,ids.signature,ids.classification,client_mac,wifi_client_mac,dhcp_mac,enrichment.src.geo_country,enrichment.dst.geo_country,enrichment.src.is_private,enrichment.dst.is_private,delta \
+>   --query-timeout 120 \
+>   --verified-trim
+> ```
+>
+> The `delta` field is added to the bitmap list because Phase 10 compaction filters on `delta: true/false` to delete deltas while preserving canonical rollup docs — without an index this is a full-collection scan. `--verified-trim` keeps storage bounded as partition-drop retention runs. `--query-timeout 120` covers Threat Hunt fan-out across many partitions.
+>
+> **Phase 10 rollup model:** rollup writes are now append-only via `/{col}/docs/_bulk`. Each flush emits delta documents tagged `delta: true` with deterministic `_id = ${bucket}|${keys}|${flushId}`. A 30-minute compaction job folds delta docs older than 1h into a single canonical doc per `(bucket, keys)` (`_id = ...|c`, `delta: false`) and `_delete_by_query` removes the deltas. Queries (`$group + $sum`) are unchanged — they correctly sum across deltas + canonical regardless of compaction state.
 
 ## Project Structure
 
