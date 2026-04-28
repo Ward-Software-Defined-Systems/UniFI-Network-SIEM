@@ -214,9 +214,16 @@ class WardsonDbBackend extends StorageBackend {
     if (this._partitions.has(name)) return;
     await this._ensureCollection(name);
     this._partitions.add(name);
-    // Fire-and-forget — empty collection means index creation is instant
-    this._createPartitionIndexes(name).catch(err =>
-      logger.warn({ err: err.message, partition: name }, 'WardSONDB partition index creation failed'));
+    // NEW-C10: await index creation rather than fire-and-forget. Empty
+    // collections take indexes instantly per WardSONDB API.md, so the
+    // wait is milliseconds — but it eliminates the midnight-rollover
+    // race where the first inserts of a new day landed against an
+    // unindexed partition before indexes were ready.
+    try {
+      await this._createPartitionIndexes(name);
+    } catch (err) {
+      logger.warn({ err: err.message, partition: name }, 'WardSONDB partition index creation failed');
+    }
   }
 
   async _createPartitionIndexes(name) {
@@ -882,7 +889,14 @@ class WardsonDbBackend extends StorageBackend {
         const result = await this._post(`/${partition}/docs/_bulk`, { documents: chunk });
         totalInserted += result.data?.inserted || 0;
         if (result.data?.errors?.length > 0) {
-          logger.warn({ partition, errors: result.data.errors.length }, 'WardSONDB bulk insert had errors');
+          // NEW-C8: include sample of error messages so operators can root-
+          // cause ingest failures (malformed nested types, doc-too-large,
+          // etc.) instead of just seeing a count.
+          logger.warn({
+            partition,
+            errors: result.data.errors.length,
+            sample: result.data.errors.slice(0, 3),
+          }, 'WardSONDB bulk insert had errors');
         }
       }
     }
@@ -952,7 +966,14 @@ class WardsonDbBackend extends StorageBackend {
     if (filters.protocol) andClauses.push({ 'network.protocol': filters.protocol.toUpperCase() });
     if (filters.since) andClauses.push({ received_at: { '$gte': filters.since } });
     if (filters.until) andClauses.push({ received_at: { '$lte': filters.until } });
-    if (filters.search) andClauses.push({ message: { '$regex': filters.search } });
+    if (filters.search) {
+      // NEW-C1: escape regex meta-characters so user input behaves like SQLite's
+      // substring LIKE pattern instead of a regex (192.168.1.1 should match the
+      // literal IP, not "192a168b1c1"). Cap at 1024 chars (API.md regex pattern
+      // length limit).
+      const escaped = String(filters.search).slice(0, 1024).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      andClauses.push({ message: { '$regex': escaped } });
+    }
     if (filters.mac) {
       andClauses.push({
         '$or': [
@@ -980,7 +1001,7 @@ class WardsonDbBackend extends StorageBackend {
     const queryPartition = async (partition, remaining) => {
       const result = await this._post(`/${partition}/query`, {
         filter: queryFilter,
-        sort: [{ '_created_at': 'desc' }],
+        sort: [{ 'received_at': 'desc' }],
         limit: remaining,
         offset,
       });
@@ -995,6 +1016,13 @@ class WardsonDbBackend extends StorageBackend {
   }
 
   async getEventById(id) {
+    // M17: validate UUIDv7 shape up front. A malformed id used to scan
+    // every partition sequentially — at 30+ daily partitions × 30s
+    // server-side query timeout, a single bad id could hang the request
+    // for many minutes.
+    const UUIDV7_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    if (typeof id !== 'string' || !UUIDV7_RE.test(id)) return null;
+
     const cacheMap = await this._getCacheMap();
     const partition = this._partitionFromId(id);
 
@@ -1003,8 +1031,11 @@ class WardsonDbBackend extends StorageBackend {
       if (!result._notFound) return this._documentToEvent(result.data, cacheMap);
     }
 
-    // Fallback: scan all partitions (rare — UUIDv7 partition not in cache)
-    for (const p of this._partitionsNewestFirst()) {
+    // M17: bounded fallback to the 7 most-recent partitions only. A
+    // valid UUIDv7 whose partition isn't in this._partitions is a rare
+    // race (server restart between _partitions refresh and the GET);
+    // unbounded scanning was the worst-case hang path.
+    for (const p of this._partitionsNewestFirst().slice(0, 7)) {
       try {
         const r = await this._get(`/${p}/docs/${encodeURIComponent(id)}`);
         if (!r._notFound) return this._documentToEvent(r.data, cacheMap);
@@ -1047,7 +1078,7 @@ class WardsonDbBackend extends StorageBackend {
     for (const p of this._partitionsNewestFirst()) {
       try {
         const r = await this._post(`/${p}/query`, {
-          sort: [{ '_created_at': 'desc' }],
+          sort: [{ 'received_at': 'desc' }],
           fields: ['received_at'],
           limit: 1,
         });
@@ -1350,15 +1381,19 @@ class WardsonDbBackend extends StorageBackend {
       enrichedCount({
         is_private: false,
         '$or': [
-          { geo_country: { '$ne': null } },
-          { abuse_score: { '$ne': null } },
+          // NEW-C6: $ne is not in WardSONDB's index-supported operators
+          // list (API.md:1317), so $ne: null silently falls back to a
+          // 10K-clamped full scan. $gte: '' / $gte: 0 hit the existing
+          // idx_cache_geo_country / idx_cache_abuse_score indexes.
+          { geo_country: { '$gte': '' } },
+          { abuse_score: { '$gte': 0 } },
         ],
       }),
       enrichedCount({ is_private: false, abuse_score: { '$gt': 0 } }),
       enrichedCount({ is_private: false, abuse_score: { '$gte': 50 } }),
       this._post(`/${this.cacheCollection}/distinct`, {
         field: 'geo_country',
-        filter: { is_private: false, geo_country: { '$ne': null } },
+        filter: { is_private: false, geo_country: { '$gte': '' } },  // NEW-C6
         limit: 1000,
       }).catch(() => ({ data: { count: 0 } })),
     ]);
@@ -1467,16 +1502,16 @@ class WardsonDbBackend extends StorageBackend {
       periodSummary = { enriched, flagged, highThreat: highThreatCount, countries: countriesSet.size };
     }
 
-    // Diagnostic log — helps debug empty-result cases. Info level so it shows
-    // up in default logging.
-    logger.info({
+    // H11: diagnostic log demoted to debug. Was info to help debug
+    // empty-result cases; permanent info-level logging at the
+    // dashboard's 5-30s poll cadence floods logs in steady state.
+    logger.debug({
       since, limit,
       aggRows: aggRows.length,
       cacheHits: cacheMap.size,
       enrichedRows: enrichedRows.length,
       finalIps: ips.length,
       periodIps: periodIps.length,
-      summary,
       ms: Date.now() - t0,
     }, 'WardSONDB getThreatIntel diagnostic');
 
@@ -1523,7 +1558,7 @@ class WardsonDbBackend extends StorageBackend {
       for (let i = 0; i < ips.length; i += CHUNK) {
         const chunk = ips.slice(i, i + CHUNK);
         const cacheRes = await this._post(`/${this.cacheCollection}/query`, {
-          filter: { ip: { '$in': chunk }, is_private: false, geo_lat: { '$ne': null } },
+          filter: { ip: { '$in': chunk }, is_private: false, geo_lat: { '$gte': -90 } },  // NEW-C6
           limit: chunk.length,
         });
         for (const d of (cacheRes.data || [])) cacheMap.set(d.ip, d);
@@ -1552,7 +1587,7 @@ class WardsonDbBackend extends StorageBackend {
     all.sort((a, b) => b.count - a.count);
     const final = all.slice(0, limit);
 
-    logger.info({
+    logger.debug({  // H11
       since, limit,
       srcAgg: srcRows.length,
       dstAgg: dstRows.length,
@@ -1568,6 +1603,11 @@ class WardsonDbBackend extends StorageBackend {
     if (this._isCollectionEmpty()) return [];
 
     // First pass: collect recent event docs across partitions newest-first.
+    // NEW-P5: drop the $exists filter (every event has at least one of
+    // src/dst, JS-side filter handles the rare both-null case) so the
+    // descending received_at sort can use IndexSorted on idx_received_at.
+    // M3: include events with src OR dst — the previous filter required
+    // src_ip and silently dropped dst-only events.
     const partitions = this._partitionsNewestFirst();
     const candidates = [];
     for (const partition of partitions) {
@@ -1575,11 +1615,12 @@ class WardsonDbBackend extends StorageBackend {
       const remaining = limit * 3 - candidates.length;
       try {
         const r = await this._post(`/${partition}/query`, {
-          filter: { 'network.src_ip': { '$exists': true } },
-          sort: [{ '_created_at': 'desc' }],
+          sort: [{ 'received_at': 'desc' }],
           limit: Math.min(remaining, 500),
         });
-        for (const doc of (r.data || [])) candidates.push(doc);
+        for (const doc of (r.data || [])) {
+          if (doc.network?.src_ip || doc.network?.dst_ip) candidates.push(doc);
+        }
       } catch (err) {
         logger.debug({ err: err.message, partition }, 'getRecentGeoEvents partition query failed');
       }
@@ -1598,14 +1639,16 @@ class WardsonDbBackend extends StorageBackend {
       for (let i = 0; i < ips.length; i += CHUNK) {
         const chunk = ips.slice(i, i + CHUNK);
         const cacheRes = await this._post(`/${this.cacheCollection}/query`, {
-          filter: { ip: { '$in': chunk }, is_private: false, geo_lat: { '$ne': null } },
+          filter: { ip: { '$in': chunk }, is_private: false, geo_lat: { '$gte': -90 } },  // NEW-C6
           limit: chunk.length,
         });
         for (const d of (cacheRes.data || [])) cacheMap.set(d.ip, d);
       }
     }
 
-    // Third pass: overlay geo on events that have at least one enriched IP.
+    // Third pass: emit events with at least one enriched IP. NEW-C12 —
+    // pass cacheMap to _documentToEvent so it does the full geo + hostname
+    // overlay (the previous manual overlay below missed the hostname field).
     const events = [];
     for (const doc of candidates) {
       if (events.length >= limit) break;
@@ -1614,44 +1657,15 @@ class WardsonDbBackend extends StorageBackend {
       const sGeo = srcIp ? cacheMap.get(srcIp) : null;
       const dGeo = dstIp ? cacheMap.get(dstIp) : null;
       if (!sGeo && !dGeo) continue;
-      const event = this._documentToEvent(doc);
-      if (sGeo) {
-        event.src_geo_lat = sGeo.geo_lat;
-        event.src_geo_lon = sGeo.geo_lon;
-        event.src_geo_country = sGeo.geo_country;
-        event.src_geo_city = sGeo.geo_city;
-        event.src_abuse_score = sGeo.abuse_score;
-      }
-      if (dGeo) {
-        event.dst_geo_lat = dGeo.geo_lat;
-        event.dst_geo_lon = dGeo.geo_lon;
-        event.dst_geo_country = dGeo.geo_country;
-        event.dst_geo_city = dGeo.geo_city;
-        event.dst_abuse_score = dGeo.abuse_score;
-      }
-      events.push(event);
+      events.push(this._documentToEvent(doc, cacheMap));
     }
     return events;
   }
 
   // --- Enrichment Cache ---
-
-  async getAllCachedEnrichments() {
-    const result = await this._post(`/${this.cacheCollection}/query`, {
-      filter: {},
-      limit: 100000,
-    });
-    return (result.data || []).map(d => ({
-      ip: d.ip,
-      geo_country: d.geo_country || null,
-      geo_city: d.geo_city || null,
-      geo_lat: d.geo_lat ?? null,
-      geo_lon: d.geo_lon ?? null,
-      abuse_score: d.abuse_score ?? null,
-      hostname: d.hostname || null,
-      is_private: d.is_private || false,
-    }));
-  }
+  // Note: the plural getAllCachedEnrichments() (no callers anywhere in
+  // the repo) was removed as part of L6 in Phase 7. Use the singular
+  // getAllCachedEnrichment() below.
 
   async getCachedEnrichment(ip) {
     const result = await this._post(`/${this.cacheCollection}/query`, {
@@ -1705,7 +1719,31 @@ class WardsonDbBackend extends StorageBackend {
   }
 
   async markPrivate(ip) {
-    await this.setCachedEnrichment(ip, { is_private: true });
+    // NEW-C7: PATCH only `is_private: true` on the existing cache row,
+    // or INSERT a minimal doc if absent. Avoids the destructive PUT path
+    // (via setCachedEnrichment) that would null out previously-stored
+    // geo_country / abuse_score / hostname for an IP later flagged private.
+    try {
+      const existing = await this._post(`/${this.cacheCollection}/query`, {
+        filter: { ip },
+        fields: ['_id'],
+        limit: 1,
+      });
+      const doc = existing.data?.[0];
+      const now = new Date().toISOString();
+      if (doc?._id) {
+        await this._patch(`/${this.cacheCollection}/docs/${encodeURIComponent(doc._id)}`, {
+          is_private: true,
+          updated_at: now,
+        });
+      } else {
+        await this._post(`/${this.cacheCollection}/docs`, {
+          ip, is_private: true, updated_at: now,
+        });
+      }
+    } catch (err) {
+      logger.debug({ err: err.message, ip }, 'WardSONDB markPrivate failed');
+    }
   }
 
   async getAllCachedEnrichment() {
@@ -1858,7 +1896,9 @@ class WardsonDbBackend extends StorageBackend {
     let rollupCount = 0;
     try {
       const probe = await this._post(`/${this.rollup5m}/query`, { count_only: true, limit: 1 });
-      rollupCount = probe.meta?.total_count || probe.data?.count || 0;
+      // NEW-C9: prefer data.count (canonical) over meta.total_count
+      // (diagnostic). Use ?? not || so a legitimate 0 isn't replaced.
+      rollupCount = probe.data?.count ?? probe.meta?.total_count ?? 0;
     } catch {}
 
     if (rollupCount > 0) {
@@ -1882,7 +1922,7 @@ class WardsonDbBackend extends StorageBackend {
         let docs;
         try {
           const r = await this._post(`/${partition}/query`, {
-            sort: [{ '_created_at': 'asc' }],
+            sort: [{ 'received_at': 'asc' }],
             limit: CHUNK,
             offset,
           });
