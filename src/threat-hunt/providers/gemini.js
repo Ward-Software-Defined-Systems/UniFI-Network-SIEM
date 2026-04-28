@@ -1,5 +1,6 @@
 const config = require('../../config');
 const { parseSSEStream } = require('../../utils/sse');
+const { throwSanitizedProviderError } = require('./util');
 
 async function invoke(prompt, key) {
   const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${config.threathunt.geminiModel}:generateContent?key=${key}`, {
@@ -11,10 +12,7 @@ async function invoke(prompt, key) {
     }),
   });
 
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`Gemini API error ${res.status}: ${err}`);
-  }
+  if (!res.ok) await throwSanitizedProviderError('Gemini', res);
 
   const data = await res.json();
   return data.candidates?.[0]?.content?.parts?.[0]?.text || 'No response from Gemini';
@@ -31,10 +29,7 @@ async function stream(prompt, key, sendEvent, signal) {
     signal,
   });
 
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`Gemini API error ${res.status}: ${err}`);
-  }
+  if (!res.ok) await throwSanitizedProviderError('Gemini', res);
 
   for await (const { data } of parseSSEStream(res.body)) {
     if (!data || typeof data !== 'object') continue;

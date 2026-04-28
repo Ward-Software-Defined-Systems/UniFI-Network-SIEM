@@ -1,5 +1,6 @@
 const config = require('../../config');
 const { parseSSEStream } = require('../../utils/sse');
+const { throwSanitizedProviderError } = require('./util');
 
 async function invoke(prompt, key) {
   const res = await fetch('https://api.anthropic.com/v1/messages', {
@@ -17,10 +18,7 @@ async function invoke(prompt, key) {
     }),
   });
 
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`Anthropic API error ${res.status}: ${err}`);
-  }
+  if (!res.ok) await throwSanitizedProviderError('Anthropic', res);
 
   const data = await res.json();
   // With thinking enabled, find the text content block (skip thinking blocks)
@@ -46,10 +44,7 @@ async function stream(prompt, key, sendEvent, signal) {
     signal,
   });
 
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`Anthropic API error ${res.status}: ${err}`);
-  }
+  if (!res.ok) await throwSanitizedProviderError('Anthropic', res);
 
   for await (const { data } of parseSSEStream(res.body)) {
     if (!data || typeof data !== 'object') continue;

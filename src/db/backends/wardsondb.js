@@ -640,8 +640,14 @@ class WardsonDbBackend extends StorageBackend {
   // --- Lifecycle ---
 
   _getRequiredEventIndexes() {
+    // NEW-C4: idx_event_type (single-field) was removed because both
+    // idx_type_time (event_type, received_at) and idx_type_action
+    // (event_type, network.action) serve as event_type prefixes for
+    // single-key lookups, AND the bitmap accelerator covers
+    // event_type entirely (low cardinality, ~10 values). Existing
+    // partitions still carry the old index — it's harmless and ages
+    // out as partitions are dropped via retention.
     return [
-      { name: 'idx_event_type', field: 'event_type' },
       { name: 'idx_received_at', field: 'received_at' },
       { name: 'idx_network_action', field: 'network.action' },
       { name: 'idx_src_ip', field: 'network.src_ip' },
@@ -690,6 +696,42 @@ class WardsonDbBackend extends StorageBackend {
     }
   }
 
+  /**
+   * NEW-P4: install or update a TTL policy on each rollup collection.
+   * Idempotent — PUT replaces any existing policy. Errors are logged
+   * but non-fatal (fall back to app-side _delete_by_query in
+   * runRetention()).
+   */
+  async _setRollupTTLs() {
+    const days = this.config.retentionDays;
+    if (!days || days <= 0) {
+      logger.debug('No retention configured; skipping rollup TTL setup');
+      return;
+    }
+    const cols = [
+      this.rollup5m,
+      this.rollupIpHourly,
+      this.rollupPortHourly,
+      this.rollupSigHourly,
+      this.rollupClientHourly,
+    ];
+    for (const col of cols) {
+      try {
+        await this._put(`/${col}/ttl`, {
+          retention_days: days,
+          // Bucket timestamps are produced by align5m()/align1h() in
+          // src/db/rollups.js. They're ISO 8601 strings tied to the
+          // time window the doc covers — stable across delta + canonical
+          // forms — which is what we want for retention.
+          field: 'bucket',
+        });
+        logger.info({ col, days }, 'Rollup TTL policy active');
+      } catch (err) {
+        logger.warn({ err: err.message, col }, 'Failed to set rollup TTL — will fall back to runRetention _delete_by_query');
+      }
+    }
+  }
+
   async initialize() {
     // Verify connection
     const info = await this._get('/');
@@ -731,6 +773,16 @@ class WardsonDbBackend extends StorageBackend {
         }
       }
     }
+
+    // NEW-P4: server-side TTL on each rollup collection. WardSONDB runs
+    // a TTL cleanup task on a 60s cadence (--ttl-interval default), so
+    // expired buckets get purged without an app-side _delete_by_query
+    // roundtrip on every retention cycle. The field is `bucket` (the
+    // 5m/1h-aligned ISO timestamp from src/db/rollups.js), not
+    // _created_at — because after compaction, canonical docs get a
+    // fresh _created_at while their bucket timestamp stays anchored to
+    // the actual time window they cover.
+    await this._setRollupTTLs();
 
     // Initial cached doc count from /_stats.total_documents (matches main).
     // Includes rollups+cache (small overhead) but is reliable.
@@ -1229,18 +1281,71 @@ class WardsonDbBackend extends StorageBackend {
     return allClauses.length === 1 ? allClauses[0] : { '$and': allClauses };
   }
 
+  /**
+   * Decode a base64-encoded keyset cursor → { received_at, id } | null.
+   * Malformed cursors silently fall back to a fresh first page rather
+   * than 400-erroring the whole query.
+   */
+  _decodeCursor(raw) {
+    if (!raw || typeof raw !== 'string') return null;
+    try {
+      const json = Buffer.from(raw, 'base64').toString('utf8');
+      const obj = JSON.parse(json);
+      if (typeof obj?.received_at === 'string' && typeof obj?.id === 'string') {
+        return { received_at: obj.received_at, id: obj.id };
+      }
+    } catch {}
+    return null;
+  }
+
+  _encodeCursor(receivedAt, id) {
+    return Buffer.from(JSON.stringify({ received_at: receivedAt, id }), 'utf8').toString('base64');
+  }
+
   async queryEvents(filters = {}) {
     const limit = Math.min(parseInt(filters.limit || '50', 10), 500);
-    let offset = parseInt(filters.offset || '0', 10);
+    const cursor = this._decodeCursor(filters.cursor);
     const queryFilter = this._buildFilter(filters);
+
+    // M4: keyset pagination. With a `(received_at, _id)` cursor we can
+    // skip directly to the next page without paying the offset-scan
+    // cost (which grows with the number of events ahead of you in the
+    // partition). _id here is UUIDv7 — its time-prefix means sorting by
+    // _id within a same-millisecond received_at bucket is also
+    // monotonic, so the keyset stays well-defined.
+    //
+    // Fall-back: if no cursor is provided, the old `offset` parameter
+    // still works for backwards compatibility with callers that haven't
+    // adopted cursors yet (e.g., direct API consumers).
+    let offset = cursor ? 0 : parseInt(filters.offset || '0', 10);
+    let cursorFilter = queryFilter;
+    if (cursor) {
+      const cursorClause = {
+        '$or': [
+          { received_at: { '$lt': cursor.received_at } },
+          {
+            '$and': [
+              { received_at: cursor.received_at },
+              { _id: { '$lt': cursor.id } },
+            ],
+          },
+        ],
+      };
+      cursorFilter = queryFilter
+        ? { '$and': [queryFilter, cursorClause] }
+        : cursorClause;
+    }
+
+    // Fetch limit + 1 so we can detect hasMore without a second query.
+    const fetchLimit = limit + 1;
 
     // M9: collect raw docs first, then look up cache for the IPs we
     // actually saw. Avoids the previous bulk-load that pulled up to
     // 100K cache rows for a query returning at most 500 events.
     const queryPartition = async (partition, remaining) => {
       const result = await this._post(`/${partition}/query`, {
-        filter: queryFilter,
-        sort: [{ 'received_at': 'desc' }],
+        filter: cursorFilter,
+        sort: [{ received_at: 'desc' }, { _id: 'desc' }],
         limit: remaining,
         offset,
       });
@@ -1249,7 +1354,18 @@ class WardsonDbBackend extends StorageBackend {
       return docs;
     };
 
-    const docs = await this._queryAcrossPartitions(queryPartition, filters.since, filters.until, limit);
+    // When a cursor is set, scope partitions to those overlapping
+    // [start, cursor.received_at] — we never need to look at partitions
+    // newer than the cursor.
+    const untilForFanOut = cursor ? cursor.received_at : filters.until;
+    const rawDocs = await this._queryAcrossPartitions(queryPartition, filters.since, untilForFanOut, fetchLimit);
+
+    const hasMore = rawDocs.length > limit;
+    const docs = hasMore ? rawDocs.slice(0, limit) : rawDocs;
+    const last = docs[docs.length - 1];
+    const nextCursor = hasMore && last
+      ? this._encodeCursor(last.received_at, last._id)
+      : null;
 
     const ipSet = new Set();
     for (const doc of docs) {
@@ -1258,8 +1374,8 @@ class WardsonDbBackend extends StorageBackend {
     }
     const cacheMap = await this._lookupCacheForIps(ipSet);
 
-    const events = docs.map(d => this._documentToEvent(d, cacheMap));
-    return { events };
+    const events = docs.map((d) => this._documentToEvent(d, cacheMap));
+    return { events, hasMore, nextCursor };
   }
 
   async getEventById(id) {
@@ -1993,26 +2109,31 @@ class WardsonDbBackend extends StorageBackend {
   }
 
   async setCachedEnrichment(ip, data) {
+    // M5: read-then-write merge. Pull the full existing row (not just
+    // `_id`) so we can preserve fields not present in the new `data`.
+    // Matches OpenSearch's behavior and keeps SQLite/WardSONDB/
+    // OpenSearch caches in lockstep — no more "marking an IP private
+    // wipes its geo_country" footgun.
     const existing = await this._post(`/${this.cacheCollection}/query`, {
       filter: { ip },
-      fields: ['_id'],
       limit: 1,
     });
+    const prev = existing.data?.[0] || {};
 
     const cacheDoc = {
       ip,
-      geo_country: data.geo_country || null,
-      geo_city: data.geo_city || null,
-      geo_lat: data.geo_lat ?? null,
-      geo_lon: data.geo_lon ?? null,
-      abuse_score: data.abuse_score ?? null,
-      hostname: data.hostname || null,
-      is_private: data.is_private ? true : false,
+      geo_country: data.geo_country ?? prev.geo_country ?? null,
+      geo_city: data.geo_city ?? prev.geo_city ?? null,
+      geo_lat: data.geo_lat ?? prev.geo_lat ?? null,
+      geo_lon: data.geo_lon ?? prev.geo_lon ?? null,
+      abuse_score: data.abuse_score ?? prev.abuse_score ?? null,
+      hostname: data.hostname ?? prev.hostname ?? null,
+      is_private: (data.is_private ?? prev.is_private) ? true : false,
       updated_at: new Date().toISOString(),
     };
 
-    if (existing.data && existing.data.length > 0) {
-      await this._put(`/${this.cacheCollection}/docs/${existing.data[0]._id}`, cacheDoc);
+    if (prev._id) {
+      await this._put(`/${this.cacheCollection}/docs/${encodeURIComponent(prev._id)}`, cacheDoc);
     } else {
       await this._post(`/${this.cacheCollection}/docs`, cacheDoc);
     }
@@ -2095,7 +2216,10 @@ class WardsonDbBackend extends StorageBackend {
       }
     }
 
-    // Clean rollup entries older than cutoff (small collections, cheap)
+    // NEW-P4: rollups are pruned by WardSONDB's server-side TTL policy
+    // (set in _setRollupTTLs() during initialize()). This _delete_by_query
+    // sweep stays as a safety net — it's a no-op once TTL has caught
+    // up, and indexed/cheap when it does match anything.
     const rollupCols = [this.rollup5m, this.rollupIpHourly, this.rollupPortHourly, this.rollupSigHourly, this.rollupClientHourly];
     for (const col of rollupCols) {
       try {

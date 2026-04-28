@@ -881,13 +881,27 @@ class SqliteBackend extends StorageBackend {
   }
 
   async setCachedEnrichment(ip, data) {
+    // M5: read-then-write merge to match OpenSearch's behavior. Without
+    // this, `setCachedEnrichment(ip, { is_private: true })` would null
+    // out previously-stored geo_country / abuse_score / hostname for an
+    // IP later flagged private. WardSONDB has its own NEW-C7 PATCH-only
+    // markPrivate path; OpenSearch already merges. Now all three
+    // backends preserve fields that aren't in the new `data` argument.
+    const existing = this.db.prepare('SELECT * FROM ip_enrichment_cache WHERE ip = ?').get(ip) || {};
     this.db.prepare(`
       INSERT OR REPLACE INTO ip_enrichment_cache
       (ip, geo_country, geo_city, geo_lat, geo_lon, abuse_score, hostname, is_private, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
-    `).run(ip, data.geo_country || null, data.geo_city || null, data.geo_lat || null,
-      data.geo_lon || null, data.abuse_score ?? null, data.hostname || null,
-      data.is_private ? 1 : 0);
+    `).run(
+      ip,
+      data.geo_country ?? existing.geo_country ?? null,
+      data.geo_city ?? existing.geo_city ?? null,
+      data.geo_lat ?? existing.geo_lat ?? null,
+      data.geo_lon ?? existing.geo_lon ?? null,
+      data.abuse_score ?? existing.abuse_score ?? null,
+      data.hostname ?? existing.hostname ?? null,
+      (data.is_private ?? existing.is_private) ? 1 : 0,
+    );
   }
 
   async markPrivate(ip) {

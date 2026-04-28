@@ -42,6 +42,10 @@ async function initialize() {
         ...backendEnvConfig,
         ...engineConfig,
         abuseIpDbCacheHours: config.enrichment.abuseIpDbCacheHours,
+        // NEW-P4: surfaced into WardSONDB so it can install server-side
+        // TTL policies on the rollup collections. Other backends ignore
+        // this field.
+        retentionDays: config.db.retentionDays,
       });
       await activeBackend.initialize();
       logger.info({ backend: engineId }, 'Using external storage backend');

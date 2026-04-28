@@ -1,5 +1,6 @@
 const config = require('../../config');
 const { parseSSEStream } = require('../../utils/sse');
+const { throwSanitizedProviderError } = require('./util');
 
 async function invoke(prompt, key) {
   const res = await fetch('https://api.openai.com/v1/chat/completions', {
@@ -15,10 +16,7 @@ async function invoke(prompt, key) {
     }),
   });
 
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`OpenAI API error ${res.status}: ${err}`);
-  }
+  if (!res.ok) await throwSanitizedProviderError('OpenAI', res);
 
   const data = await res.json();
   return data.choices?.[0]?.message?.content || 'No response from OpenAI';
@@ -40,10 +38,7 @@ async function stream(prompt, key, sendEvent, signal) {
     signal,
   });
 
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`OpenAI API error ${res.status}: ${err}`);
-  }
+  if (!res.ok) await throwSanitizedProviderError('OpenAI', res);
 
   for await (const { data } of parseSSEStream(res.body)) {
     if (data === '[DONE]') break;
