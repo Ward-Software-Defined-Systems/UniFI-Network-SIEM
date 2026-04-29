@@ -330,18 +330,23 @@ The app runs HTTPS by default with an auto-generated self-signed certificate. Be
 
 | Concern | Severity | Description |
 |---|---|---|
-| No authentication | **Medium** | The web UI, API, and database reset are accessible to anyone who can reach port 3000. On a trusted home network this is acceptable. If exposed beyond your LAN, put it behind a reverse proxy with auth (nginx/Caddy with basic auth or mTLS). |
-| Syslog spoofing | **Low** | The UDP syslog listener accepts messages from any source on the network. A device on your LAN could send crafted syslog to inject fake events. UDP has no authentication by design — this is inherent to syslog. |
-| Database reset without auth | **Low** | The `POST /api/settings/reset-db` endpoint requires no credentials. Mitigated by the network-only access constraint and the two-click confirmation in the UI. |
+| Single shared API token | **Low** | The web UI, REST API, and WebSocket are bearer-token gated (Phase 3). The token is auto-generated on first run and logged once to the console — copy it to log in via the browser TokenGate or send `Authorization: Bearer <token>` on API calls. It's a single shared token (no per-user accounts or RBAC) and can be rotated via Settings or by setting `SIEM_API_TOKEN`. For multi-user or internet-exposed deployments, put a reverse proxy (nginx/Caddy basic auth, OAuth2 proxy, mTLS) in front of port 3000. |
+| Syslog spoofing | **Low** | UDP has no authentication by design — a device on your LAN could send crafted syslog to inject fake events. Mitigations available: set `SYSLOG_ALLOWED_SOURCES` to a CIDR allowlist (Phase 3B) so the listener drops packets from anywhere outside; the listener also has a per-source rate cap to limit a single misbehaving sender. Without an allowlist, any host on the broadcast domain can submit events. |
 | TLS certificate trust | **Info** | The self-signed certificate will trigger browser warnings. For production, replace `data/server.key` and `data/server.cert` with certs from a trusted CA or your own internal CA. |
 
-**Known advisories:**
-- **esbuild ≤ 0.24.2 (moderate)** — allows any website to send requests to the Vite dev server and read responses ([GHSA-67mh-4wv8-2f99](https://github.com/advisories/GHSA-67mh-4wv8-2f99)). This is a dev-only dependency used during frontend development — it does not affect production builds or the deployed SIEM. Fix requires upgrading Vite to 7.x (breaking change).
+**Known advisories** (after the 2026-04-28 patch-level audit cleanup):
+- **esbuild ≤ 0.24.2 (moderate, dev-only)** — affects the Vite dev server (`npm run dev`, port 5173) and the Vitest test runner: a page in the operator's browser can send requests to a running dev/test server and read responses ([GHSA-67mh-4wv8-2f99](https://github.com/advisories/GHSA-67mh-4wv8-2f99)). Production builds and `npm start` are unaffected. Cleared by upgrading Vite 5 → 8 (frontend) and Vitest 2 → 4 (backend); both are semver-major and gated on a focused upgrade pass. This is the only residual advisory in either tree — `path-to-regexp`, `brace-expansion`, `lodash`, `picomatch`, and `postcss` were all patched in-range during the cleanup.
 
 **Already mitigated:**
+- **API + WebSocket authentication** — bearer-token middleware on every `/api/*` route; WebSocket validates the same token via `?token=` query at upgrade time; frontend `TokenGate.jsx` login screen + global fetch wrapper. The reset-DB endpoint sits behind this same gate (Phase 3)
+- **Sensitive settings at rest** — AbuseIPDB / Anthropic / OpenAI / Gemini keys, OpenSearch password, etc. are AES-256-GCM-encrypted in the SQLite settings table (`v1:iv:tag:ct` envelope). Master key auto-generated on first run, logged once, rotatable via Settings (Phase 2)
+- **Default localhost bind** — `HTTP_HOST` defaults to `127.0.0.1`; the server is reachable only from the host until you explicitly set a LAN IP or `0.0.0.0`
+- **Request body limit** — `express.json({ limit: '64kb' })` caps API request bodies; Helmet sets a CSP scoped for OSM/CartoDB tiles + `wss:`
+- **LLM prompt-injection defense** — every attacker-influenceable Threat Hunt field (IDS signature, hostname, geo_country, whois fields) is wrapped in `<untrusted>...</untrusted>` after control-char strip + 256-char truncation + closing-tag entity-escape; system prompt sent via the elevated-trust channel of each provider (Phase 13)
+- **LLM output rendering** — markdown rendered via `marked` + `DOMPurify` with `ALLOWED_TAGS` restricted to formatting + lists; no attributes, no `<a>`, no `<img>`. PDF export escapes operator-supplied interpolated values (Phase 13)
 - **SQL injection** — all queries use parameterized prepared statements. The `getTimeline()` strftime format string is derived from a fixed internal lookup (not from caller input), eliminating the previous injection surface
 - **XSS** — React auto-escapes all rendered content including untrusted syslog data
-- **API key exposure** — AbuseIPDB key is redacted in API responses (last 4 chars only)
+- **API key exposure** — sensitive keys are redacted to last 4 chars in API responses
 - **Transport security** — HTTPS/WSS enabled by default with auto-generated TLS certificate
 - **Parser crashes** — all parsers wrapped in try/catch with fallback to system parser
 - **AbuseIPDB rate limits** — automatic 1-hour backoff when daily limit is reached
