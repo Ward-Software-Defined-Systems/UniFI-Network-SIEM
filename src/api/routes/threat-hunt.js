@@ -154,7 +154,12 @@ router.post('/investigate-stream', async (req, res) => {
   // memory bloat in the buffered SSE reader).
   const controller = new AbortController();
   let aborted = false;
-  req.on('close', () => {
+  // Express `req.on('close')` fires the moment express.json finishes reading
+  // the POST body — not when the client disconnects — so it would always set
+  // `aborted = true` before gather even runs and silently swallow the
+  // metadata write. `res.on('close')` only fires on real socket teardown
+  // (or after a normal `res.end()`), which is what we actually want.
+  res.on('close', () => {
     if (!res.writableEnded) {
       aborted = true;
       controller.abort();
