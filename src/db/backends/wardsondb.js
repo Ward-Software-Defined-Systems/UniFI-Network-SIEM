@@ -1610,6 +1610,70 @@ class WardsonDbBackend extends StorageBackend {
     return map;
   }
 
+  /**
+   * Async generator yielding batches of enriched non-private cache rows.
+   * Pages by `ip > lastIp` to walk past the API's 10K /query cap. Uses the
+   * NEW-C6 $gte-instead-of-$exists pattern so idx_cache_geo_country and
+   * idx_cache_abuse_score participate. Required by getThreatIntel period
+   * summary and getAllCachedEnrichment pre-warm — both previously silently
+   * truncated at the 10K cap.
+   */
+  async *_iterateEnrichedCacheRows(batchSize = 1000) {
+    let lastIp = null;
+    while (true) {
+      const conds = [
+        { is_private: false },
+        { '$or': [
+          { geo_country: { '$gte': '' } },
+          { abuse_score: { '$gte': 0 } },
+        ]},
+      ];
+      if (lastIp != null) conds.push({ ip: { '$gt': lastIp } });
+      let res;
+      try {
+        res = await this._post(`/${this.cacheCollection}/query`, {
+          filter: { '$and': conds },
+          sort: [{ ip: 'asc' }],
+          limit: batchSize,
+        });
+      } catch (err) {
+        logger.error({ err: err.message }, 'WardSONDB _iterateEnrichedCacheRows page failed');
+        break;
+      }
+      const rows = res.data || [];
+      if (rows.length === 0) break;
+      yield rows;
+      if (rows.length < batchSize) break;
+      const tailIp = rows[rows.length - 1].ip;
+      if (tailIp == null || tailIp === lastIp) break;
+      lastIp = tailIp;
+    }
+  }
+
+  /**
+   * Given a chunk of IPs, return the subset present in rollupIpHourly with
+   * bucket >= since. Pushes the $in match + $group fully to the server so
+   * we get exactly the IPs we asked about, free of the /distinct 10K cap.
+   */
+  async _rollupPresenceForIps(ips, since) {
+    const present = new Set();
+    if (!ips || ips.length === 0) return present;
+    try {
+      const res = await this._post(`/${this.rollupIpHourly}/aggregate`, {
+        pipeline: [
+          { '$match': { ip: { '$in': ips }, bucket: { '$gte': since } } },
+          { '$group': { '_id': 'ip' } },
+        ],
+      });
+      for (const r of (res.data || [])) {
+        if (r._id) present.add(r._id);
+      }
+    } catch (err) {
+      logger.error({ err: err.message, count: ips.length }, 'WardSONDB _rollupPresenceForIps failed');
+    }
+    return present;
+  }
+
   async getTopTalkers(since, direction, limit, excludePrivate) {
     if (this._isCollectionEmpty()) return [];
     const dir = direction === 'dst' ? 'dst' : 'src';
@@ -1863,53 +1927,39 @@ class WardsonDbBackend extends StorageBackend {
       });
 
     // --- Period summary ---
-    // NEW-P2: /distinct over the indexed `ip` field is index-only when no
-    // filter touches a non-indexed column; even with the bucket filter
-    // it's cheaper than $group{_id:ip} on a busy rollup collection.
-    // M14: surface truncation so the UI can warn that the period summary
-    // undercounts. The 10K cap is the WardSONDB API hard limit per
-    // API.md:1657 — we can't get more even by raising it.
-    const PERIOD_IPS_CAP = 10000;
-    const periodIpsRes = await this._post(`/${this.rollupIpHourly}/distinct`, {
-      field: 'ip',
-      filter: { bucket: { '$gte': since } },
-      limit: PERIOD_IPS_CAP,
-    }).catch(() => ({ data: { values: [], truncated: false } }));
-    const periodIps = (periodIpsRes.data?.values || []).filter(Boolean);
-    const periodIpsTruncated = periodIpsRes.data?.truncated === true
-      || periodIps.length >= PERIOD_IPS_CAP;
-    if (periodIpsTruncated) {
-      logger.warn({
-        cap: PERIOD_IPS_CAP, periodIps: periodIps.length, since,
-      }, 'WardSONDB getThreatIntel periodIps truncated — period summary may undercount');
-    }
-
-    let periodSummary = { enriched: 0, flagged: 0, highThreat: 0, countries: 0 };
-    if (periodIps.length > 0) {
-      const CHUNK = 500;
-      const countriesSet = new Set();
-      let enriched = 0, flagged = 0, highThreatCount = 0;
-      for (let i = 0; i < periodIps.length; i += CHUNK) {
-        const chunk = periodIps.slice(i, i + CHUNK);
-        const res = await this._post(`/${this.cacheCollection}/query`, {
-          filter: { ip: { '$in': chunk }, is_private: false },
-          limit: chunk.length,
-        });
-        for (const d of (res.data || [])) {
-          if (d.geo_country != null || d.abuse_score != null) enriched++;
-          if (d.abuse_score > 0) flagged++;
-          if (d.abuse_score >= 50) highThreatCount++;
-          if (d.geo_country) countriesSet.add(d.geo_country);
+    // Walk the (small) enriched cache, batched 500 IPs at a time, and check
+    // rollupIpHourly presence per chunk via $in match + $group. Replaces the
+    // previous /distinct PERIOD_IPS_CAP=10000 path which silently undercounted
+    // busy 30d windows above 10K unique IPs and matched cache rows asymmetrically.
+    let pEnriched = 0, pFlagged = 0, pHighThreat = 0;
+    const pCountries = new Set();
+    let cacheRowsScanned = 0;
+    const CHUNK = 500;
+    for await (const batch of this._iterateEnrichedCacheRows(1000)) {
+      cacheRowsScanned += batch.length;
+      const chunks = [];
+      for (let i = 0; i < batch.length; i += CHUNK) chunks.push(batch.slice(i, i + CHUNK));
+      const presents = await Promise.all(
+        chunks.map(slice => this._rollupPresenceForIps(slice.map(r => r.ip).filter(Boolean), since)),
+      );
+      for (let ci = 0; ci < chunks.length; ci++) {
+        const present = presents[ci];
+        for (const r of chunks[ci]) {
+          if (!present.has(r.ip)) continue;
+          if (r.geo_country == null && r.abuse_score == null) continue;
+          pEnriched++;
+          if (r.abuse_score > 0) pFlagged++;
+          if (r.abuse_score >= 50) pHighThreat++;
+          if (r.geo_country) pCountries.add(r.geo_country);
         }
       }
-      periodSummary = {
-        enriched, flagged, highThreat: highThreatCount, countries: countriesSet.size,
-        // M14: propagate truncation flag so the UI can render a banner
-        // when the period summary undercounts (busy 30d windows with
-        // >10K unique IPs).
-        truncated: periodIpsTruncated,
-      };
     }
+    const periodSummary = {
+      enriched: pEnriched,
+      flagged: pFlagged,
+      highThreat: pHighThreat,
+      countries: pCountries.size,
+    };
 
     // H11: diagnostic log demoted to debug. Was info to help debug
     // empty-result cases; permanent info-level logging at the
@@ -1920,7 +1970,7 @@ class WardsonDbBackend extends StorageBackend {
       cacheHits: cacheMap.size,
       enrichedRows: enrichedRows.length,
       finalIps: ips.length,
-      periodIps: periodIps.length,
+      cacheRowsScanned,
       ms: Date.now() - t0,
     }, 'WardSONDB getThreatIntel diagnostic');
 
@@ -2168,27 +2218,21 @@ class WardsonDbBackend extends StorageBackend {
   }
 
   async getAllCachedEnrichment() {
-    const result = await this._post(`/${this.cacheCollection}/query`, {
-      filter: {
-        '$and': [
-          { is_private: false },
-          { '$or': [
-            { geo_country: { '$exists': true } },
-            { abuse_score: { '$exists': true } },
-          ]},
-        ],
-      },
-      limit: 10000,
-    });
-    return (result.data || []).map(d => ({
-      ip: d.ip,
-      geo_country: d.geo_country,
-      geo_city: d.geo_city,
-      geo_lat: d.geo_lat,
-      geo_lon: d.geo_lon,
-      abuse_score: d.abuse_score,
-      hostname: d.hostname,
-    }));
+    const out = [];
+    for await (const batch of this._iterateEnrichedCacheRows(1000)) {
+      for (const d of batch) {
+        out.push({
+          ip: d.ip,
+          geo_country: d.geo_country,
+          geo_city: d.geo_city,
+          geo_lat: d.geo_lat,
+          geo_lon: d.geo_lon,
+          abuse_score: d.abuse_score,
+          hostname: d.hostname,
+        });
+      }
+    }
+    return out;
   }
 
   // --- Maintenance ---

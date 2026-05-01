@@ -1251,115 +1251,84 @@ class OpenSearchBackend extends StorageBackend {
     if (this._isCollectionEmpty()) return empty;
 
     try {
-      // Get all non-private enrichment cache entries
-      const allCache = await this._getAllCacheEntries();
+      // Top row (cache-wide totals) runs in parallel with the cache walk below.
+      const summaryPromise = this._cacheGlobalSummary();
 
-      // Summary from cache
-      const totalEnriched = allCache.length;
-      const withAbuseScore = allCache.filter(c => c.abuseConfidenceScore > 0).length;
-      const highThreat = allCache.filter(c => c.abuseConfidenceScore >= 50).length;
-      const countriesSet = new Set(allCache.filter(c => c.country).map(c => c.country));
+      // Walk the enriched cache fully — paginated by search_after, no 10K cap.
+      // Collect rows into cacheMap and IP chunks for parallel period-stats
+      // queries against the events index.
+      const cacheMap = new Map();
+      const ipChunks = [];
+      for await (const batch of this._iterateEnrichedCacheEntries(1000)) {
+        const ips = [];
+        for (const c of batch) {
+          cacheMap.set(c.ip, c);
+          ips.push(c.ip);
+        }
+        ipChunks.push(ips);
+      }
 
-      // IP aggregation from events in period — both src and dst directions
-      const aggBody = {
-        aggs: {
-          events: { value_count: { field: 'received_at' } },
-          blocked: { filter: { term: { network_action: 'block' } } },
-          threats: { filter: { term: { event_type: 'threat' } } },
-          last_seen: { max: { field: 'received_at' } },
-        },
-      };
-      const [srcResult, dstResult] = await Promise.all([
-        this.client.search({
-          index: this.eventsIndex,
-          body: {
-            size: 0,
-            query: this._timeRange(since),
-            aggs: { by_ip: { terms: { field: 'src_ip', size: 5000 }, ...aggBody } },
-          },
-        }),
-        this.client.search({
-          index: this.eventsIndex,
-          body: {
-            size: 0,
-            query: this._timeRange(since),
-            aggs: { by_ip: { terms: { field: 'dst_ip', size: 5000 }, ...aggBody } },
-          },
-        }),
-      ]);
+      // Each chunk's events query is independent — fan out in parallel.
+      // Filtering with `terms.include` against cache IPs avoids the 5000-bucket
+      // truncation bug of the previous top-N terms agg approach.
+      const statsResults = await Promise.all(
+        ipChunks.map(chunk => this._eventsStatsForIps(chunk, since)),
+      );
 
-      // Merge src + dst buckets into combined per-IP stats
+      // Merge per-chunk maps. An IP may appear in multiple chunks only if cache
+      // pagination rolls past it (shouldn't happen with stable ip-sort), but
+      // merging is cheap insurance.
       const ipStats = new Map();
-      const mergeBuckets = (buckets) => {
-        for (const b of buckets) {
-          const existing = ipStats.get(b.key);
-          if (existing) {
-            existing.event_count += b.doc_count;
-            existing.blocked_count += b.blocked?.doc_count || 0;
-            existing.threat_count += b.threats?.doc_count || 0;
-            const ls = b.last_seen?.value_as_string;
-            if (ls && (!existing.lastSeen || ls > existing.lastSeen)) existing.lastSeen = ls;
+      for (const stats of statsResults) {
+        for (const [ip, s] of stats) {
+          const cur = ipStats.get(ip);
+          if (cur) {
+            cur.event_count += s.event_count;
+            cur.blocked_count += s.blocked_count;
+            cur.threat_count += s.threat_count;
+            if (s.lastSeen && (!cur.lastSeen || s.lastSeen > cur.lastSeen)) cur.lastSeen = s.lastSeen;
           } else {
-            ipStats.set(b.key, {
-              event_count: b.doc_count,
-              blocked_count: b.blocked?.doc_count || 0,
-              threat_count: b.threats?.doc_count || 0,
-              lastSeen: b.last_seen?.value_as_string || null,
-            });
+            ipStats.set(ip, { ...s });
           }
         }
-      };
-      mergeBuckets(srcResult.body?.aggregations?.by_ip?.buckets || []);
-      mergeBuckets(dstResult.body?.aggregations?.by_ip?.buckets || []);
+      }
 
-      // Build cache lookup
-      const cacheMap = new Map(allCache.map(c => [c.ip, c]));
-
-      // Merge event agg with cache
+      // Period summary tallied directly from cache rows that had ≥1 event.
+      let pEnriched = 0, pFlagged = 0, pHighThreat = 0;
+      const pCountries = new Set();
       const ips = [];
-      const periodCountries = new Set();
-      let periodFlagged = 0;
-      let periodHighThreat = 0;
-
       for (const [ip, stats] of ipStats) {
-        const cached = cacheMap.get(ip);
-        if (!cached) continue; // only show enriched IPs
-        if (!cached.country && cached.abuseConfidenceScore == null) continue;
-
-        if (cached.country) periodCountries.add(cached.country);
-        if (cached.abuseConfidenceScore > 0) periodFlagged++;
-        if (cached.abuseConfidenceScore >= 50) periodHighThreat++;
-
+        const c = cacheMap.get(ip);
+        if (!c) continue;
+        if (!c.country && c.abuseConfidenceScore == null) continue;
+        pEnriched++;
+        if (c.abuseConfidenceScore > 0) pFlagged++;
+        if (c.abuseConfidenceScore >= 50) pHighThreat++;
+        if (c.country) pCountries.add(c.country);
         ips.push({
           ip,
-          hostname: cached.hostname || null,
-          country: cached.country || null,
-          city: cached.city || null,
-          lat: cached.latitude ?? null,
-          lon: cached.longitude ?? null,
-          abuse_score: cached.abuseConfidenceScore ?? null,
+          hostname: c.hostname || null,
+          country: c.country || null,
+          city: c.city || null,
+          lat: c.latitude ?? null,
+          lon: c.longitude ?? null,
+          abuse_score: c.abuseConfidenceScore ?? null,
           event_count: stats.event_count,
           blocked_count: stats.blocked_count,
           threat_count: stats.threat_count,
           lastSeen: stats.lastSeen,
         });
       }
-
-      // Sort by event count then abuse score
       ips.sort((a, b) => b.event_count - a.event_count || (b.abuse_score || 0) - (a.abuse_score || 0));
 
+      const summary = await summaryPromise;
       return {
-        summary: {
-          totalEnriched,
-          withAbuseScore,
-          highThreat,
-          countries: countriesSet.size,
-        },
+        summary,
         periodSummary: {
-          enriched: ips.length,
-          flagged: periodFlagged,
-          highThreat: periodHighThreat,
-          countries: periodCountries.size,
+          enriched: pEnriched,
+          flagged: pFlagged,
+          highThreat: pHighThreat,
+          countries: pCountries.size,
         },
         ips: ips.slice(0, limit),
       };
@@ -1515,29 +1484,141 @@ class OpenSearchBackend extends StorageBackend {
     }
   }
 
-  /** Get all non-private cache entries with enrichment data */
-  async _getAllCacheEntries() {
+  /** Bool query matching non-private cache rows that carry geo or abuse data. */
+  _enrichedCacheQuery() {
+    return {
+      bool: {
+        must_not: [{ term: { is_private: true } }],
+        should: [
+          { exists: { field: 'country' } },
+          { exists: { field: 'abuseConfidenceScore' } },
+        ],
+        minimum_should_match: 1,
+      },
+    };
+  }
+
+  /**
+   * Single aggregation that returns the cache-wide summary (top-row cards).
+   * Removes the 10K hits cap from the previous _getAllCacheEntries-then-iterate
+   * pattern. cardinality precision_threshold is set to OpenSearch's max (40000)
+   * — exact for ≤40K distinct values.
+   */
+  async _cacheGlobalSummary() {
     try {
       const { body } = await this.client.search({
         index: this.cacheIndex,
         body: {
-          size: 10000,
-          query: {
-            bool: {
-              must_not: [{ term: { is_private: true } }],
-              should: [
-                { exists: { field: 'country' } },
-                { exists: { field: 'abuseConfidenceScore' } },
-              ],
-              minimum_should_match: 1,
-            },
+          size: 0,
+          track_total_hits: true,
+          query: this._enrichedCacheQuery(),
+          aggs: {
+            withAbuseScore: { filter: { range: { abuseConfidenceScore: { gt: 0 } } } },
+            highThreat:    { filter: { range: { abuseConfidenceScore: { gte: 50 } } } },
+            countries:     { cardinality: { field: 'country', precision_threshold: 40000 } },
           },
         },
       });
-      return (body.hits?.hits || []).map(h => ({ ip: h._id, ...h._source }));
-    } catch {
-      return [];
+      return {
+        totalEnriched: body.hits?.total?.value ?? 0,
+        withAbuseScore: body.aggregations?.withAbuseScore?.doc_count ?? 0,
+        highThreat: body.aggregations?.highThreat?.doc_count ?? 0,
+        countries: body.aggregations?.countries?.value ?? 0,
+      };
+    } catch (err) {
+      logger.error({ err }, 'OpenSearch _cacheGlobalSummary failed');
+      return { totalEnriched: 0, withAbuseScore: 0, highThreat: 0, countries: 0 };
     }
+  }
+
+  /**
+   * Async generator that yields batches of enriched non-private cache rows.
+   * Pages via sort + search_after on the `ip` field (== _id) — handles caches
+   * larger than the 10K index.max_result_window cap.
+   */
+  async *_iterateEnrichedCacheEntries(batchSize = 1000) {
+    const baseBody = {
+      size: batchSize,
+      query: this._enrichedCacheQuery(),
+      sort: [{ ip: { order: 'asc' } }],
+      track_total_hits: false,
+    };
+    let searchAfter;
+    while (true) {
+      const body = searchAfter ? { ...baseBody, search_after: searchAfter } : baseBody;
+      let hits;
+      try {
+        const res = await this.client.search({ index: this.cacheIndex, body });
+        hits = res.body?.hits?.hits || [];
+      } catch (err) {
+        logger.error({ err }, 'OpenSearch _iterateEnrichedCacheEntries page failed');
+        break;
+      }
+      if (hits.length === 0) break;
+      yield hits.map(h => ({ ip: h._id, ...h._source }));
+      if (hits.length < batchSize) break;
+      searchAfter = hits[hits.length - 1].sort;
+    }
+  }
+
+  /**
+   * Given a chunk of IPs, return per-IP stats for those that appeared in
+   * events during [since, now) — uses `terms.include` to push the filter
+   * down so we only get back the IPs we asked about (no top-N truncation).
+   * Returns Map<ip, {event_count, blocked_count, threat_count, lastSeen}>.
+   */
+  async _eventsStatsForIps(ips, since) {
+    const stats = new Map();
+    if (!ips || ips.length === 0) return stats;
+    const subAggs = {
+      blocked:   { filter: { term: { network_action: 'block' } } },
+      threats:   { filter: { term: { event_type: 'threat' } } },
+      last_seen: { max: { field: 'received_at' } },
+    };
+    try {
+      const { body } = await this.client.search({
+        index: this.eventsIndex,
+        body: {
+          size: 0,
+          query: {
+            bool: {
+              filter: [
+                this._timeRange(since),
+                {
+                  bool: {
+                    should: [
+                      { terms: { src_ip: ips } },
+                      { terms: { dst_ip: ips } },
+                    ],
+                    minimum_should_match: 1,
+                  },
+                },
+              ],
+            },
+          },
+          aggs: {
+            by_src: { terms: { field: 'src_ip', include: ips, size: ips.length }, aggs: subAggs },
+            by_dst: { terms: { field: 'dst_ip', include: ips, size: ips.length }, aggs: subAggs },
+          },
+        },
+      });
+      const merge = (buckets) => {
+        for (const b of buckets) {
+          const cur = stats.get(b.key) || { event_count: 0, blocked_count: 0, threat_count: 0, lastSeen: null };
+          cur.event_count += b.doc_count;
+          cur.blocked_count += b.blocked?.doc_count || 0;
+          cur.threat_count += b.threats?.doc_count || 0;
+          const ls = b.last_seen?.value_as_string;
+          if (ls && (!cur.lastSeen || ls > cur.lastSeen)) cur.lastSeen = ls;
+          stats.set(b.key, cur);
+        }
+      };
+      merge(body.aggregations?.by_src?.buckets || []);
+      merge(body.aggregations?.by_dst?.buckets || []);
+    } catch (err) {
+      logger.error({ err, count: ips.length }, 'OpenSearch _eventsStatsForIps failed');
+    }
+    return stats;
   }
 
   async getCachedEnrichment(ip) {
@@ -1608,16 +1689,21 @@ class OpenSearchBackend extends StorageBackend {
   }
 
   async getAllCachedEnrichment() {
-    const entries = await this._getAllCacheEntries();
-    return entries.map(e => ({
-      ip: e.ip,
-      geo_country: e.country || null,
-      geo_city: e.city || null,
-      geo_lat: e.latitude ?? null,
-      geo_lon: e.longitude ?? null,
-      abuse_score: e.abuseConfidenceScore ?? null,
-      hostname: e.hostname || null,
-    }));
+    const out = [];
+    for await (const batch of this._iterateEnrichedCacheEntries(1000)) {
+      for (const e of batch) {
+        out.push({
+          ip: e.ip,
+          geo_country: e.country || null,
+          geo_city: e.city || null,
+          geo_lat: e.latitude ?? null,
+          geo_lon: e.longitude ?? null,
+          abuse_score: e.abuseConfidenceScore ?? null,
+          hostname: e.hostname || null,
+        });
+      }
+    }
+    return out;
   }
 
   // --- Health & Maintenance ---
