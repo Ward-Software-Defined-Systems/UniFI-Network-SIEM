@@ -25,6 +25,8 @@ async function invoke(prompt, key) {
       model: config.threathunt.anthropicModel,
       max_tokens: config.threathunt.anthropicMaxTokens,
       thinking: { type: 'adaptive', display: 'summarized' },
+      // Deepest reasoning setting for the most thorough analysis (GA; default 'high').
+      output_config: { effort: 'max' },
       system: huntSystemPrompt(),
       messages: [{ role: 'user', content: prompt }],
     }),
@@ -50,6 +52,8 @@ async function stream(prompt, key, sendEvent, signal) {
       model: config.threathunt.anthropicModel,
       max_tokens: config.threathunt.anthropicMaxTokens,
       thinking: { type: 'adaptive', display: 'summarized' },
+      // Deepest reasoning setting for the most thorough analysis (GA; default 'high').
+      output_config: { effort: 'max' },
       system: huntSystemPrompt(),
       stream: true,
       messages: [{ role: 'user', content: prompt }],
