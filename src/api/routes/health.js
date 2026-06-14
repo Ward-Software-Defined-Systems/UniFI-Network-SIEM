@@ -5,7 +5,7 @@ const storage = require('../../db/storage');
 const logger = require('../../utils/logger');
 const { isGeoIpAvailable } = require('../../enrichment/geoip');
 const { isAbuseIpDbConfigured } = require('../../enrichment/abuseipdb');
-const { getQueueSize } = require('../../enrichment/enrichment-queue');
+const { getQueueSize, getUpdateQueueSize } = require('../../enrichment/enrichment-queue');
 
 const { getResetGraceStatus } = require('./settings');
 
@@ -115,6 +115,7 @@ router.get('/', async (req, res) => {
           geoip: isGeoIpAvailable(),
           abuseipdb: isAbuseIpDbConfigured(),
           queueSize: getQueueSize(),
+          updateQueueSize: getUpdateQueueSize(),
         },
         backendHealth: hc?.details || null,
         ...(isRebuilding ? { rebuilding: true, writePressure } : {}),

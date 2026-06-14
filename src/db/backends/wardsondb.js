@@ -9,13 +9,20 @@
  *     rollups-5m, rollups-ip-hourly, rollups-port-hourly,
  *     rollups-sig-hourly, rollups-client-hourly.
  *   Counts are accumulated in memory during insertEvents() and flushed every
- *   5 seconds via a read-then-increment cycle.
+ *   5 seconds. Phase 10 (M10) replaced the read-then-increment pattern with
+ *   append-only deltas via `/{col}/docs/_bulk`: each flush writes a fresh
+ *   batch of {bucket, ..., count, delta:true} documents with deterministic
+ *   `_id = ${bucket}|${k1}|${k2}|${flushId}`. Queries already use
+ *   `$group + $sum` so they sum correctly across delta docs without code
+ *   changes. The append-only model removes the lost-update race that
+ *   PATCH had under concurrent flushes (M11).
  * - Singleton enrichment_cache collection stores per-IP enrichment data.
  * - Settings remain in SQLite (needed to boot and select the backend).
  */
 const StorageBackend = require('./interface');
 const logger = require('../../utils/logger');
 const { isPrivateIp } = require('../../utils/ip-utils');
+const { accumulateRollups, mergeRollups, newRollupBuffers, align5m, align1h } = require('../rollups');
 // Use undici's own fetch (not Node's globalThis.fetch) so the per-client Agent
 // we construct from the same undici package has a matching request-handler
 // interface. Mixing Node's bundled undici with a standalone-undici Agent
@@ -77,13 +84,18 @@ class WardsonDbBackend extends StorageBackend {
     this._flushing = false;
     this._shuttingDown = false;
     this._backfillStarted = false;
+    // M10: append-only delta `_id` suffix counter. Combined with Date.now()
+    // it stays unique across same-millisecond flushes (rare but possible
+    // under heavy load) and tags each flush idempotently — duplicate _id
+    // returns 409 per-doc on a retry, so the same buffer can be re-flushed
+    // without double-counting.
+    this._flushCounter = 0;
+    // NEW-P3: rollup compaction state.
+    this._compacting = false;
+    this._compactionIntervalHandle = null;
 
     // Cached doc count across event partitions, used for empty-DB short-circuit
     this._cachedDocCount = null;
-
-    // Enrichment cache map (30s TTL), used by stats joins and event overlay
-    this._cacheMap = null;
-    this._cacheMapTs = 0;
   }
 
   static get metadata() {
@@ -166,17 +178,11 @@ class WardsonDbBackend extends StorageBackend {
   async _patch(path, body) { return this._request('PATCH', path, body); }
   async _delete(path) { return this._request('DELETE', path); }
 
-  // --- Bucket alignment (mirrors sqlite.js:494-495) ---
-
-  _align5m(iso) {
-    const ms = (iso ? new Date(iso) : new Date()).getTime();
-    return new Date(Math.floor(ms / 300000) * 300000).toISOString();
-  }
-
-  _align1h(iso) {
-    const ms = (iso ? new Date(iso) : new Date()).getTime();
-    return new Date(Math.floor(ms / 3600000) * 3600000).toISOString();
-  }
+  // Bucket alignment kept as instance methods for backward compatibility
+  // with internal callers; both delegate to the shared helpers in
+  // src/db/rollups.js so SQLite and WardSONDB stay in lockstep.
+  _align5m(iso) { return align5m(iso); }
+  _align1h(iso) { return align1h(iso); }
 
   // --- Partition helpers ---
 
@@ -219,9 +225,16 @@ class WardsonDbBackend extends StorageBackend {
     if (this._partitions.has(name)) return;
     await this._ensureCollection(name);
     this._partitions.add(name);
-    // Fire-and-forget — empty collection means index creation is instant
-    this._createPartitionIndexes(name).catch(err =>
-      logger.warn({ err: err.message, partition: name }, 'WardSONDB partition index creation failed'));
+    // NEW-C10: await index creation rather than fire-and-forget. Empty
+    // collections take indexes instantly per WardSONDB API.md, so the
+    // wait is milliseconds — but it eliminates the midnight-rollover
+    // race where the first inserts of a new day landed against an
+    // unindexed partition before indexes were ready.
+    try {
+      await this._createPartitionIndexes(name);
+    } catch (err) {
+      logger.warn({ err: err.message, partition: name }, 'WardSONDB partition index creation failed');
+    }
   }
 
   async _createPartitionIndexes(name) {
@@ -266,147 +279,86 @@ class WardsonDbBackend extends StorageBackend {
   // --- Rollup buffers ---
 
   _newBuffers() {
-    return {
-      fiveMin: new Map(),     // key -> { bucket, event_type, action, count }
-      ipHourly: new Map(),    // key -> { bucket, ip, direction, event_count, blocked_count, threat_count }
-      portHourly: new Map(),  // key -> { bucket, port, protocol, count }
-      sigHourly: new Map(),   // key -> { bucket, signature, classification, count }
-      clientHourly: new Map(),// key -> { bucket, mac, event_count, wifi_count, dhcp_count, firewall_count }
-    };
+    return newRollupBuffers();
   }
 
   /**
-   * Accumulate rollup deltas in memory. Mirrors sqlite.js:481-568 _updateRollups.
-   * Private IPs are NOT filtered at write time — they're filtered at query time
-   * when callers pass excludePrivate (matches SQLite's HAVING-style semantics).
+   * Accumulate rollup deltas into the persistent in-memory buffer that
+   * the 5-second flush worker drains. Pure aggregation lives in
+   * src/db/rollups.js — this method is just the buffer-merge wrapper.
+   * Private IPs are NOT filtered at write time — they're filtered at
+   * query time when callers pass excludePrivate (matches SQLite's
+   * HAVING-style semantics).
    */
   _accumulateRollups(events) {
-    const bufs = this._rollupBuffers;
-    const now = Date.now();
+    mergeRollups(this._rollupBuffers, accumulateRollups(events));
+  }
 
-    for (const evt of events) {
-      const ms = evt.received_at ? new Date(evt.received_at).getTime() : now;
-      if (!Number.isFinite(ms)) continue;
-      const b5 = new Date(Math.floor(ms / 300000) * 300000).toISOString();
-      const b1 = new Date(Math.floor(ms / 3600000) * 3600000).toISOString();
-      const type = evt.event_type || 'unknown';
-      const action = evt.action || '';
-      const isBlocked = action === 'block' ? 1 : 0;
-      const isThreat = type === 'threat' ? 1 : 0;
+  // --- Rollup flush (append-only deltas, M10) ---
 
-      // rollups-5m — every event
-      {
-        const key = `${b5}|${type}|${action}`;
-        const ex = bufs.fiveMin.get(key);
-        if (ex) ex.count++;
-        else bufs.fiveMin.set(key, { bucket: b5, event_type: type, action, count: 1 });
-      }
+  /**
+   * Build the deterministic `_id` for a delta document.
+   *
+   * Shape: `${bucket}|${naturalKeys}|${flushId}`. The flushId suffix
+   * makes each flush's deltas unique while letting a retry of the SAME
+   * flush land on duplicate `_id`s (409 per-doc → silently skipped).
+   * The natural-key prefix is what compaction filters on.
+   */
+  _baseKeyFiveMin(d) { return `${d.bucket}|${d.event_type}|${d.action}`; }
+  _baseKeyIpHourly(d) { return `${d.bucket}|${d.ip}|${d.direction}`; }
+  _baseKeyPortHourly(d) { return `${d.bucket}|${d.port}|${d.protocol}`; }
+  _baseKeySigHourly(d) { return `${d.bucket}|${d.signature}|${d.classification}`; }
+  _baseKeyClientHourly(d) { return `${d.bucket}|${d.mac}`; }
 
-      // rollups-ip-hourly — both directions, all IPs (filter at query time)
-      if (evt.src_ip) {
-        const key = `${b1}|${evt.src_ip}|src`;
-        const ex = bufs.ipHourly.get(key);
-        if (ex) {
-          ex.event_count++;
-          ex.blocked_count += isBlocked;
-          ex.threat_count += isThreat;
-        } else {
-          bufs.ipHourly.set(key, {
-            bucket: b1, ip: evt.src_ip, direction: 'src',
-            event_count: 1, blocked_count: isBlocked, threat_count: isThreat,
-          });
-        }
+  /**
+   * Per-collection bulk insert. Returns true on success, false on
+   * transactional failure. WardSONDB's `_bulk` is atomic per call — if
+   * the transaction fails, none of the docs are committed (per
+   * API.md:512), so a re-merge of the drain buffer on failure is safe
+   * and won't double-count.
+   */
+  async _bulkInsertDeltas(collection, docs) {
+    if (docs.length === 0) return true;
+    try {
+      const result = await this._post(`/${collection}/docs/_bulk`, { documents: docs });
+      const inserted = result.data?.inserted ?? 0;
+      const errors = result.data?.errors || [];
+      if (errors.length > 0) {
+        // Per-doc errors. Duplicate _id is the expected mode on a retry
+        // of the same flush — log at debug so a real failure (e.g.,
+        // schema validation) still gets surfaced via the inserted-vs-
+        // submitted gap below.
+        logger.debug(
+          { col: collection, errorCount: errors.length, sample: errors.slice(0, 3) },
+          'Rollup bulk delta had per-doc errors',
+        );
       }
-      if (evt.dst_ip) {
-        const key = `${b1}|${evt.dst_ip}|dst`;
-        const ex = bufs.ipHourly.get(key);
-        if (ex) {
-          ex.event_count++;
-          ex.blocked_count += isBlocked;
-          ex.threat_count += isThreat;
-        } else {
-          bufs.ipHourly.set(key, {
-            bucket: b1, ip: evt.dst_ip, direction: 'dst',
-            event_count: 1, blocked_count: isBlocked, threat_count: isThreat,
-          });
-        }
+      // Successful retry: inserted may be 0 if every doc was a duplicate.
+      // Successful first attempt: inserted should equal docs.length.
+      // Anything in between with non-duplicate errors is a problem worth
+      // logging, but we still consider the call successful — partial
+      // success means the duplicates already landed previously.
+      const expected = docs.length;
+      if (inserted < expected && errors.length === 0) {
+        logger.warn({ col: collection, inserted, submitted: expected }, 'Rollup bulk under-inserted with no errors reported');
       }
-
-      // rollups-port-hourly — every event with dst_port (mirrors sqlite.js:521-524)
-      if (evt.dst_port != null) {
-        const protocol = evt.protocol || '';
-        const key = `${b1}|${evt.dst_port}|${protocol}`;
-        const ex = bufs.portHourly.get(key);
-        if (ex) ex.count++;
-        else bufs.portHourly.set(key, { bucket: b1, port: evt.dst_port, protocol, count: 1 });
-      }
-
-      // rollups-sig-hourly — threat events only, '(no signature)' fallback
-      if (type === 'threat') {
-        const sig = evt.ids_signature || '(no signature)';
-        const cls = evt.ids_classification || '';
-        const key = `${b1}|${sig}|${cls}`;
-        const ex = bufs.sigHourly.get(key);
-        if (ex) ex.count++;
-        else bufs.sigHourly.set(key, { bucket: b1, signature: sig, classification: cls, count: 1 });
-      }
-
-      // rollups-client-hourly — first-non-null MAC, pre-pivoted by event type
-      const mac = evt.client_mac || evt.wifi_client_mac || evt.dhcp_mac;
-      if (mac) {
-        const key = `${b1}|${mac}`;
-        const ex = bufs.clientHourly.get(key);
-        if (ex) {
-          ex.event_count++;
-          if (type === 'wifi') ex.wifi_count++;
-          else if (type === 'dhcp') ex.dhcp_count++;
-          else if (type === 'firewall') ex.firewall_count++;
-        } else {
-          bufs.clientHourly.set(key, {
-            bucket: b1, mac,
-            event_count: 1,
-            wifi_count: type === 'wifi' ? 1 : 0,
-            dhcp_count: type === 'dhcp' ? 1 : 0,
-            firewall_count: type === 'firewall' ? 1 : 0,
-          });
-        }
-      }
+      return true;
+    } catch (err) {
+      logger.warn(
+        { err: err.message, col: collection, docs: docs.length },
+        'Rollup bulk delta insert failed',
+      );
+      return false;
     }
   }
 
-  // --- Rollup flush ---
-
-  _docIdForFiveMin(d) { return `${d.bucket}|${d.event_type}|${d.action}`; }
-  _docIdForIpHourly(d) { return `${d.bucket}|${d.ip}|${d.direction}`; }
-  _docIdForPortHourly(d) { return `${d.bucket}|${d.port}|${d.protocol}`; }
-  _docIdForSigHourly(d) { return `${d.bucket}|${d.signature}|${d.classification}`; }
-  _docIdForClientHourly(d) { return `${d.bucket}|${d.mac}`; }
-
-  async _upsertRollup(collection, id, doc, mergeFields) {
-    const path = `/${collection}/docs/${encodeURIComponent(id)}`;
-    const existing = await this._get(path);
-
-    if (existing._notFound) {
-      // Insert new doc with the deterministic _id in the body
-      const body = { _id: id, ...doc };
-      const created = await this._post(`/${collection}/docs`, body);
-      if (created._conflict) {
-        // Concurrent creation — fall through to PATCH on retry
-        const refetched = await this._get(path);
-        if (refetched._notFound) throw new Error(`Failed to upsert rollup ${id}: conflict but doc not found`);
-        const merged = {};
-        for (const f of mergeFields) merged[f] = (refetched.data[f] || 0) + (doc[f] || 0);
-        await this._patch(path, merged);
-      }
-      return;
-    }
-
-    const merged = {};
-    for (const f of mergeFields) merged[f] = (existing.data[f] || 0) + (doc[f] || 0);
-    await this._patch(path, merged);
-  }
-
-  _mergeBuffersBack(drain) {
+  /**
+   * Re-merge a partial drain back into the live buffer. Called when
+   * one or more per-collection bulk inserts failed — only the failed
+   * Maps are re-merged, so collections that succeeded don't get
+   * double-counted on the next flush.
+   */
+  _mergeBuffersBack(drain, failedMaps) {
     const live = this._rollupBuffers;
     const mergeMap = (src, dst, fields) => {
       for (const [k, v] of src) {
@@ -418,11 +370,11 @@ class WardsonDbBackend extends StorageBackend {
         }
       }
     };
-    mergeMap(drain.fiveMin, live.fiveMin, ['count']);
-    mergeMap(drain.ipHourly, live.ipHourly, ['event_count', 'blocked_count', 'threat_count']);
-    mergeMap(drain.portHourly, live.portHourly, ['count']);
-    mergeMap(drain.sigHourly, live.sigHourly, ['count']);
-    mergeMap(drain.clientHourly, live.clientHourly, ['event_count', 'wifi_count', 'dhcp_count', 'firewall_count']);
+    if (failedMaps.has('fiveMin')) mergeMap(drain.fiveMin, live.fiveMin, ['count']);
+    if (failedMaps.has('ipHourly')) mergeMap(drain.ipHourly, live.ipHourly, ['event_count', 'blocked_count', 'threat_count']);
+    if (failedMaps.has('portHourly')) mergeMap(drain.portHourly, live.portHourly, ['count']);
+    if (failedMaps.has('sigHourly')) mergeMap(drain.sigHourly, live.sigHourly, ['count']);
+    if (failedMaps.has('clientHourly')) mergeMap(drain.clientHourly, live.clientHourly, ['event_count', 'wifi_count', 'dhcp_count', 'firewall_count']);
   }
 
   async _flushRollups() {
@@ -430,63 +382,73 @@ class WardsonDbBackend extends StorageBackend {
     this._flushing = true;
     const t0 = Date.now();
 
-    // Atomic swap
-    const drain = this._rollupBuffers;
-    this._rollupBuffers = this._newBuffers();
-
-    const fiveMinFields = ['count'];
-    const ipFields = ['event_count', 'blocked_count', 'threat_count'];
-    const portFields = ['count'];
-    const sigFields = ['count'];
-    const clientFields = ['event_count', 'wifi_count', 'dhcp_count', 'firewall_count'];
-
-    const tasks = [];
-    for (const doc of drain.fiveMin.values()) tasks.push({ col: this.rollup5m, id: this._docIdForFiveMin(doc), doc, fields: fiveMinFields });
-    for (const doc of drain.ipHourly.values()) tasks.push({ col: this.rollupIpHourly, id: this._docIdForIpHourly(doc), doc, fields: ipFields });
-    for (const doc of drain.portHourly.values()) tasks.push({ col: this.rollupPortHourly, id: this._docIdForPortHourly(doc), doc, fields: portFields });
-    for (const doc of drain.sigHourly.values()) tasks.push({ col: this.rollupSigHourly, id: this._docIdForSigHourly(doc), doc, fields: sigFields });
-    for (const doc of drain.clientHourly.values()) tasks.push({ col: this.rollupClientHourly, id: this._docIdForClientHourly(doc), doc, fields: clientFields });
-
-    if (tasks.length === 0) {
-      this._flushing = false;
-      return;
-    }
-
-    let failed = false;
     try {
+      // Atomic swap so accumulation continues into a fresh buffer while
+      // the prior buffer drains.
+      const drain = this._rollupBuffers;
+      this._rollupBuffers = this._newBuffers();
+
+      // Stable per-flush identifier. Combined with the natural-key prefix
+      // it produces a deterministic `_id` for each delta — meaning a
+      // retry of the same flush hits 409 per-doc and skips, never
+      // double-counts.
+      const flushId = `${Date.now()}-${this._flushCounter++}`;
+
+      // Build per-collection delta arrays. Each delta carries `delta:true`
+      // so compaction (Phase 10B / NEW-P3) can target them with
+      // `_delete_by_query` without touching canonical docs.
+      const buildDeltas = (map, baseKeyFn) => {
+        const out = [];
+        for (const d of map.values()) {
+          out.push({ _id: `${baseKeyFn(d)}|${flushId}`, ...d, delta: true });
+        }
+        return out;
+      };
+
+      const tasks = [
+        { key: 'fiveMin', col: this.rollup5m, docs: buildDeltas(drain.fiveMin, (d) => this._baseKeyFiveMin(d)) },
+        { key: 'ipHourly', col: this.rollupIpHourly, docs: buildDeltas(drain.ipHourly, (d) => this._baseKeyIpHourly(d)) },
+        { key: 'portHourly', col: this.rollupPortHourly, docs: buildDeltas(drain.portHourly, (d) => this._baseKeyPortHourly(d)) },
+        { key: 'sigHourly', col: this.rollupSigHourly, docs: buildDeltas(drain.sigHourly, (d) => this._baseKeySigHourly(d)) },
+        { key: 'clientHourly', col: this.rollupClientHourly, docs: buildDeltas(drain.clientHourly, (d) => this._baseKeyClientHourly(d)) },
+      ];
+
+      const totalDocs = tasks.reduce((n, t) => n + t.docs.length, 0);
+      if (totalDocs === 0) return;
+
+      // Bulk insert per collection in parallel (each call is its own
+      // atomic transaction at the WardSONDB layer). flushConcurrency
+      // caps the parallelism; with 5 collections and a default of 4 the
+      // worker pool absorbs all five with at most one slot of queueing.
+      const failedMaps = new Set();
       let i = 0;
-      const workers = Array.from({ length: this.flushConcurrency }, async () => {
+      const workers = Array.from({ length: Math.min(this.flushConcurrency, tasks.length) }, async () => {
         while (i < tasks.length) {
           const my = tasks[i++];
-          try {
-            await this._upsertRollup(my.col, my.id, my.doc, my.fields);
-          } catch (err) {
-            failed = true;
-            logger.debug({ err: err.message, id: my.id, col: my.col }, 'Rollup upsert failed');
-          }
+          const ok = await this._bulkInsertDeltas(my.col, my.docs);
+          if (!ok) failedMaps.add(my.key);
         }
       });
       await Promise.all(workers);
-    } catch (err) {
-      failed = true;
-      logger.warn({ err: err.message }, 'Rollup flush worker pool failed');
+
+      if (failedMaps.size > 0) {
+        logger.warn({ failed: [...failedMaps] }, 'Rollup flush partial failure — re-merging affected buffers for retry');
+        this._mergeBuffersBack(drain, failedMaps);
+      }
+
+      logger.debug({
+        '5m': drain.fiveMin.size,
+        ip: drain.ipHourly.size,
+        port: drain.portHourly.size,
+        sig: drain.sigHourly.size,
+        client: drain.clientHourly.size,
+        ms: Date.now() - t0,
+        flushId,
+        failed: failedMaps.size,
+      }, 'Rollup flush');
+    } finally {
+      this._flushing = false;
     }
-
-    if (failed) {
-      logger.warn({ tasks: tasks.length }, 'Rollup flush had errors, re-merging buffers for retry');
-      this._mergeBuffersBack(drain);
-    }
-
-    logger.debug({
-      '5m': drain.fiveMin.size,
-      ip: drain.ipHourly.size,
-      port: drain.portHourly.size,
-      sig: drain.sigHourly.size,
-      client: drain.clientHourly.size,
-      ms: Date.now() - t0,
-    }, 'Rollup flush');
-
-    this._flushing = false;
   }
 
   _startFlushInterval() {
@@ -499,11 +461,272 @@ class WardsonDbBackend extends StorageBackend {
     this._flushIntervalHandle.unref?.();
   }
 
+  // --- Rollup compaction (NEW-P3) ---
+
+  /**
+   * Per-collection compaction definitions. Each entry says how to
+   * group the deltas by their natural key, the count fields to sum,
+   * and how to assemble the canonical doc + its `_id` from a $group row.
+   *
+   * Canonical docs share the same shape as deltas — including `delta:
+   * false` so queries can keep using `$group + $sum` without filter
+   * changes while compaction targets `delta: true` for deletion.
+   */
+  _compactionSpecs() {
+    return [
+      {
+        col: this.rollup5m,
+        keyFields: { event_type: 'event_type', action: 'action' },
+        sumFields: ['count'],
+        canonicalIdFor: (row) => `${row.bucket}|${row.event_type}|${row.action}|c`,
+      },
+      {
+        col: this.rollupIpHourly,
+        keyFields: { ip: 'ip', direction: 'direction' },
+        sumFields: ['event_count', 'blocked_count', 'threat_count'],
+        canonicalIdFor: (row) => `${row.bucket}|${row.ip}|${row.direction}|c`,
+      },
+      {
+        col: this.rollupPortHourly,
+        keyFields: { port: 'port', protocol: 'protocol' },
+        sumFields: ['count'],
+        canonicalIdFor: (row) => `${row.bucket}|${row.port}|${row.protocol}|c`,
+      },
+      {
+        col: this.rollupSigHourly,
+        keyFields: { signature: 'signature', classification: 'classification' },
+        sumFields: ['count'],
+        canonicalIdFor: (row) => `${row.bucket}|${row.signature}|${row.classification}|c`,
+      },
+      {
+        col: this.rollupClientHourly,
+        keyFields: { mac: 'mac' },
+        sumFields: ['event_count', 'wifi_count', 'dhcp_count', 'firewall_count'],
+        canonicalIdFor: (row) => `${row.bucket}|${row.mac}|c`,
+      },
+    ];
+  }
+
+  /**
+   * Compact buckets that closed at least `minAgeHours` ago.
+   *
+   * Per bucket: CLAIM a snapshot of the exact delta `_id`s, SUM those claimed
+   * deltas + the existing canonical, PUT the canonical (full replacement), then
+   * DELETE only the claimed `_id`s. The claim set is the load-bearing detail —
+   * a flush that writes a new delta into the same bucket AFTER the snapshot is
+   * neither summed (the sum matches only claimed `_id`s) nor deleted (the delete
+   * targets only claimed `_id`s), so it survives and is folded by the next
+   * cycle. The previous implementation aggregated the whole bucket then deleted
+   * by `{bucket, delta:true}` — any delta flushed between those two calls was
+   * deleted but never counted, silently losing it (acute during startup backfill,
+   * which flushes deltas into old buckets exactly while compaction scans them).
+   *
+   * Folding the existing canonical (delta:false) into the sum keeps the PUT a
+   * full replacement, so re-runs are idempotent; canonicals are written only by
+   * this single-threaded compactor (the `_compacting` guard), so reading them
+   * never races a flush. NOTE: a process crash in the sub-second window between
+   * the canonical PUT and the delete can over-count that bucket (the surviving
+   * claimed deltas get re-folded into the already-updated canonical next run).
+   * PUT-first is deliberate — it risks over-count, never the under-count that
+   * delete-first would cause. This crash edge predates this change and is out of
+   * scope; the fix here is the flush-vs-compaction race, not crash atomicity.
+   */
+  async _compactRollups(minAgeHours = 1) {
+    if (this._compacting) return;
+    this._compacting = true;
+    const t0 = Date.now();
+    let totalCanonicalsWritten = 0;
+    let totalDeltasDeleted = 0;
+    try {
+      const cutoff = new Date(Date.now() - minAgeHours * 60 * 60 * 1000).toISOString();
+      for (const spec of this._compactionSpecs()) {
+        const counts = await this._compactCollection(spec, cutoff);
+        totalCanonicalsWritten += counts.canonicals;
+        totalDeltasDeleted += counts.deltas;
+      }
+      logger.info({
+        canonicals: totalCanonicalsWritten,
+        deltasDeleted: totalDeltasDeleted,
+        ms: Date.now() - t0,
+        cutoff,
+      }, 'Rollup compaction complete');
+    } catch (err) {
+      logger.warn({ err: err.message }, 'Rollup compaction failed');
+    } finally {
+      this._compacting = false;
+    }
+  }
+
+  async _compactCollection(spec, cutoff) {
+    const { col, keyFields, sumFields, canonicalIdFor } = spec;
+
+    // Distinct old buckets that still contain deltas. If only canonical
+    // docs are present, there's nothing to compact for that bucket.
+    let buckets;
+    try {
+      const r = await this._post(`/${col}/distinct`, {
+        field: 'bucket',
+        filter: { bucket: { '$lt': cutoff }, delta: true },
+        limit: 5000,
+      });
+      buckets = r.data?.values || [];
+    } catch (err) {
+      logger.warn({ err: err.message, col }, 'Compaction distinct lookup failed');
+      return { canonicals: 0, deltas: 0 };
+    }
+    if (buckets.length === 0) return { canonicals: 0, deltas: 0 };
+
+    let canonicals = 0;
+    let deltas = 0;
+
+    const CHUNK = 500; // mirrors the $in chunking in _lookupCacheForIps
+
+    for (const bucket of buckets) {
+      try {
+        // 1. CLAIM: snapshot the exact delta _ids we will fold and delete.
+        //    Anything flushed after this snapshot is left for the next cycle.
+        const ids = await this._snapshotDeltaIds(col, bucket);
+        if (ids.length === 0) continue;
+
+        const groupSpec = { _id: keyFields };
+        for (const f of sumFields) groupSpec[f] = { '$sum': f };
+
+        // 2. SUM the claimed deltas, grouped by natural key. Chunk the $in so a
+        //    backfilled hour-bucket with thousands of deltas stays within the
+        //    server's query payload caps.
+        const totals = new Map(); // keyJSON -> { key, sums }
+        const fold = (rows) => {
+          for (const row of rows || []) {
+            const k = JSON.stringify(row._id);
+            const acc = totals.get(k) || { key: row._id, sums: {} };
+            for (const f of sumFields) acc.sums[f] = (acc.sums[f] || 0) + (row[f] || 0);
+            totals.set(k, acc);
+          }
+        };
+        for (let i = 0; i < ids.length; i += CHUNK) {
+          const chunk = ids.slice(i, i + CHUNK);
+          const agg = await this._post(`/${col}/aggregate`, {
+            pipeline: [
+              { '$match': { _id: { '$in': chunk } } },
+              { '$group': groupSpec },
+            ],
+          });
+          fold(agg.data);
+        }
+
+        // 3. FOLD the existing canonical (delta:false) into the totals so the
+        //    PUT is a full replacement (idempotent). Canonicals are written
+        //    only by this single-threaded compactor, so this read never races
+        //    a flush.
+        const canonAgg = await this._post(`/${col}/aggregate`, {
+          pipeline: [
+            { '$match': { bucket, delta: false } },
+            { '$group': groupSpec },
+          ],
+        });
+        fold(canonAgg.data);
+        if (totals.size === 0) continue;
+
+        // 4. PUT canonical docs (replace if exists, insert if not). Per
+        //    WardSONDB API.md: PUT replaces and returns 404 if missing, so on
+        //    404 we POST to create, retrying the PUT on a concurrent-create 409.
+        for (const { key, sums } of totals.values()) {
+          const doc = { bucket, ...key, delta: false };
+          for (const f of sumFields) doc[f] = sums[f] || 0;
+          const id = canonicalIdFor(doc);
+          const path = `/${col}/docs/${encodeURIComponent(id)}`;
+
+          const replaced = await this._put(path, doc);
+          if (replaced._notFound) {
+            const created = await this._post(`/${col}/docs`, { _id: id, ...doc });
+            if (created._conflict) {
+              // Race: another compactor created it concurrently. Retry the PUT.
+              await this._put(path, doc).catch(() => {});
+            }
+          }
+          canonicals++;
+        }
+
+        // 5. DELETE only the claimed delta _ids (chunked to match step 2).
+        //    Canonical docs (delta:false) and any deltas flushed after step 1
+        //    are not in `ids`, so they're left intact.
+        for (let i = 0; i < ids.length; i += CHUNK) {
+          const chunk = ids.slice(i, i + CHUNK);
+          const del = await this._post(`/${col}/docs/_delete_by_query`, {
+            filter: { _id: { '$in': chunk } },
+          });
+          deltas += del.data?.deleted || 0;
+        }
+      } catch (err) {
+        logger.warn({ err: err.message, col, bucket }, 'Per-bucket compaction failed');
+      }
+    }
+
+    return { canonicals, deltas };
+  }
+
+  /**
+   * Snapshot the `_id`s of every delta doc in a closed bucket — the claim set
+   * for compaction. Pages through with `fields:['_id']` (stable `_id` sort),
+   * deduping defensively since offset paging can re-surface a boundary row when
+   * a concurrent flush inserts ahead of the cursor. Bounded so a pathological
+   * bucket can't spin forever; any overflow is simply folded by a later cycle.
+   */
+  async _snapshotDeltaIds(col, bucket) {
+    const PAGE = 1000;
+    const MAX_PAGES = 200; // 200k _ids/bucket ceiling — far above any real bucket
+    const seen = new Set();
+    let offset = 0;
+    for (let page = 0; page < MAX_PAGES; page++) {
+      let rows;
+      try {
+        const r = await this._post(`/${col}/query`, {
+          filter: { bucket, delta: true },
+          fields: ['_id'],
+          sort: [{ _id: 'asc' }],
+          limit: PAGE,
+          offset,
+        });
+        rows = r.data || [];
+      } catch (err) {
+        logger.warn({ err: err.message, col, bucket }, 'Compaction delta-id snapshot failed');
+        break;
+      }
+      if (rows.length === 0) break;
+      for (const d of rows) if (d._id) seen.add(d._id);
+      if (rows.length < PAGE) break;
+      offset += rows.length;
+      if (page === MAX_PAGES - 1) {
+        logger.warn({ col, bucket, claimed: seen.size }, 'Compaction snapshot hit page cap — remainder deferred to next cycle');
+      }
+    }
+    return [...seen];
+  }
+
+  _startCompactionInterval() {
+    if (this._compactionIntervalHandle) clearInterval(this._compactionIntervalHandle);
+    // Run compaction every 30 minutes. The cutoff window (default 1h)
+    // ensures we never touch buckets that could still receive flush
+    // writes from a delayed event arrival.
+    this._compactionIntervalHandle = setInterval(() => {
+      if (this._shuttingDown) return;
+      this._compactRollups().catch((err) =>
+        logger.warn({ err: err.message }, 'Rollup compaction cycle error'));
+    }, 30 * 60 * 1000);
+    this._compactionIntervalHandle.unref?.();
+  }
+
   // --- Lifecycle ---
 
   _getRequiredEventIndexes() {
+    // NEW-C4: idx_event_type (single-field) was removed because both
+    // idx_type_time (event_type, received_at) and idx_type_action
+    // (event_type, network.action) serve as event_type prefixes for
+    // single-key lookups, AND the bitmap accelerator covers
+    // event_type entirely (low cardinality, ~10 values). Existing
+    // partitions still carry the old index — it's harmless and ages
+    // out as partitions are dropped via retention.
     return [
-      { name: 'idx_event_type', field: 'event_type' },
       { name: 'idx_received_at', field: 'received_at' },
       { name: 'idx_network_action', field: 'network.action' },
       { name: 'idx_src_ip', field: 'network.src_ip' },
@@ -552,6 +775,42 @@ class WardsonDbBackend extends StorageBackend {
     }
   }
 
+  /**
+   * NEW-P4: install or update a TTL policy on each rollup collection.
+   * Idempotent — PUT replaces any existing policy. Errors are logged
+   * but non-fatal (fall back to app-side _delete_by_query in
+   * runRetention()).
+   */
+  async _setRollupTTLs() {
+    const days = this.config.retentionDays;
+    if (!days || days <= 0) {
+      logger.debug('No retention configured; skipping rollup TTL setup');
+      return;
+    }
+    const cols = [
+      this.rollup5m,
+      this.rollupIpHourly,
+      this.rollupPortHourly,
+      this.rollupSigHourly,
+      this.rollupClientHourly,
+    ];
+    for (const col of cols) {
+      try {
+        await this._put(`/${col}/ttl`, {
+          retention_days: days,
+          // Bucket timestamps are produced by align5m()/align1h() in
+          // src/db/rollups.js. They're ISO 8601 strings tied to the
+          // time window the doc covers — stable across delta + canonical
+          // forms — which is what we want for retention.
+          field: 'bucket',
+        });
+        logger.info({ col, days }, 'Rollup TTL policy active');
+      } catch (err) {
+        logger.warn({ err: err.message, col }, 'Failed to set rollup TTL — will fall back to runRetention _delete_by_query');
+      }
+    }
+  }
+
   async initialize() {
     // Verify connection
     const info = await this._get('/');
@@ -594,6 +853,16 @@ class WardsonDbBackend extends StorageBackend {
       }
     }
 
+    // NEW-P4: server-side TTL on each rollup collection. WardSONDB runs
+    // a TTL cleanup task on a 60s cadence (--ttl-interval default), so
+    // expired buckets get purged without an app-side _delete_by_query
+    // roundtrip on every retention cycle. The field is `bucket` (the
+    // 5m/1h-aligned ISO timestamp from src/db/rollups.js), not
+    // _created_at — because after compaction, canonical docs get a
+    // fresh _created_at while their bucket timestamp stays anchored to
+    // the actual time window they cover.
+    await this._setRollupTTLs();
+
     // Initial cached doc count from /_stats.total_documents (matches main).
     // Includes rollups+cache (small overhead) but is reliable.
     try {
@@ -610,6 +879,10 @@ class WardsonDbBackend extends StorageBackend {
 
     // Start the flush cycle
     this._startFlushInterval();
+    // NEW-P3: hourly compaction folds older delta docs into a single
+    // canonical doc per (bucket, key) and prunes the deltas. Without
+    // this the rollup collections grow linearly with flushes.
+    this._startCompactionInterval();
 
     // Schedule deferred rollup backfill (same 30s cadence as enrichment backfill)
     setTimeout(() => {
@@ -653,6 +926,10 @@ class WardsonDbBackend extends StorageBackend {
     if (this._flushIntervalHandle) {
       clearInterval(this._flushIntervalHandle);
       this._flushIntervalHandle = null;
+    }
+    if (this._compactionIntervalHandle) {
+      clearInterval(this._compactionIntervalHandle);
+      this._compactionIntervalHandle = null;
     }
     // Final flush — bypass _flushing guard
     this._flushing = false;
@@ -980,7 +1257,14 @@ class WardsonDbBackend extends StorageBackend {
         const result = await this._post(`/${partition}/docs/_bulk`, { documents: chunk });
         totalInserted += result.data?.inserted || 0;
         if (result.data?.errors?.length > 0) {
-          logger.warn({ partition, errors: result.data.errors.length }, 'WardSONDB bulk insert had errors');
+          // NEW-C8: include sample of error messages so operators can root-
+          // cause ingest failures (malformed nested types, doc-too-large,
+          // etc.) instead of just seeing a count.
+          logger.warn({
+            partition,
+            errors: result.data.errors.length,
+            sample: result.data.errors.slice(0, 3),
+          }, 'WardSONDB bulk insert had errors');
         }
       }
     }
@@ -1050,7 +1334,14 @@ class WardsonDbBackend extends StorageBackend {
     if (filters.protocol) andClauses.push({ 'network.protocol': filters.protocol.toUpperCase() });
     if (filters.since) andClauses.push({ received_at: { '$gte': filters.since } });
     if (filters.until) andClauses.push({ received_at: { '$lte': filters.until } });
-    if (filters.search) andClauses.push({ message: { '$regex': filters.search } });
+    if (filters.search) {
+      // NEW-C1: escape regex meta-characters so user input behaves like SQLite's
+      // substring LIKE pattern instead of a regex (192.168.1.1 should match the
+      // literal IP, not "192a168b1c1"). Cap at 1024 chars (API.md regex pattern
+      // length limit).
+      const escaped = String(filters.search).slice(0, 1024).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      andClauses.push({ message: { '$regex': escaped } });
+    }
     if (filters.mac) {
       andClauses.push({
         '$or': [
@@ -1069,46 +1360,140 @@ class WardsonDbBackend extends StorageBackend {
     return allClauses.length === 1 ? allClauses[0] : { '$and': allClauses };
   }
 
+  /**
+   * Decode a base64-encoded keyset cursor → { received_at, id } | null.
+   * Malformed cursors silently fall back to a fresh first page rather
+   * than 400-erroring the whole query.
+   */
+  _decodeCursor(raw) {
+    if (!raw || typeof raw !== 'string') return null;
+    try {
+      const json = Buffer.from(raw, 'base64').toString('utf8');
+      const obj = JSON.parse(json);
+      if (typeof obj?.received_at === 'string' && typeof obj?.id === 'string') {
+        return { received_at: obj.received_at, id: obj.id };
+      }
+    } catch {}
+    return null;
+  }
+
+  _encodeCursor(receivedAt, id) {
+    return Buffer.from(JSON.stringify({ received_at: receivedAt, id }), 'utf8').toString('base64');
+  }
+
   async queryEvents(filters = {}) {
     const limit = Math.min(parseInt(filters.limit || '50', 10), 500);
-    let offset = parseInt(filters.offset || '0', 10);
+    const cursor = this._decodeCursor(filters.cursor);
     const queryFilter = this._buildFilter(filters);
-    const cacheMap = await this._getCacheMap();
 
+    // M4: keyset pagination. With a `(received_at, _id)` cursor we can
+    // skip directly to the next page without paying the offset-scan
+    // cost (which grows with the number of events ahead of you in the
+    // partition). _id here is UUIDv7 — its time-prefix means sorting by
+    // _id within a same-millisecond received_at bucket is also
+    // monotonic, so the keyset stays well-defined.
+    //
+    // Fall-back: if no cursor is provided, the old `offset` parameter
+    // still works for backwards compatibility with callers that haven't
+    // adopted cursors yet (e.g., direct API consumers).
+    let offset = cursor ? 0 : parseInt(filters.offset || '0', 10);
+    let cursorFilter = queryFilter;
+    if (cursor) {
+      const cursorClause = {
+        '$or': [
+          { received_at: { '$lt': cursor.received_at } },
+          {
+            '$and': [
+              { received_at: cursor.received_at },
+              { _id: { '$lt': cursor.id } },
+            ],
+          },
+        ],
+      };
+      cursorFilter = queryFilter
+        ? { '$and': [queryFilter, cursorClause] }
+        : cursorClause;
+    }
+
+    // Fetch limit + 1 so we can detect hasMore without a second query.
+    const fetchLimit = limit + 1;
+
+    // M9: collect raw docs first, then look up cache for the IPs we
+    // actually saw. Avoids the previous bulk-load that pulled up to
+    // 100K cache rows for a query returning at most 500 events.
     const queryPartition = async (partition, remaining) => {
       const result = await this._post(`/${partition}/query`, {
-        filter: queryFilter,
-        sort: [{ '_created_at': 'desc' }],
+        filter: cursorFilter,
+        sort: [{ received_at: 'desc' }, { _id: 'desc' }],
         limit: remaining,
         offset,
       });
       const docs = result.data || [];
-      // Approximate offset across boundaries: decrement what this partition consumed
       if (offset > 0) offset = Math.max(0, offset - docs.length);
-      return docs.map(d => this._documentToEvent(d, cacheMap));
+      return docs;
     };
 
-    const events = await this._queryAcrossPartitions(queryPartition, filters.since, filters.until, limit);
-    return { events };
+    // When a cursor is set, scope partitions to those overlapping
+    // [start, cursor.received_at] — we never need to look at partitions
+    // newer than the cursor.
+    const untilForFanOut = cursor ? cursor.received_at : filters.until;
+    const rawDocs = await this._queryAcrossPartitions(queryPartition, filters.since, untilForFanOut, fetchLimit);
+
+    const hasMore = rawDocs.length > limit;
+    const docs = hasMore ? rawDocs.slice(0, limit) : rawDocs;
+    const last = docs[docs.length - 1];
+    const nextCursor = hasMore && last
+      ? this._encodeCursor(last.received_at, last._id)
+      : null;
+
+    const ipSet = new Set();
+    for (const doc of docs) {
+      if (doc.network?.src_ip) ipSet.add(doc.network.src_ip);
+      if (doc.network?.dst_ip) ipSet.add(doc.network.dst_ip);
+    }
+    const cacheMap = await this._lookupCacheForIps(ipSet);
+
+    const events = docs.map((d) => this._documentToEvent(d, cacheMap));
+    return { events, hasMore, nextCursor };
   }
 
   async getEventById(id) {
-    const cacheMap = await this._getCacheMap();
+    // M17: validate UUIDv7 shape up front. A malformed id used to scan
+    // every partition sequentially — at 30+ daily partitions × 30s
+    // server-side query timeout, a single bad id could hang the request
+    // for many minutes.
+    const UUIDV7_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    if (typeof id !== 'string' || !UUIDV7_RE.test(id)) return null;
+
     const partition = this._partitionFromId(id);
+    let doc = null;
 
     if (partition && this._partitions.has(partition)) {
       const result = await this._get(`/${partition}/docs/${encodeURIComponent(id)}`);
-      if (!result._notFound) return this._documentToEvent(result.data, cacheMap);
+      if (!result._notFound) doc = result.data;
     }
 
-    // Fallback: scan all partitions (rare — UUIDv7 partition not in cache)
-    for (const p of this._partitionsNewestFirst()) {
-      try {
-        const r = await this._get(`/${p}/docs/${encodeURIComponent(id)}`);
-        if (!r._notFound) return this._documentToEvent(r.data, cacheMap);
-      } catch {}
+    if (!doc) {
+      // M17: bounded fallback to the 7 most-recent partitions only. A
+      // valid UUIDv7 whose partition isn't in this._partitions is a rare
+      // race (server restart between _partitions refresh and the GET);
+      // unbounded scanning was the worst-case hang path.
+      for (const p of this._partitionsNewestFirst().slice(0, 7)) {
+        try {
+          const r = await this._get(`/${p}/docs/${encodeURIComponent(id)}`);
+          if (!r._notFound) { doc = r.data; break; }
+        } catch {}
+      }
     }
-    return null;
+    if (!doc) return null;
+
+    // M9: targeted cache lookup for just this doc's IPs (≤2).
+    const ips = [];
+    if (doc.network?.src_ip) ips.push(doc.network.src_ip);
+    if (doc.network?.dst_ip) ips.push(doc.network.dst_ip);
+    const cacheMap = await this._lookupCacheForIps(ips);
+
+    return this._documentToEvent(doc, cacheMap);
   }
 
   async getEventCount() {
@@ -1145,7 +1530,7 @@ class WardsonDbBackend extends StorageBackend {
     for (const p of this._partitionsNewestFirst()) {
       try {
         const r = await this._post(`/${p}/query`, {
-          sort: [{ '_created_at': 'desc' }],
+          sort: [{ 'received_at': 'desc' }],
           fields: ['received_at'],
           limit: 1,
         });
@@ -1275,21 +1660,97 @@ class WardsonDbBackend extends StorageBackend {
     return Array.from(buckets.values());
   }
 
-  async _getCacheMap() {
-    if (this._cacheMapTs && Date.now() - this._cacheMapTs < 30000) return this._cacheMap;
-    const CAP = 100000;
-    const result = await this._post(`/${this.cacheCollection}/query`, {
-      filter: { is_private: false },
-      limit: CAP,
-    });
-    const data = result.data || [];
-    if (data.length >= CAP) {
-      logger.warn({ loaded: data.length, cap: CAP },
-        'WardSONDB _getCacheMap hit cap — some enrichment data may be missing from event/stats joins');
+  /**
+   * M9: targeted cache lookup for a specific set of IPs. Replaces the
+   * previous bulk _getCacheMap which loaded up to 100K rows on every 30s
+   * expiration (a no-op above the API's 10K hard limit, and wasteful
+   * even below it). Chunks the $in filter at 500 IPs to fit within
+   * server-side query payload caps. Empty input returns an empty Map
+   * immediately — no network round-trip.
+   */
+  async _lookupCacheForIps(ips) {
+    const map = new Map();
+    if (!ips) return map;
+    const unique = ips instanceof Set ? [...ips] : [...new Set(ips)];
+    if (unique.length === 0) return map;
+    const CHUNK = 500;
+    for (let i = 0; i < unique.length; i += CHUNK) {
+      const chunk = unique.slice(i, i + CHUNK);
+      try {
+        const res = await this._post(`/${this.cacheCollection}/query`, {
+          filter: { ip: { '$in': chunk } },
+          limit: chunk.length,
+        });
+        for (const d of (res.data || [])) map.set(d.ip, d);
+      } catch (err) {
+        logger.debug({ err: err.message, chunk: chunk.length }, '_lookupCacheForIps chunk failed');
+      }
     }
-    this._cacheMap = new Map(data.map(d => [d.ip, d]));
-    this._cacheMapTs = Date.now();
-    return this._cacheMap;
+    return map;
+  }
+
+  /**
+   * Async generator yielding batches of enriched non-private cache rows.
+   * Pages by `ip > lastIp` to walk past the API's 10K /query cap. Uses the
+   * NEW-C6 $gte-instead-of-$exists pattern so idx_cache_geo_country and
+   * idx_cache_abuse_score participate. Required by getThreatIntel period
+   * summary and getAllCachedEnrichment pre-warm — both previously silently
+   * truncated at the 10K cap.
+   */
+  async *_iterateEnrichedCacheRows(batchSize = 1000) {
+    let lastIp = null;
+    while (true) {
+      const conds = [
+        { is_private: false },
+        { '$or': [
+          { geo_country: { '$gte': '' } },
+          { abuse_score: { '$gte': 0 } },
+        ]},
+      ];
+      if (lastIp != null) conds.push({ ip: { '$gt': lastIp } });
+      let res;
+      try {
+        res = await this._post(`/${this.cacheCollection}/query`, {
+          filter: { '$and': conds },
+          sort: [{ ip: 'asc' }],
+          limit: batchSize,
+        });
+      } catch (err) {
+        logger.error({ err: err.message }, 'WardSONDB _iterateEnrichedCacheRows page failed');
+        break;
+      }
+      const rows = res.data || [];
+      if (rows.length === 0) break;
+      yield rows;
+      if (rows.length < batchSize) break;
+      const tailIp = rows[rows.length - 1].ip;
+      if (tailIp == null || tailIp === lastIp) break;
+      lastIp = tailIp;
+    }
+  }
+
+  /**
+   * Given a chunk of IPs, return the subset present in rollupIpHourly with
+   * bucket >= since. Pushes the $in match + $group fully to the server so
+   * we get exactly the IPs we asked about, free of the /distinct 10K cap.
+   */
+  async _rollupPresenceForIps(ips, since) {
+    const present = new Set();
+    if (!ips || ips.length === 0) return present;
+    try {
+      const res = await this._post(`/${this.rollupIpHourly}/aggregate`, {
+        pipeline: [
+          { '$match': { ip: { '$in': ips }, bucket: { '$gte': since } } },
+          { '$group': { '_id': 'ip' } },
+        ],
+      });
+      for (const r of (res.data || [])) {
+        if (r._id) present.add(r._id);
+      }
+    } catch (err) {
+      logger.error({ err: err.message, count: ips.length }, 'WardSONDB _rollupPresenceForIps failed');
+    }
+    return present;
   }
 
   async getTopTalkers(since, direction, limit, excludePrivate) {
@@ -1306,8 +1767,11 @@ class WardsonDbBackend extends StorageBackend {
       ],
     });
 
-    const cacheMap = await this._getCacheMap();
-    let rows = (result.data || []).map(r => {
+    // M9: targeted lookup for just the top-N rollup IPs.
+    const aggRows = result.data || [];
+    const ipSet = new Set(aggRows.map(r => r._id).filter(Boolean));
+    const cacheMap = await this._lookupCacheForIps(ipSet);
+    let rows = aggRows.map(r => {
       const c = cacheMap.get(r._id) || {};
       return {
         ip: r._id,
@@ -1336,8 +1800,11 @@ class WardsonDbBackend extends StorageBackend {
       ],
     });
 
-    const cacheMap = await this._getCacheMap();
-    let rows = (result.data || []).map(r => {
+    // M9: targeted lookup for just the top-N rollup IPs.
+    const aggRows = result.data || [];
+    const ipSet = new Set(aggRows.map(r => r._id).filter(Boolean));
+    const cacheMap = await this._lookupCacheForIps(ipSet);
+    let rows = aggRows.map(r => {
       const c = cacheMap.get(r._id) || {};
       return {
         ip: r._id,
@@ -1448,15 +1915,19 @@ class WardsonDbBackend extends StorageBackend {
       enrichedCount({
         is_private: false,
         '$or': [
-          { geo_country: { '$ne': null } },
-          { abuse_score: { '$ne': null } },
+          // NEW-C6: $ne is not in WardSONDB's index-supported operators
+          // list (API.md:1317), so $ne: null silently falls back to a
+          // 10K-clamped full scan. $gte: '' / $gte: 0 hit the existing
+          // idx_cache_geo_country / idx_cache_abuse_score indexes.
+          { geo_country: { '$gte': '' } },
+          { abuse_score: { '$gte': 0 } },
         ],
       }),
       enrichedCount({ is_private: false, abuse_score: { '$gt': 0 } }),
       enrichedCount({ is_private: false, abuse_score: { '$gte': 50 } }),
       this._post(`/${this.cacheCollection}/distinct`, {
         field: 'geo_country',
-        filter: { is_private: false, geo_country: { '$ne': null } },
+        filter: { is_private: false, geo_country: { '$gte': '' } },  // NEW-C6
         limit: 1000,
       }).catch(() => ({ data: { count: 0 } })),
     ]);
@@ -1535,46 +2006,50 @@ class WardsonDbBackend extends StorageBackend {
       });
 
     // --- Period summary ---
-    const periodIpsRes = await this._post(`/${this.rollupIpHourly}/aggregate`, {
-      pipeline: [
-        { '$match': { bucket: { '$gte': since } } },
-        { '$group': { '_id': 'ip' } },
-        { '$limit': 10000 },
-      ],
-    });
-    const periodIps = (periodIpsRes.data || []).map(r => r._id).filter(Boolean);
-
-    let periodSummary = { enriched: 0, flagged: 0, highThreat: 0, countries: 0 };
-    if (periodIps.length > 0) {
-      const CHUNK = 500;
-      const countriesSet = new Set();
-      let enriched = 0, flagged = 0, highThreatCount = 0;
-      for (let i = 0; i < periodIps.length; i += CHUNK) {
-        const chunk = periodIps.slice(i, i + CHUNK);
-        const res = await this._post(`/${this.cacheCollection}/query`, {
-          filter: { ip: { '$in': chunk }, is_private: false },
-          limit: chunk.length,
-        });
-        for (const d of (res.data || [])) {
-          if (d.geo_country != null || d.abuse_score != null) enriched++;
-          if (d.abuse_score > 0) flagged++;
-          if (d.abuse_score >= 50) highThreatCount++;
-          if (d.geo_country) countriesSet.add(d.geo_country);
+    // Walk the (small) enriched cache, batched 500 IPs at a time, and check
+    // rollupIpHourly presence per chunk via $in match + $group. Replaces the
+    // previous /distinct PERIOD_IPS_CAP=10000 path which silently undercounted
+    // busy 30d windows above 10K unique IPs and matched cache rows asymmetrically.
+    let pEnriched = 0, pFlagged = 0, pHighThreat = 0;
+    const pCountries = new Set();
+    let cacheRowsScanned = 0;
+    const CHUNK = 500;
+    for await (const batch of this._iterateEnrichedCacheRows(1000)) {
+      cacheRowsScanned += batch.length;
+      const chunks = [];
+      for (let i = 0; i < batch.length; i += CHUNK) chunks.push(batch.slice(i, i + CHUNK));
+      const presents = await Promise.all(
+        chunks.map(slice => this._rollupPresenceForIps(slice.map(r => r.ip).filter(Boolean), since)),
+      );
+      for (let ci = 0; ci < chunks.length; ci++) {
+        const present = presents[ci];
+        for (const r of chunks[ci]) {
+          if (!present.has(r.ip)) continue;
+          if (r.geo_country == null && r.abuse_score == null) continue;
+          pEnriched++;
+          if (r.abuse_score > 0) pFlagged++;
+          if (r.abuse_score >= 50) pHighThreat++;
+          if (r.geo_country) pCountries.add(r.geo_country);
         }
       }
-      periodSummary = { enriched, flagged, highThreat: highThreatCount, countries: countriesSet.size };
     }
+    const periodSummary = {
+      enriched: pEnriched,
+      flagged: pFlagged,
+      highThreat: pHighThreat,
+      countries: pCountries.size,
+    };
 
-    // Diagnostic log — helps debug empty-result cases. Info level so it shows
-    // up in default logging.
-    logger.info({
+    // H11: diagnostic log demoted to debug. Was info to help debug
+    // empty-result cases; permanent info-level logging at the
+    // dashboard's 5-30s poll cadence floods logs in steady state.
+    logger.debug({
       since, limit,
       aggRows: aggRows.length,
       cacheHits: cacheMap.size,
       enrichedRows: enrichedRows.length,
       finalIps: ips.length,
-      periodIps: periodIps.length,
-      summary,
+      cacheRowsScanned,
       ms: Date.now() - t0,
     }, 'WardSONDB getThreatIntel diagnostic');
 
@@ -1621,7 +2096,7 @@ class WardsonDbBackend extends StorageBackend {
       for (let i = 0; i < ips.length; i += CHUNK) {
         const chunk = ips.slice(i, i + CHUNK);
         const cacheRes = await this._post(`/${this.cacheCollection}/query`, {
-          filter: { ip: { '$in': chunk }, is_private: false, geo_lat: { '$ne': null } },
+          filter: { ip: { '$in': chunk }, is_private: false, geo_lat: { '$gte': -90 } },  // NEW-C6
           limit: chunk.length,
         });
         for (const d of (cacheRes.data || [])) cacheMap.set(d.ip, d);
@@ -1650,7 +2125,7 @@ class WardsonDbBackend extends StorageBackend {
     all.sort((a, b) => b.count - a.count);
     const final = all.slice(0, limit);
 
-    logger.info({
+    logger.debug({  // H11
       since, limit,
       srcAgg: srcRows.length,
       dstAgg: dstRows.length,
@@ -1666,6 +2141,11 @@ class WardsonDbBackend extends StorageBackend {
     if (this._isCollectionEmpty()) return [];
 
     // First pass: collect recent event docs across partitions newest-first.
+    // NEW-P5: drop the $exists filter (every event has at least one of
+    // src/dst, JS-side filter handles the rare both-null case) so the
+    // descending received_at sort can use IndexSorted on idx_received_at.
+    // M3: include events with src OR dst — the previous filter required
+    // src_ip and silently dropped dst-only events.
     const partitions = this._partitionsNewestFirst();
     const candidates = [];
     for (const partition of partitions) {
@@ -1673,11 +2153,12 @@ class WardsonDbBackend extends StorageBackend {
       const remaining = limit * 3 - candidates.length;
       try {
         const r = await this._post(`/${partition}/query`, {
-          filter: { 'network.src_ip': { '$exists': true } },
-          sort: [{ '_created_at': 'desc' }],
+          sort: [{ 'received_at': 'desc' }],
           limit: Math.min(remaining, 500),
         });
-        for (const doc of (r.data || [])) candidates.push(doc);
+        for (const doc of (r.data || [])) {
+          if (doc.network?.src_ip || doc.network?.dst_ip) candidates.push(doc);
+        }
       } catch (err) {
         logger.debug({ err: err.message, partition }, 'getRecentGeoEvents partition query failed');
       }
@@ -1696,14 +2177,16 @@ class WardsonDbBackend extends StorageBackend {
       for (let i = 0; i < ips.length; i += CHUNK) {
         const chunk = ips.slice(i, i + CHUNK);
         const cacheRes = await this._post(`/${this.cacheCollection}/query`, {
-          filter: { ip: { '$in': chunk }, is_private: false, geo_lat: { '$ne': null } },
+          filter: { ip: { '$in': chunk }, is_private: false, geo_lat: { '$gte': -90 } },  // NEW-C6
           limit: chunk.length,
         });
         for (const d of (cacheRes.data || [])) cacheMap.set(d.ip, d);
       }
     }
 
-    // Third pass: overlay geo on events that have at least one enriched IP.
+    // Third pass: emit events with at least one enriched IP. NEW-C12 —
+    // pass cacheMap to _documentToEvent so it does the full geo + hostname
+    // overlay (the previous manual overlay below missed the hostname field).
     const events = [];
     for (const doc of candidates) {
       if (events.length >= limit) break;
@@ -1712,44 +2195,22 @@ class WardsonDbBackend extends StorageBackend {
       const sGeo = srcIp ? cacheMap.get(srcIp) : null;
       const dGeo = dstIp ? cacheMap.get(dstIp) : null;
       if (!sGeo && !dGeo) continue;
-      const event = this._documentToEvent(doc);
-      if (sGeo) {
-        event.src_geo_lat = sGeo.geo_lat;
-        event.src_geo_lon = sGeo.geo_lon;
-        event.src_geo_country = sGeo.geo_country;
-        event.src_geo_city = sGeo.geo_city;
-        event.src_abuse_score = sGeo.abuse_score;
-      }
-      if (dGeo) {
-        event.dst_geo_lat = dGeo.geo_lat;
-        event.dst_geo_lon = dGeo.geo_lon;
-        event.dst_geo_country = dGeo.geo_country;
-        event.dst_geo_city = dGeo.geo_city;
-        event.dst_abuse_score = dGeo.abuse_score;
-      }
-      events.push(event);
+      events.push(this._documentToEvent(doc, cacheMap));
     }
     return events;
   }
 
-  // --- Enrichment Cache ---
+  // --- Threat Hunt ---
 
-  async getAllCachedEnrichments() {
-    const result = await this._post(`/${this.cacheCollection}/query`, {
-      filter: {},
-      limit: 100000,
-    });
-    return (result.data || []).map(d => ({
-      ip: d.ip,
-      geo_country: d.geo_country || null,
-      geo_city: d.geo_city || null,
-      geo_lat: d.geo_lat ?? null,
-      geo_lon: d.geo_lon ?? null,
-      abuse_score: d.abuse_score ?? null,
-      hostname: d.hostname || null,
-      is_private: d.is_private || false,
-    }));
+  async gatherHuntIntel(target, since) {
+    const { gatherHuntIntel } = require('../../threat-hunt/intel/wardsondb');
+    return gatherHuntIntel(this, target, since);
   }
+
+  // --- Enrichment Cache ---
+  // Note: the plural getAllCachedEnrichments() (no callers anywhere in
+  // the repo) was removed as part of L6 in Phase 7. Use the singular
+  // getAllCachedEnrichment() below.
 
   async getCachedEnrichment(ip) {
     const result = await this._post(`/${this.cacheCollection}/query`, {
@@ -1777,57 +2238,80 @@ class WardsonDbBackend extends StorageBackend {
   }
 
   async setCachedEnrichment(ip, data) {
+    // M5: read-then-write merge. Pull the full existing row (not just
+    // `_id`) so we can preserve fields not present in the new `data`.
+    // Matches OpenSearch's behavior and keeps SQLite/WardSONDB/
+    // OpenSearch caches in lockstep — no more "marking an IP private
+    // wipes its geo_country" footgun.
     const existing = await this._post(`/${this.cacheCollection}/query`, {
       filter: { ip },
-      fields: ['_id'],
       limit: 1,
     });
+    const prev = existing.data?.[0] || {};
 
     const cacheDoc = {
       ip,
-      geo_country: data.geo_country || null,
-      geo_city: data.geo_city || null,
-      geo_lat: data.geo_lat ?? null,
-      geo_lon: data.geo_lon ?? null,
-      abuse_score: data.abuse_score ?? null,
-      hostname: data.hostname || null,
-      is_private: data.is_private ? true : false,
+      geo_country: data.geo_country ?? prev.geo_country ?? null,
+      geo_city: data.geo_city ?? prev.geo_city ?? null,
+      geo_lat: data.geo_lat ?? prev.geo_lat ?? null,
+      geo_lon: data.geo_lon ?? prev.geo_lon ?? null,
+      abuse_score: data.abuse_score ?? prev.abuse_score ?? null,
+      hostname: data.hostname ?? prev.hostname ?? null,
+      is_private: (data.is_private ?? prev.is_private) ? true : false,
       updated_at: new Date().toISOString(),
     };
 
-    if (existing.data && existing.data.length > 0) {
-      await this._put(`/${this.cacheCollection}/docs/${existing.data[0]._id}`, cacheDoc);
+    if (prev._id) {
+      await this._put(`/${this.cacheCollection}/docs/${encodeURIComponent(prev._id)}`, cacheDoc);
     } else {
       await this._post(`/${this.cacheCollection}/docs`, cacheDoc);
     }
   }
 
   async markPrivate(ip) {
-    await this.setCachedEnrichment(ip, { is_private: true });
+    // NEW-C7: PATCH only `is_private: true` on the existing cache row,
+    // or INSERT a minimal doc if absent. Avoids the destructive PUT path
+    // (via setCachedEnrichment) that would null out previously-stored
+    // geo_country / abuse_score / hostname for an IP later flagged private.
+    try {
+      const existing = await this._post(`/${this.cacheCollection}/query`, {
+        filter: { ip },
+        fields: ['_id'],
+        limit: 1,
+      });
+      const doc = existing.data?.[0];
+      const now = new Date().toISOString();
+      if (doc?._id) {
+        await this._patch(`/${this.cacheCollection}/docs/${encodeURIComponent(doc._id)}`, {
+          is_private: true,
+          updated_at: now,
+        });
+      } else {
+        await this._post(`/${this.cacheCollection}/docs`, {
+          ip, is_private: true, updated_at: now,
+        });
+      }
+    } catch (err) {
+      logger.debug({ err: err.message, ip }, 'WardSONDB markPrivate failed');
+    }
   }
 
   async getAllCachedEnrichment() {
-    const result = await this._post(`/${this.cacheCollection}/query`, {
-      filter: {
-        '$and': [
-          { is_private: false },
-          { '$or': [
-            { geo_country: { '$exists': true } },
-            { abuse_score: { '$exists': true } },
-          ]},
-        ],
-      },
-      limit: 10000,
-    });
-    return (result.data || []).map(d => ({
-      ip: d.ip,
-      geo_country: d.geo_country,
-      geo_city: d.geo_city,
-      geo_lat: d.geo_lat,
-      geo_lon: d.geo_lon,
-      abuse_score: d.abuse_score,
-      hostname: d.hostname,
-    }));
+    const out = [];
+    for await (const batch of this._iterateEnrichedCacheRows(1000)) {
+      for (const d of batch) {
+        out.push({
+          ip: d.ip,
+          geo_country: d.geo_country,
+          geo_city: d.geo_city,
+          geo_lat: d.geo_lat,
+          geo_lon: d.geo_lon,
+          abuse_score: d.abuse_score,
+          hostname: d.hostname,
+        });
+      }
+    }
+    return out;
   }
 
   // --- Maintenance ---
@@ -1855,7 +2339,10 @@ class WardsonDbBackend extends StorageBackend {
       }
     }
 
-    // Clean rollup entries older than cutoff (small collections, cheap)
+    // NEW-P4: rollups are pruned by WardSONDB's server-side TTL policy
+    // (set in _setRollupTTLs() during initialize()). This _delete_by_query
+    // sweep stays as a safety net — it's a no-op once TTL has caught
+    // up, and indexed/cheap when it does match anything.
     const rollupCols = [this.rollup5m, this.rollupIpHourly, this.rollupPortHourly, this.rollupSigHourly, this.rollupClientHourly];
     for (const col of rollupCols) {
       try {
@@ -1904,8 +2391,6 @@ class WardsonDbBackend extends StorageBackend {
     // Reset in-memory state
     this._partitions.clear();
     this._rollupBuffers = this._newBuffers();
-    this._cacheMap = null;
-    this._cacheMapTs = 0;
     this._cachedDocCount = 0;
 
     // Recreate today's partition + indexes
@@ -1956,7 +2441,9 @@ class WardsonDbBackend extends StorageBackend {
     let rollupCount = 0;
     try {
       const probe = await this._post(`/${this.rollup5m}/query`, { count_only: true, limit: 1 });
-      rollupCount = probe.meta?.total_count || probe.data?.count || 0;
+      // NEW-C9: prefer data.count (canonical) over meta.total_count
+      // (diagnostic). Use ?? not || so a legitimate 0 isn't replaced.
+      rollupCount = probe.data?.count ?? probe.meta?.total_count ?? 0;
     } catch {}
 
     if (rollupCount > 0) {
@@ -1980,7 +2467,7 @@ class WardsonDbBackend extends StorageBackend {
         let docs;
         try {
           const r = await this._post(`/${partition}/query`, {
-            sort: [{ '_created_at': 'asc' }],
+            sort: [{ 'received_at': 'asc' }],
             limit: CHUNK,
             offset,
           });

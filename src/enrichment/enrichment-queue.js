@@ -22,11 +22,16 @@ let _updateEnrichment = null;      // Single-IP update (backend.updateEnrichment
 let _batchUpdateEnrichment = null; // Batch update (backend.updateEnrichmentBatch) — optional
 let _updateQueue = [];              // Serialized queue for update_by_query calls
 let _updateRunning = false;
+let _updateRunningPromise = null;   // Resolves when the in-flight drain finishes
 let _updateDrainTimer = null;
 let _shuttingDown = false;
+let _drainingForShutdown = false;   // M7: lets the shutdown drain bypass the _shuttingDown guard
+let _droppedSinceLastWarn = 0;       // M8: throttle queue-drop warnings
+let _lastDropWarn = 0;
 const UPDATE_BATCH_DELAY_MS = 500;  // Accumulate for 500ms before draining
 const UPDATE_BATCH_MAX_IPS = 50;    // Or drain when 50 IPs queued per direction
 const UPDATE_BATCH_DRAIN_LIMIT = 200; // Max items to drain per cycle (prevents mega-batches)
+const SHUTDOWN_DRAIN_TIMEOUT_MS = 5000; // M7: bound the shutdown drain
 
 function setCacheAccessors(getCached, setCached, markPriv) {
   _getCache = getCached;
@@ -47,6 +52,28 @@ function queueEnrichmentUpdate(ip, direction, data) {
   if (_shuttingDown) return;
   if (!_updateEnrichment && !_batchUpdateEnrichment) return;
   if (isPrivateIp(ip)) return;
+
+  // M8: high-watermark backpressure. If a downstream backend stalls
+  // (network blip, OpenSearch GC pause, WardSONDB index rebuild) the
+  // queue can grow unbounded, eating heap. When we hit the cap, drop
+  // the OLDEST entry — the new enrichment is more likely to reflect
+  // current state than a 30-minute-old queued update. Warn at most
+  // once every 30s so a flood doesn't drown the logs.
+  const max = config.enrichment?.queueMaxDepth || 50000;
+  if (_updateQueue.length >= max) {
+    _updateQueue.shift();
+    _droppedSinceLastWarn++;
+    const now = Date.now();
+    if (now - _lastDropWarn > 30000) {
+      logger.warn(
+        { dropped: _droppedSinceLastWarn, max, queue: _updateQueue.length },
+        'Enrichment update queue at capacity — dropping oldest entries',
+      );
+      _lastDropWarn = now;
+      _droppedSinceLastWarn = 0;
+    }
+  }
+
   _updateQueue.push({ ip, direction, data });
 
   // Drain immediately if we have enough items, otherwise debounce
@@ -58,48 +85,61 @@ function queueEnrichmentUpdate(ip, direction, data) {
   }
 }
 
-async function drainUpdateQueue() {
-  if (_updateRunning || _shuttingDown) return;
+function drainUpdateQueue() {
+  // If a drain is already running, just hand back its promise — callers
+  // (including the shutdown path) can await the same drain rather than
+  // racing a second one and double-processing items.
+  if (_updateRunning) return _updateRunningPromise;
+  // M7: during normal operation, _shuttingDown blocks new drains. The
+  // shutdown path flips _drainingForShutdown to bypass this so the
+  // bounded shutdown drain can flush whatever was already queued.
+  if (_shuttingDown && !_drainingForShutdown) return Promise.resolve();
   _updateRunning = true;
+  _updateRunningPromise = (async () => {
+    try {
+      while (_updateQueue.length > 0) {
+        if (_shuttingDown && !_drainingForShutdown) break;
+        // Take a bounded chunk to prevent mega-batches
+        const batch = _updateQueue.splice(0, UPDATE_BATCH_DRAIN_LIMIT);
 
-  while (_updateQueue.length > 0 && !_shuttingDown) {
-    // Take a bounded chunk to prevent mega-batches
-    const batch = _updateQueue.splice(0, UPDATE_BATCH_DRAIN_LIMIT);
-
-    if (_batchUpdateEnrichment) {
-      // Group by direction + enrichment data for batch calls
-      const groups = new Map();
-      for (const item of batch) {
-        const key = `${item.direction}:${JSON.stringify(item.data)}`;
-        if (!groups.has(key)) {
-          groups.set(key, { direction: item.direction, data: item.data, ips: [] });
-        }
-        groups.get(key).ips.push(item.ip);
-      }
-
-      for (const group of groups.values()) {
-        try {
-          const result = await _batchUpdateEnrichment(group.ips, group.direction, group.data);
-          if (result.updated > 0) {
-            logger.debug({ ips: group.ips.length, direction: group.direction, updated: result.updated }, 'Batch enrichment update');
+        if (_batchUpdateEnrichment) {
+          // Group by direction + enrichment data for batch calls
+          const groups = new Map();
+          for (const item of batch) {
+            const key = `${item.direction}:${JSON.stringify(item.data)}`;
+            if (!groups.has(key)) {
+              groups.set(key, { direction: item.direction, data: item.data, ips: [] });
+            }
+            groups.get(key).ips.push(item.ip);
           }
-        } catch (err) {
-          logger.warn({ err: err.message, ips: group.ips.length, direction: group.direction }, 'Batch enrichment update failed');
-        }
-      }
-    } else if (_updateEnrichment) {
-      // Fallback: serial per-IP updates
-      for (const { ip, direction, data } of batch) {
-        try {
-          await _updateEnrichment(ip, direction, data);
-        } catch (err) {
-          logger.warn({ err: err.message, ip, direction }, 'Enrichment update failed');
-        }
-      }
-    }
-  }
 
-  _updateRunning = false;
+          for (const group of groups.values()) {
+            try {
+              const result = await _batchUpdateEnrichment(group.ips, group.direction, group.data);
+              if (result.updated > 0) {
+                logger.debug({ ips: group.ips.length, direction: group.direction, updated: result.updated }, 'Batch enrichment update');
+              }
+            } catch (err) {
+              logger.warn({ err: err.message, ips: group.ips.length, direction: group.direction }, 'Batch enrichment update failed');
+            }
+          }
+        } else if (_updateEnrichment) {
+          // Fallback: serial per-IP updates
+          for (const { ip, direction, data } of batch) {
+            try {
+              await _updateEnrichment(ip, direction, data);
+            } catch (err) {
+              logger.warn({ err: err.message, ip, direction }, 'Enrichment update failed');
+            }
+          }
+        }
+      }
+    } finally {
+      _updateRunning = false;
+      _updateRunningPromise = null;
+    }
+  })();
+  return _updateRunningPromise;
 }
 
 function initWorker() {
@@ -125,6 +165,11 @@ function initWorker() {
         break;
       case 'update-done':
         logger.debug({ ip: msg.ip, src: msg.srcChanged, dst: msg.dstChanged }, 'Worker: enrichment update applied');
+        break;
+      case 'update-error':
+        // H18: surface SQLITE_BUSY / I/O errors that previously vanished
+        // silently in the worker's catch.
+        logger.warn({ ip: msg.ip, err: msg.error, code: msg.code }, 'Worker: enrichment update failed');
         break;
     }
   });
@@ -273,6 +318,11 @@ function getQueueSize() {
   return ipQueue.size;
 }
 
+// M8: expose the update-queue depth so /api/health surfaces backpressure.
+function getUpdateQueueSize() {
+  return _updateQueue.length;
+}
+
 function backfillFromCache() {
   initWorker();
   setTimeout(() => {
@@ -280,15 +330,38 @@ function backfillFromCache() {
   }, 1000);
 }
 
-function shutdownWorker() {
+async function shutdownWorker() {
+  // M7: drain any queued external-backend enrichment updates with a
+  // bounded timeout BEFORE tearing down. Without this, a normal
+  // SIGTERM dropped recently-queued update_by_query calls on the
+  // floor — the next OpenSearch dashboard render saw stale enrichment
+  // until the next event for that IP triggered a re-queue.
   _shuttingDown = true;
-  // Clear pending update queue and drain timer
-  _updateQueue.length = 0;
   if (_updateDrainTimer) { clearTimeout(_updateDrainTimer); _updateDrainTimer = null; }
+
+  if (_updateQueue.length > 0 || _updateRunning) {
+    _drainingForShutdown = true;
+    try {
+      const drain = drainUpdateQueue();
+      const timeout = new Promise((resolve) => {
+        const t = setTimeout(resolve, SHUTDOWN_DRAIN_TIMEOUT_MS);
+        if (typeof t.unref === 'function') t.unref();
+      });
+      await Promise.race([drain, timeout]);
+      if (_updateQueue.length > 0) {
+        logger.warn({ remaining: _updateQueue.length }, 'Enrichment update queue not fully drained at shutdown');
+      }
+    } finally {
+      _drainingForShutdown = false;
+    }
+  }
+
+  _updateQueue.length = 0;
+
   if (worker) {
     worker.postMessage({ type: 'shutdown' });
     worker = null;
   }
 }
 
-module.exports = { enqueueEvent, enqueueIp, getQueueSize, backfillFromCache, shutdownWorker, setCacheAccessors, setUpdateEnrichment, setBatchUpdateEnrichment, queueEnrichmentUpdate };
+module.exports = { enqueueEvent, enqueueIp, getQueueSize, getUpdateQueueSize, backfillFromCache, shutdownWorker, setCacheAccessors, setUpdateEnrichment, setBatchUpdateEnrichment, queueEnrichmentUpdate };

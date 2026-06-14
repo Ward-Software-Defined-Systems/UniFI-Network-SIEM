@@ -14,6 +14,7 @@
 const { Client } = require('@opensearch-project/opensearch');
 const StorageBackend = require('./interface');
 const logger = require('../../utils/logger');
+const { isPrivateIp } = require('../../utils/ip-utils');
 
 // --- Index Mappings ---
 
@@ -130,6 +131,98 @@ const CACHE_MAPPING = {
   },
 };
 
+// Phase 11A — Native OpenSearch Rollup jobs (H10).
+//
+// Five continuous rollup jobs mirror SQLite's five rollup tables. Each job
+// reads from `${prefix}events` and writes pre-aggregated docs into a
+// dedicated `${prefix}rollup-*` index. With `continuous: true` the IM
+// plugin processes new ingest on the schedule cadence — no app-side flush
+// worker.
+//
+// Field-name caveat: the SIEM's OpenSearch mapping is FLAT
+// (`network_action`, `dst_port`, `ids_signature`, `ids_category`) — NOT
+// nested. The dimension `source_field` paths below match the actual
+// indexed fields, not the WardSONDB-style dotted paths.
+//
+// Backfill caveat: continuous rollup jobs do not retroactively process
+// data that existed before job creation (per OpenSearch docs). Existing
+// deployments will see rollup indexes accumulate forward-only. Phase 11B
+// (a separate change) flips the 9 stats methods to query rollups via
+// `_rollup_search` once enough history has accumulated for the longest
+// dashboard window.
+function buildRollupJobs(prefix) {
+  const sourceIndex = `${prefix}events`;
+  const mk = (id, targetSuffix, dimensions) => ({
+    id: `${prefix}rollup-${id}`,
+    body: {
+      rollup: {
+        source_index: sourceIndex,
+        target_index: `${prefix}rollup-${targetSuffix}`,
+        description: `SIEM ${id} rollup`,
+        enabled: true,
+        // Continuous mode still uses `schedule` to set the processing cadence.
+        // 5-minute cadence keeps near-real-time freshness on the dashboards.
+        schedule: { interval: { period: 5, unit: 'Minutes' } },
+        // delay 60s lets late-arriving events (clock skew, syslog backlog)
+        // land in the correct bucket before that bucket is rolled up.
+        delay: 60_000,
+        page_size: 1000,
+        continuous: true,
+        dimensions,
+        // value_count on `received_at` gives the doc-count metric every
+        // stats method needs. Adding extra metric types up-front is cheap
+        // and avoids the "metrics are immutable once defined" trap.
+        metrics: [
+          {
+            source_field: 'received_at',
+            metrics: [{ value_count: {} }, { max: {} }, { min: {} }],
+          },
+        ],
+      },
+    },
+  });
+
+  return [
+    // 5-minute event-type/action rollup — feeds getEventTypeCounts,
+    // getOverviewStats, getEventCountToday.
+    mk('5m', '5m', [
+      { date_histogram: { source_field: 'received_at', fixed_interval: '5m' } },
+      { terms: { source_field: 'event_type' } },
+      { terms: { source_field: 'network_action' } },
+    ]),
+    // Hourly src/dst IP — feeds getTopTalkers, getTopBlocked.
+    mk('ip-hourly', 'ip-hourly', [
+      { date_histogram: { source_field: 'received_at', fixed_interval: '1h' } },
+      { terms: { source_field: 'src_ip' } },
+      { terms: { source_field: 'dst_ip' } },
+      { terms: { source_field: 'direction' } },
+    ]),
+    // Hourly port/protocol — feeds getTopPorts.
+    mk('port-hourly', 'port-hourly', [
+      { date_histogram: { source_field: 'received_at', fixed_interval: '1h' } },
+      { terms: { source_field: 'dst_port' } },
+      { terms: { source_field: 'protocol' } },
+    ]),
+    // Hourly IDS signature — feeds getTopThreats.
+    mk('sig-hourly', 'sig-hourly', [
+      { date_histogram: { source_field: 'received_at', fixed_interval: '1h' } },
+      { terms: { source_field: 'ids_signature' } },
+      { terms: { source_field: 'ids_category' } },
+    ]),
+    // Hourly client MAC — feeds getTopClients. Rolls up the single canonical
+    // `mac_address` field (set at ingest as the first-non-null of
+    // client_mac/dhcp_mac/wifi_client_mac/mac_src — see _serializeEvent), which
+    // matches SQLite's first-non-null `mac` rollup and WardSONDB's `$id:'mac'`
+    // grouping. Chaining the three raw mac fields would Cartesian-product the
+    // buckets and (with default missing_bucket) drop the common case of an
+    // event populating only one of them.
+    mk('client-hourly', 'client-hourly', [
+      { date_histogram: { source_field: 'received_at', fixed_interval: '1h' } },
+      { terms: { source_field: 'mac_address' } },
+    ]),
+  ];
+}
+
 class OpenSearchBackend extends StorageBackend {
   constructor(config = {}) {
     super('OpenSearch', config);
@@ -153,6 +246,12 @@ class OpenSearchBackend extends StorageBackend {
     this.bulkSize = config.bulkSize || 50;
     this.docCount = null;
     this.ready = false;
+    // M6: set true while resetData is dropping/recreating indexes so
+    // stats methods short-circuit (mirrors WardSONDB's _isCollectionEmpty
+    // pattern). Without this, queries during the reset window can hit
+    // partially-deleted indexes and throw — and the rebuilding banner
+    // wouldn't appear until the next health poll catches up.
+    this._rebuilding = false;
   }
 
   static get metadata() {
@@ -196,6 +295,14 @@ class OpenSearchBackend extends StorageBackend {
 
     this.indexesReady = Promise.resolve();
     this.ready = true;
+
+    // Phase 11A: ensure native rollup jobs are registered + started.
+    // Failures here are logged but non-fatal — the SIEM still works on
+    // raw queries; the rollups are an optimization layer.
+    this._setupRollupJobs().catch((err) =>
+      logger.warn({ err: err.message }, 'OpenSearch rollup-job setup failed (non-fatal)'),
+    );
+
     logger.info({ backend: 'opensearch', url: this.baseUrl, eventsIndex: this.eventsIndex }, 'OpenSearch backend initialized');
   }
 
@@ -204,6 +311,74 @@ class OpenSearchBackend extends StorageBackend {
     if (!exists) {
       await this.client.indices.create({ index: name, body: mapping });
       logger.info({ index: name }, 'Created OpenSearch index');
+    }
+  }
+
+  // --- Phase 11A: Rollup jobs (H10) ---
+
+  /**
+   * Idempotently register + start the 5 continuous rollup jobs. Safe to
+   * call on every startup: existing jobs are detected via GET and left
+   * alone; missing jobs are PUT and started; already-running jobs are
+   * not re-started.
+   */
+  async _setupRollupJobs() {
+    const jobs = buildRollupJobs(this.config.indexPrefix || 'siem-');
+    for (const job of jobs) {
+      try {
+        await this._ensureRollupJob(job);
+      } catch (err) {
+        // Log per-job — one failure shouldn't block the others.
+        logger.warn({ err: err.message, jobId: job.id }, 'Rollup job setup failed');
+      }
+    }
+  }
+
+  async _ensureRollupJob({ id, body }) {
+    // GET first. Two outcomes:
+    //   1. 404 → job doesn't exist → PUT + _start.
+    //   2. 200 → already exists → ensure it's running.
+    let exists = false;
+    try {
+      await this.client.transport.request({
+        method: 'GET',
+        path: `/_plugins/_rollup/jobs/${encodeURIComponent(id)}`,
+      });
+      exists = true;
+    } catch (err) {
+      // opensearch-js wraps 404 in ResponseError; check statusCode.
+      if (err.meta?.statusCode !== 404 && err.statusCode !== 404) {
+        throw err;
+      }
+    }
+
+    if (!exists) {
+      await this.client.transport.request({
+        method: 'PUT',
+        path: `/_plugins/_rollup/jobs/${encodeURIComponent(id)}`,
+        body,
+      });
+      logger.info({ jobId: id, target: body.rollup.target_index }, 'Created OpenSearch rollup job');
+    }
+
+    // Start the job. Per the docs, continuous jobs do NOT auto-start
+    // after PUT — _start is required. Calling _start on an already-
+    // running job is a no-op (returns 200 with "Failed to start job"
+    // for some versions, but is safe).
+    try {
+      await this.client.transport.request({
+        method: 'POST',
+        path: `/_plugins/_rollup/jobs/${encodeURIComponent(id)}/_start`,
+      });
+    } catch (err) {
+      // "already started" comes back as 4xx in some IM-plugin versions.
+      // We tolerate that and keep going.
+      const status = err.meta?.statusCode || err.statusCode;
+      if (status && status >= 400 && status < 500) {
+        logger.debug({ jobId: id, status }, 'Rollup _start returned 4xx (likely already running)');
+      } else {
+        throw err;
+      }
     }
   }
 
@@ -216,6 +391,10 @@ class OpenSearchBackend extends StorageBackend {
   // --- Private Helpers ---
 
   _isCollectionEmpty() {
+    // M6: treat the reset window as "no data yet" so stats endpoints
+    // return empty payloads instead of trying to query indexes that
+    // are mid-recreate.
+    if (this._rebuilding) return true;
     return this.docCount === 0;
   }
 
@@ -223,12 +402,9 @@ class OpenSearchBackend extends StorageBackend {
     return { range: { received_at: { gte: since } } };
   }
 
-  _isPrivateIp(ip) {
-    if (!ip || typeof ip !== 'string') return true;
-    // Reuse the authoritative check from ip-utils
-    const { isPrivateIp } = require('../../utils/ip-utils');
-    return isPrivateIp(ip);
-  }
+  // _isPrivateIp removed — call the authoritative isPrivateIp from
+  // utils/ip-utils directly (hoisted require at file top to avoid the
+  // per-call require lookup in hot paths).
 
   /** Validate that a string looks like an IP (v4 or v6). OpenSearch's ip type rejects bad values. */
   _isValidIp(val) {
@@ -742,7 +918,7 @@ class OpenSearchBackend extends StorageBackend {
                 filter: {
                   bool: { filter: [
                     { term: { event_type: 'firewall' } },
-                    { terms: { network_action: ['block', 'drop'] } },
+                    { term: { network_action: 'block' } },
                   ] },
                 },
               },
@@ -819,7 +995,7 @@ class OpenSearchBackend extends StorageBackend {
           return {
             ts,
             allowed: actionMap['allow'] || 0,
-            blocked: (actionMap['block'] || 0) + (actionMap['drop'] || 0),
+            blocked: (actionMap['block'] || 0),
           };
         } else {
           const typeMap = {};
@@ -884,7 +1060,7 @@ class OpenSearchBackend extends StorageBackend {
         };
       });
 
-      if (excludePrivate) rows = rows.filter(r => !this._isPrivateIp(r.ip));
+      if (excludePrivate) rows = rows.filter(r => !isPrivateIp(r.ip));
       return rows.slice(0, limit);
     } catch (err) {
       logger.error({ err }, 'OpenSearch getTopTalkers failed');
@@ -909,7 +1085,7 @@ class OpenSearchBackend extends StorageBackend {
               filter: [
                 this._timeRange(since),
                 { exists: { field: ipField } },
-                { terms: { network_action: ['block', 'drop'] } },
+                { term: { network_action: 'block' } },
               ],
             },
           },
@@ -940,7 +1116,7 @@ class OpenSearchBackend extends StorageBackend {
         };
       });
 
-      if (excludePrivate) rows = rows.filter(r => !this._isPrivateIp(r.ip));
+      if (excludePrivate) rows = rows.filter(r => !isPrivateIp(r.ip));
       return rows.slice(0, limit);
     } catch (err) {
       logger.error({ err }, 'OpenSearch getTopBlocked failed');
@@ -1075,115 +1251,84 @@ class OpenSearchBackend extends StorageBackend {
     if (this._isCollectionEmpty()) return empty;
 
     try {
-      // Get all non-private enrichment cache entries
-      const allCache = await this._getAllCacheEntries();
+      // Top row (cache-wide totals) runs in parallel with the cache walk below.
+      const summaryPromise = this._cacheGlobalSummary();
 
-      // Summary from cache
-      const totalEnriched = allCache.length;
-      const withAbuseScore = allCache.filter(c => c.abuseConfidenceScore > 0).length;
-      const highThreat = allCache.filter(c => c.abuseConfidenceScore >= 50).length;
-      const countriesSet = new Set(allCache.filter(c => c.country).map(c => c.country));
+      // Walk the enriched cache fully — paginated by search_after, no 10K cap.
+      // Collect rows into cacheMap and IP chunks for parallel period-stats
+      // queries against the events index.
+      const cacheMap = new Map();
+      const ipChunks = [];
+      for await (const batch of this._iterateEnrichedCacheEntries(1000)) {
+        const ips = [];
+        for (const c of batch) {
+          cacheMap.set(c.ip, c);
+          ips.push(c.ip);
+        }
+        ipChunks.push(ips);
+      }
 
-      // IP aggregation from events in period — both src and dst directions
-      const aggBody = {
-        aggs: {
-          events: { value_count: { field: 'received_at' } },
-          blocked: { filter: { terms: { network_action: ['block', 'drop'] } } },
-          threats: { filter: { term: { event_type: 'threat' } } },
-          last_seen: { max: { field: 'received_at' } },
-        },
-      };
-      const [srcResult, dstResult] = await Promise.all([
-        this.client.search({
-          index: this.eventsIndex,
-          body: {
-            size: 0,
-            query: this._timeRange(since),
-            aggs: { by_ip: { terms: { field: 'src_ip', size: 5000 }, ...aggBody } },
-          },
-        }),
-        this.client.search({
-          index: this.eventsIndex,
-          body: {
-            size: 0,
-            query: this._timeRange(since),
-            aggs: { by_ip: { terms: { field: 'dst_ip', size: 5000 }, ...aggBody } },
-          },
-        }),
-      ]);
+      // Each chunk's events query is independent — fan out in parallel.
+      // Filtering with `terms.include` against cache IPs avoids the 5000-bucket
+      // truncation bug of the previous top-N terms agg approach.
+      const statsResults = await Promise.all(
+        ipChunks.map(chunk => this._eventsStatsForIps(chunk, since)),
+      );
 
-      // Merge src + dst buckets into combined per-IP stats
+      // Merge per-chunk maps. An IP may appear in multiple chunks only if cache
+      // pagination rolls past it (shouldn't happen with stable ip-sort), but
+      // merging is cheap insurance.
       const ipStats = new Map();
-      const mergeBuckets = (buckets) => {
-        for (const b of buckets) {
-          const existing = ipStats.get(b.key);
-          if (existing) {
-            existing.event_count += b.doc_count;
-            existing.blocked_count += b.blocked?.doc_count || 0;
-            existing.threat_count += b.threats?.doc_count || 0;
-            const ls = b.last_seen?.value_as_string;
-            if (ls && (!existing.lastSeen || ls > existing.lastSeen)) existing.lastSeen = ls;
+      for (const stats of statsResults) {
+        for (const [ip, s] of stats) {
+          const cur = ipStats.get(ip);
+          if (cur) {
+            cur.event_count += s.event_count;
+            cur.blocked_count += s.blocked_count;
+            cur.threat_count += s.threat_count;
+            if (s.lastSeen && (!cur.lastSeen || s.lastSeen > cur.lastSeen)) cur.lastSeen = s.lastSeen;
           } else {
-            ipStats.set(b.key, {
-              event_count: b.doc_count,
-              blocked_count: b.blocked?.doc_count || 0,
-              threat_count: b.threats?.doc_count || 0,
-              lastSeen: b.last_seen?.value_as_string || null,
-            });
+            ipStats.set(ip, { ...s });
           }
         }
-      };
-      mergeBuckets(srcResult.body?.aggregations?.by_ip?.buckets || []);
-      mergeBuckets(dstResult.body?.aggregations?.by_ip?.buckets || []);
+      }
 
-      // Build cache lookup
-      const cacheMap = new Map(allCache.map(c => [c.ip, c]));
-
-      // Merge event agg with cache
+      // Period summary tallied directly from cache rows that had ≥1 event.
+      let pEnriched = 0, pFlagged = 0, pHighThreat = 0;
+      const pCountries = new Set();
       const ips = [];
-      const periodCountries = new Set();
-      let periodFlagged = 0;
-      let periodHighThreat = 0;
-
       for (const [ip, stats] of ipStats) {
-        const cached = cacheMap.get(ip);
-        if (!cached) continue; // only show enriched IPs
-        if (!cached.country && cached.abuseConfidenceScore == null) continue;
-
-        if (cached.country) periodCountries.add(cached.country);
-        if (cached.abuseConfidenceScore > 0) periodFlagged++;
-        if (cached.abuseConfidenceScore >= 50) periodHighThreat++;
-
+        const c = cacheMap.get(ip);
+        if (!c) continue;
+        if (!c.country && c.abuseConfidenceScore == null) continue;
+        pEnriched++;
+        if (c.abuseConfidenceScore > 0) pFlagged++;
+        if (c.abuseConfidenceScore >= 50) pHighThreat++;
+        if (c.country) pCountries.add(c.country);
         ips.push({
           ip,
-          hostname: cached.hostname || null,
-          country: cached.country || null,
-          city: cached.city || null,
-          lat: cached.latitude ?? null,
-          lon: cached.longitude ?? null,
-          abuse_score: cached.abuseConfidenceScore ?? null,
+          hostname: c.hostname || null,
+          country: c.country || null,
+          city: c.city || null,
+          lat: c.latitude ?? null,
+          lon: c.longitude ?? null,
+          abuse_score: c.abuseConfidenceScore ?? null,
           event_count: stats.event_count,
           blocked_count: stats.blocked_count,
           threat_count: stats.threat_count,
           lastSeen: stats.lastSeen,
         });
       }
-
-      // Sort by event count then abuse score
       ips.sort((a, b) => b.event_count - a.event_count || (b.abuse_score || 0) - (a.abuse_score || 0));
 
+      const summary = await summaryPromise;
       return {
-        summary: {
-          totalEnriched,
-          withAbuseScore,
-          highThreat,
-          countries: countriesSet.size,
-        },
+        summary,
         periodSummary: {
-          enriched: ips.length,
-          flagged: periodFlagged,
-          highThreat: periodHighThreat,
-          countries: periodCountries.size,
+          enriched: pEnriched,
+          flagged: pFlagged,
+          highThreat: pHighThreat,
+          countries: pCountries.size,
         },
         ips: ips.slice(0, limit),
       };
@@ -1218,7 +1363,7 @@ class OpenSearchBackend extends StorageBackend {
                       _source: ['src_country', 'src_city', 'src_latitude', 'src_longitude', 'src_abuseScore', 'src_hostname'],
                     },
                   },
-                  blocked: { filter: { terms: { network_action: ['block', 'drop'] } } },
+                  blocked: { filter: { term: { network_action: 'block' } } },
                   threats: { filter: { term: { event_type: 'threat' } } },
                 },
               },
@@ -1244,7 +1389,7 @@ class OpenSearchBackend extends StorageBackend {
                       _source: ['dst_country', 'dst_city', 'dst_latitude', 'dst_longitude', 'dst_abuseScore', 'dst_hostname'],
                     },
                   },
-                  blocked: { filter: { terms: { network_action: ['block', 'drop'] } } },
+                  blocked: { filter: { term: { network_action: 'block' } } },
                   threats: { filter: { term: { event_type: 'threat' } } },
                 },
               },
@@ -1310,6 +1455,13 @@ class OpenSearchBackend extends StorageBackend {
     }
   }
 
+  // --- Threat Hunt ---
+
+  async gatherHuntIntel(target, since) {
+    const { gatherHuntIntel } = require('../../threat-hunt/intel/opensearch');
+    return gatherHuntIntel(this, target, since);
+  }
+
   // --- Enrichment Cache ---
 
   /** Batch lookup cache entries by IP using mget */
@@ -1332,29 +1484,141 @@ class OpenSearchBackend extends StorageBackend {
     }
   }
 
-  /** Get all non-private cache entries with enrichment data */
-  async _getAllCacheEntries() {
+  /** Bool query matching non-private cache rows that carry geo or abuse data. */
+  _enrichedCacheQuery() {
+    return {
+      bool: {
+        must_not: [{ term: { is_private: true } }],
+        should: [
+          { exists: { field: 'country' } },
+          { exists: { field: 'abuseConfidenceScore' } },
+        ],
+        minimum_should_match: 1,
+      },
+    };
+  }
+
+  /**
+   * Single aggregation that returns the cache-wide summary (top-row cards).
+   * Removes the 10K hits cap from the previous _getAllCacheEntries-then-iterate
+   * pattern. cardinality precision_threshold is set to OpenSearch's max (40000)
+   * — exact for ≤40K distinct values.
+   */
+  async _cacheGlobalSummary() {
     try {
       const { body } = await this.client.search({
         index: this.cacheIndex,
         body: {
-          size: 10000,
-          query: {
-            bool: {
-              must_not: [{ term: { is_private: true } }],
-              should: [
-                { exists: { field: 'country' } },
-                { exists: { field: 'abuseConfidenceScore' } },
-              ],
-              minimum_should_match: 1,
-            },
+          size: 0,
+          track_total_hits: true,
+          query: this._enrichedCacheQuery(),
+          aggs: {
+            withAbuseScore: { filter: { range: { abuseConfidenceScore: { gt: 0 } } } },
+            highThreat:    { filter: { range: { abuseConfidenceScore: { gte: 50 } } } },
+            countries:     { cardinality: { field: 'country', precision_threshold: 40000 } },
           },
         },
       });
-      return (body.hits?.hits || []).map(h => ({ ip: h._id, ...h._source }));
-    } catch {
-      return [];
+      return {
+        totalEnriched: body.hits?.total?.value ?? 0,
+        withAbuseScore: body.aggregations?.withAbuseScore?.doc_count ?? 0,
+        highThreat: body.aggregations?.highThreat?.doc_count ?? 0,
+        countries: body.aggregations?.countries?.value ?? 0,
+      };
+    } catch (err) {
+      logger.error({ err }, 'OpenSearch _cacheGlobalSummary failed');
+      return { totalEnriched: 0, withAbuseScore: 0, highThreat: 0, countries: 0 };
     }
+  }
+
+  /**
+   * Async generator that yields batches of enriched non-private cache rows.
+   * Pages via sort + search_after on the `ip` field (== _id) — handles caches
+   * larger than the 10K index.max_result_window cap.
+   */
+  async *_iterateEnrichedCacheEntries(batchSize = 1000) {
+    const baseBody = {
+      size: batchSize,
+      query: this._enrichedCacheQuery(),
+      sort: [{ ip: { order: 'asc' } }],
+      track_total_hits: false,
+    };
+    let searchAfter;
+    while (true) {
+      const body = searchAfter ? { ...baseBody, search_after: searchAfter } : baseBody;
+      let hits;
+      try {
+        const res = await this.client.search({ index: this.cacheIndex, body });
+        hits = res.body?.hits?.hits || [];
+      } catch (err) {
+        logger.error({ err }, 'OpenSearch _iterateEnrichedCacheEntries page failed');
+        break;
+      }
+      if (hits.length === 0) break;
+      yield hits.map(h => ({ ip: h._id, ...h._source }));
+      if (hits.length < batchSize) break;
+      searchAfter = hits[hits.length - 1].sort;
+    }
+  }
+
+  /**
+   * Given a chunk of IPs, return per-IP stats for those that appeared in
+   * events during [since, now) — uses `terms.include` to push the filter
+   * down so we only get back the IPs we asked about (no top-N truncation).
+   * Returns Map<ip, {event_count, blocked_count, threat_count, lastSeen}>.
+   */
+  async _eventsStatsForIps(ips, since) {
+    const stats = new Map();
+    if (!ips || ips.length === 0) return stats;
+    const subAggs = {
+      blocked:   { filter: { term: { network_action: 'block' } } },
+      threats:   { filter: { term: { event_type: 'threat' } } },
+      last_seen: { max: { field: 'received_at' } },
+    };
+    try {
+      const { body } = await this.client.search({
+        index: this.eventsIndex,
+        body: {
+          size: 0,
+          query: {
+            bool: {
+              filter: [
+                this._timeRange(since),
+                {
+                  bool: {
+                    should: [
+                      { terms: { src_ip: ips } },
+                      { terms: { dst_ip: ips } },
+                    ],
+                    minimum_should_match: 1,
+                  },
+                },
+              ],
+            },
+          },
+          aggs: {
+            by_src: { terms: { field: 'src_ip', include: ips, size: ips.length }, aggs: subAggs },
+            by_dst: { terms: { field: 'dst_ip', include: ips, size: ips.length }, aggs: subAggs },
+          },
+        },
+      });
+      const merge = (buckets) => {
+        for (const b of buckets) {
+          const cur = stats.get(b.key) || { event_count: 0, blocked_count: 0, threat_count: 0, lastSeen: null };
+          cur.event_count += b.doc_count;
+          cur.blocked_count += b.blocked?.doc_count || 0;
+          cur.threat_count += b.threats?.doc_count || 0;
+          const ls = b.last_seen?.value_as_string;
+          if (ls && (!cur.lastSeen || ls > cur.lastSeen)) cur.lastSeen = ls;
+          stats.set(b.key, cur);
+        }
+      };
+      merge(body.aggregations?.by_src?.buckets || []);
+      merge(body.aggregations?.by_dst?.buckets || []);
+    } catch (err) {
+      logger.error({ err, count: ips.length }, 'OpenSearch _eventsStatsForIps failed');
+    }
+    return stats;
   }
 
   async getCachedEnrichment(ip) {
@@ -1425,16 +1689,21 @@ class OpenSearchBackend extends StorageBackend {
   }
 
   async getAllCachedEnrichment() {
-    const entries = await this._getAllCacheEntries();
-    return entries.map(e => ({
-      ip: e.ip,
-      geo_country: e.country || null,
-      geo_city: e.city || null,
-      geo_lat: e.latitude ?? null,
-      geo_lon: e.longitude ?? null,
-      abuse_score: e.abuseConfidenceScore ?? null,
-      hostname: e.hostname || null,
-    }));
+    const out = [];
+    for await (const batch of this._iterateEnrichedCacheEntries(1000)) {
+      for (const e of batch) {
+        out.push({
+          ip: e.ip,
+          geo_country: e.country || null,
+          geo_city: e.city || null,
+          geo_lat: e.latitude ?? null,
+          geo_lon: e.longitude ?? null,
+          abuse_score: e.abuseConfidenceScore ?? null,
+          hostname: e.hostname || null,
+        });
+      }
+    }
+    return out;
   }
 
   // --- Health & Maintenance ---
@@ -1454,10 +1723,15 @@ class OpenSearchBackend extends StorageBackend {
 
       // Yellow is expected for single-node (replicas can't be assigned)
       const ok = clusterStatus !== 'red';
+      // M6: surface the reset-window rebuild as write_pressure: high so
+      // the dashboard banner appears immediately (rather than waiting
+      // for the next ingestion-driven write_pressure observation).
+      const writePressure = (this._rebuilding || clusterStatus === 'red') ? 'high' : 'normal';
 
       return {
         ok,
-        writePressure: clusterStatus === 'red' ? 'high' : 'normal',
+        writePressure,
+        rebuilding: this._rebuilding,
         details: {
           backend: 'opensearch',
           clusterStatus,
@@ -1506,20 +1780,28 @@ class OpenSearchBackend extends StorageBackend {
   }
 
   async resetData() {
-    // Delete and recreate both indexes
+    // M6: flag the rebuild window so stats methods short-circuit and
+    // healthCheck reports rebuilding. Cleared in the finally block —
+    // even on failure, leaving the flag stuck would silently break
+    // the dashboard.
+    this._rebuilding = true;
     try {
-      await this.client.indices.delete({
-        index: [this.eventsIndex, this.cacheIndex],
-        ignore_unavailable: true,
-      });
-    } catch {
-      // Indexes may not exist
-    }
+      try {
+        await this.client.indices.delete({
+          index: [this.eventsIndex, this.cacheIndex],
+          ignore_unavailable: true,
+        });
+      } catch {
+        // Indexes may not exist
+      }
 
-    await this._ensureIndex(this.eventsIndex, EVENTS_MAPPING);
-    await this._ensureIndex(this.cacheIndex, CACHE_MAPPING);
-    this.docCount = 0;
-    this.indexesReady = Promise.resolve();
+      await this._ensureIndex(this.eventsIndex, EVENTS_MAPPING);
+      await this._ensureIndex(this.cacheIndex, CACHE_MAPPING);
+      this.docCount = 0;
+      this.indexesReady = Promise.resolve();
+    } finally {
+      this._rebuilding = false;
+    }
   }
 
   // --- Settings (delegated to SQLite by storage manager) ---
@@ -1530,3 +1812,6 @@ class OpenSearchBackend extends StorageBackend {
 }
 
 module.exports = OpenSearchBackend;
+// Exported for unit testing — the rollup-job specs are pure data, easy to
+// verify against the OpenSearch IM-plugin schema without spinning up a cluster.
+module.exports.buildRollupJobs = buildRollupJobs;

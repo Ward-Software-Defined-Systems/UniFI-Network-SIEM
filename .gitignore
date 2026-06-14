@@ -14,6 +14,7 @@ data/server.cert
 
 # Environment / secrets
 .env
+scripts/print-api-token.js
 
 # Frontend build output
 frontend/dist/
@@ -34,6 +35,7 @@ SPEC_SIEM_wardsondb_backend_fixes.md
 SIEM_OPENSEARCH_BACKEND_TASK.md
 SIEM_WARDSONDB_PARTITIONING_ROLLUPS_TASK.md
 WardSONDB_API.md
+CODE_REVIEW.md
 
 # Editor
 *.swp

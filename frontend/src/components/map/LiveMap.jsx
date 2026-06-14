@@ -1,20 +1,11 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { MapContainer, TileLayer, CircleMarker, Polyline, Popup, useMap } from 'react-leaflet';
 import PeriodSelector from '../shared/PeriodSelector';
 import RefreshControls, { PausedIndicator } from '../shared/RefreshControls';
 import { getGeoEvents, getRecentGeoEvents } from '../../lib/api';
 import { formatNumber, formatDateTime, countryFlag } from '../../lib/format';
 import 'leaflet/dist/leaflet.css';
-
-function isPrivateIp(ip) {
-  if (!ip) return false;
-  return ip.startsWith('10.') ||
-    ip.startsWith('192.168.') ||
-    ip.startsWith('127.') ||
-    ip.startsWith('169.254.') ||
-    /^172\.(1[6-9]|2\d|3[01])\./.test(ip) ||
-    /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(ip);
-}
+import { isPrivateIp } from '../../lib/ip-utils';
 
 function getMarkerColor(event) {
   if (event.threats > 0 || event.abuseScore > 50) return '#ef4444'; // red
@@ -109,25 +100,33 @@ export default function LiveMap({ period, setPeriod, refreshRate, setRefreshRate
   const [loading, setLoading] = useState(false);
   const fetchRef = useRef(null);
 
-  const doFetch = useCallback(() => {
-    setLoading(true);
-    Promise.all([
-      getGeoEvents(period, 1000),
-      getRecentGeoEvents(50),
-    ]).then(([geo, recent]) => {
-      setGeoEvents(geo);
-      setRecentEvents(recent);
-    }).catch(() => {}).finally(() => setLoading(false));
-  }, [period]);
-
-  useEffect(() => { fetchRef.current = doFetch; }, [doFetch]);
-
   useEffect(() => {
+    let cancelled = false;
+
+    const doFetch = () => {
+      if (cancelled) return;
+      setLoading(true);
+      Promise.all([
+        getGeoEvents(period, 1000),
+        getRecentGeoEvents(50),
+      ]).then(([geo, recent]) => {
+        if (cancelled) return;
+        setGeoEvents(geo);
+        setRecentEvents(recent);
+      }).catch(() => {}).finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    };
+
+    fetchRef.current = doFetch;
     doFetch();
-    if (paused) return;
-    const interval = setInterval(() => fetchRef.current?.(), refreshRate);
-    return () => clearInterval(interval);
-  }, [doFetch, refreshRate, paused]);
+    if (paused) return () => { cancelled = true; };
+    const interval = setInterval(doFetch, refreshRate);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [period, refreshRate, paused]);
 
   const filteredEvents = geoEvents.filter(e => !isPrivateIp(e.ip));
   const hasData = filteredEvents.length > 0;

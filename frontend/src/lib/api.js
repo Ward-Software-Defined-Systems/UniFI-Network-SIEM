@@ -1,4 +1,42 @@
-const BASE = '';
+// Token helpers — single source of truth for the SIEM_API_TOKEN that the
+// dashboard sends with every API request and the WebSocket upgrade.
+const TOKEN_KEY = 'siem_api_token';
+
+export function getStoredToken() {
+  try { return localStorage.getItem(TOKEN_KEY) || ''; } catch { return ''; }
+}
+export function setStoredToken(t) {
+  try { localStorage.setItem(TOKEN_KEY, t); } catch {}
+}
+export function clearStoredToken() {
+  try { localStorage.removeItem(TOKEN_KEY); } catch {}
+}
+
+function authHeaders() {
+  const t = getStoredToken();
+  return t ? { Authorization: `Bearer ${t}` } : {};
+}
+
+function dispatchAuthRequired() {
+  try { window.dispatchEvent(new CustomEvent('siem:auth-required')); } catch {}
+}
+
+async function jsonFetch(url, init = {}) {
+  const res = await fetch(url, {
+    ...init,
+    headers: { ...(init.headers || {}), ...authHeaders() },
+  });
+  if (res.status === 401) {
+    dispatchAuthRequired();
+    throw new Error('Unauthorized');
+  }
+  if (!res.ok) {
+    let err = `API error: ${res.status}`;
+    try { const j = await res.json(); if (j?.error) err = j.error; } catch {}
+    throw new Error(err);
+  }
+  return res.json();
+}
 
 export async function fetchApi(path, params = {}) {
   const url = new URL(path, window.location.origin);
@@ -7,10 +45,20 @@ export async function fetchApi(path, params = {}) {
       url.searchParams.set(key, value);
     }
   }
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`API error: ${res.status}`);
-  return res.json();
+  return jsonFetch(url);
 }
+
+export const postApi = (path, body) => jsonFetch(new URL(path, window.location.origin), {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: body === undefined ? undefined : JSON.stringify(body),
+});
+
+export const putApi = (path, body) => jsonFetch(new URL(path, window.location.origin), {
+  method: 'PUT',
+  headers: { 'Content-Type': 'application/json' },
+  body: body === undefined ? undefined : JSON.stringify(body),
+});
 
 export const getEvents = (params) => fetchApi('/api/events', params);
 export const getEvent = (id) => fetchApi(`/api/events/${id}`);

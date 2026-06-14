@@ -1,4 +1,7 @@
-const { getDb } = require('./database');
+// Sync better-sqlite3 cache accessors used by the SQLite enrichment
+// path. Backed by the SQLite settings backend's connection (always
+// present, even when the active data backend is OpenSearch/WardSONDB).
+const { getDb } = require('./storage');
 const config = require('../config');
 
 function getCachedEnrichment(ip) {

@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import PeriodSelector from '../shared/PeriodSelector';
 import RefreshControls, { PausedIndicator } from '../shared/RefreshControls';
 import StatsCards from './StatsCards';
@@ -25,46 +25,54 @@ export default function Dashboard({ period, setPeriod, refreshRate, setRefreshRa
   const [loadProgress, setLoadProgress] = useState({ completed: 0, total: TOTAL_QUERIES, loading: false });
   const fetchRef = useRef(null);
 
-  const doFetch = useCallback(() => {
+  // Initial fetch + auto-refresh interval. The cancelled flag prevents
+  // stale in-flight responses from overwriting fresh state when the
+  // period/excludePrivate changes or the component unmounts mid-fetch.
+  useEffect(() => {
+    let cancelled = false;
     const bucket = period === '1h' ? '5m' : period === '6h' ? '15m' : '1h';
     const ep = excludePrivate ? '1' : undefined;
 
-    let completed = 0;
-    setLoadProgress({ completed: 0, total: TOTAL_QUERIES, loading: true });
+    const doFetch = () => {
+      let completed = 0;
+      if (cancelled) return;
+      setLoadProgress({ completed: 0, total: TOTAL_QUERIES, loading: true });
 
-    const track = (promise, setter, label) =>
-      promise.then(data => {
-        if (setter) setter(data);
-        completed++;
-        setLoadProgress({ completed, total: TOTAL_QUERIES, loading: completed < TOTAL_QUERIES });
-      }).catch((err) => {
-        console.error(`[Dashboard] ${label || 'query'} failed:`, err);
-        completed++;
-        setLoadProgress({ completed, total: TOTAL_QUERIES, loading: completed < TOTAL_QUERIES });
-      });
+      const track = (promise, setter, label) =>
+        promise.then(data => {
+          if (cancelled) return;
+          if (setter) setter(data);
+          completed++;
+          setLoadProgress({ completed, total: TOTAL_QUERIES, loading: completed < TOTAL_QUERIES });
+        }).catch((err) => {
+          if (cancelled) return;
+          console.error(`[Dashboard] ${label || 'query'} failed:`, err);
+          completed++;
+          setLoadProgress({ completed, total: TOTAL_QUERIES, loading: completed < TOTAL_QUERIES });
+        });
 
-    Promise.all([
-      track(getStatsOverview(period), setOverview, 'overview'),
-      track(getTimeline(period, bucket), setTimeline, 'timeline'),
-      track(getTopTalkers(period, 10, 'src'), setTopSrc, 'topSrc'),
-      track(getTopBlocked(period, 10, 'src', ep), setTopBlockedSrc, 'topBlockedSrc'),
-      track(getTopBlocked(period, 10, 'dst', ep), setTopBlockedDst, 'topBlockedDst'),
-      track(getTopPorts(period, 10), setTopPorts, 'topPorts'),
-      track(getTopThreats(period, 10), setTopThreats, 'topThreats'),
-      track(getTopClients(period, 10), setTopClients, 'topClients'),
-      track(getTopTalkers(period, 10, 'dst', ep), setTopDst, 'topDst'),
-    ]);
-  }, [period, excludePrivate]);
+      Promise.all([
+        track(getStatsOverview(period), setOverview, 'overview'),
+        track(getTimeline(period, bucket), setTimeline, 'timeline'),
+        track(getTopTalkers(period, 10, 'src'), setTopSrc, 'topSrc'),
+        track(getTopBlocked(period, 10, 'src', ep), setTopBlockedSrc, 'topBlockedSrc'),
+        track(getTopBlocked(period, 10, 'dst', ep), setTopBlockedDst, 'topBlockedDst'),
+        track(getTopPorts(period, 10), setTopPorts, 'topPorts'),
+        track(getTopThreats(period, 10), setTopThreats, 'topThreats'),
+        track(getTopClients(period, 10), setTopClients, 'topClients'),
+        track(getTopTalkers(period, 10, 'dst', ep), setTopDst, 'topDst'),
+      ]);
+    };
 
-  useEffect(() => { fetchRef.current = doFetch; }, [doFetch]);
-
-  // Initial fetch + auto-refresh interval
-  useEffect(() => {
+    fetchRef.current = doFetch;
     doFetch();
-    if (paused) return;
-    const interval = setInterval(() => fetchRef.current?.(), refreshRate);
-    return () => clearInterval(interval);
-  }, [doFetch, refreshRate, paused]);
+    if (paused) return () => { cancelled = true; };
+    const interval = setInterval(doFetch, refreshRate);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [period, excludePrivate, refreshRate, paused]);
 
   return (
     <div className="p-4 space-y-4 overflow-auto h-full">

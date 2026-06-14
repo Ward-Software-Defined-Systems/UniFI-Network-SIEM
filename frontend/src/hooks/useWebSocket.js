@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
+import { getStoredToken } from '../lib/api';
 
 export function useWebSocket(maxEvents = 200) {
   const [events, setEvents] = useState([]);
@@ -10,7 +11,12 @@ export function useWebSocket(maxEvents = 200) {
 
   const connect = useCallback(() => {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const url = `${protocol}//${window.location.host}/ws/events`;
+    // Token travels as a query param because browser WebSocket clients can't
+    // set custom headers on the upgrade. Default HTTP_HOST=127.0.0.1 keeps
+    // the URL local; bind to 0.0.0.0 only on a trusted network.
+    const token = getStoredToken();
+    const tokenParam = token ? `?token=${encodeURIComponent(token)}` : '';
+    const url = `${protocol}//${window.location.host}/ws/events${tokenParam}`;
 
     const ws = new WebSocket(url);
     wsRef.current = ws;

@@ -11,7 +11,15 @@ export function useEventQuery(initialFilters = {}) {
     try {
       const params = { ...filters, ...overrides };
       const data = await getEvents(params);
-      setEvents(data);
+      // M4: `/api/events` now returns `{events, hasMore, nextCursor}`.
+      // Tolerate the older array-shaped response for forward/back-
+      // compat across server upgrades — if `data` is an array, treat
+      // it as the events list directly.
+      if (Array.isArray(data)) {
+        setEvents(data);
+      } else {
+        setEvents(data.events || []);
+      }
     } catch (err) {
       console.error('Failed to fetch events:', err);
     } finally {

@@ -10,6 +10,8 @@ const path = require('path');
 const fs = require('fs');
 const StorageBackend = require('./interface');
 const logger = require('../../utils/logger');
+const { buildPrivateIpFilter } = require('../utils/private-ip-sql');
+const { accumulateRollups } = require('../rollups');
 
 class SqliteBackend extends StorageBackend {
   constructor(config = {}) {
@@ -479,91 +481,25 @@ class SqliteBackend extends StorageBackend {
   }
 
   _updateRollups(events) {
-    const nowMs = Date.now();
+    // Aggregate the batch via the shared pure function, then UPSERT each
+    // resulting row. Keeps SQLite + WardSONDB rollups in lockstep — the
+    // shared math lives in src/db/rollups.js.
+    const r = accumulateRollups(events);
 
-    // Pre-aggregate batch in JS, keyed by per-event bucket
-    const eventCounts = new Map();  // key: bucket5m|event_type|action → count
-    const ipCounts = new Map();     // key: bucket1h|ip|direction → { event, blocked, threat }
-    const portCounts = new Map();   // key: bucket1h|port|protocol → count
-    const sigCounts = new Map();    // key: bucket1h|signature|classification → count
-    const clientCounts = new Map(); // key: bucket1h|mac → { event, wifi, dhcp, firewall }
-
-    for (const evt of events) {
-      // Use event's received_at for bucket, fall back to now
-      const evtMs = evt.received_at ? new Date(evt.received_at).getTime() : nowMs;
-      const b5m = new Date(Math.floor(evtMs / 300000) * 300000).toISOString();
-      const b1h = new Date(Math.floor(evtMs / 3600000) * 3600000).toISOString();
-
-      const type = evt.event_type || 'unknown';
-      const action = evt.action || '';
-
-      // event_stats_5m
-      const ek = `${b5m}|${type}|${action}`;
-      eventCounts.set(ek, (eventCounts.get(ek) || 0) + 1);
-
-      // ip_stats_hourly
-      const isBlocked = action === 'block' ? 1 : 0;
-      const isThreat = type === 'threat' ? 1 : 0;
-      if (evt.src_ip) {
-        const sk = `${b1h}|${evt.src_ip}|src`;
-        const s = ipCounts.get(sk) || { event: 0, blocked: 0, threat: 0 };
-        s.event++; s.blocked += isBlocked; s.threat += isThreat;
-        ipCounts.set(sk, s);
-      }
-      if (evt.dst_ip) {
-        const dk = `${b1h}|${evt.dst_ip}|dst`;
-        const d = ipCounts.get(dk) || { event: 0, blocked: 0, threat: 0 };
-        d.event++; d.blocked += isBlocked; d.threat += isThreat;
-        ipCounts.set(dk, d);
-      }
-
-      // port_stats_hourly
-      if (evt.dst_port) {
-        const pk = `${b1h}|${evt.dst_port}|${evt.protocol || ''}`;
-        portCounts.set(pk, (portCounts.get(pk) || 0) + 1);
-      }
-
-      // sig_stats_hourly — include all threats, fallback signature for missing
-      if (type === 'threat') {
-        const sig = evt.ids_signature || '(no signature)';
-        const cls = evt.ids_classification || '';
-        const sigk = `${b1h}|${sig}|${cls}`;
-        sigCounts.set(sigk, (sigCounts.get(sigk) || 0) + 1);
-      }
-
-      // client_stats_hourly
-      const mac = evt.client_mac || evt.wifi_client_mac || evt.dhcp_mac;
-      if (mac) {
-        const ck = `${b1h}|${mac}`;
-        const c = clientCounts.get(ck) || { event: 0, wifi: 0, dhcp: 0, firewall: 0 };
-        c.event++;
-        if (type === 'wifi') c.wifi++;
-        if (type === 'dhcp') c.dhcp++;
-        if (type === 'firewall') c.firewall++;
-        clientCounts.set(ck, c);
-      }
+    for (const v of r.fiveMin.values()) {
+      this._rollupEventStats.run(v.bucket, v.event_type, v.action, v.count);
     }
-
-    // UPSERT aggregated counts
-    for (const [key, count] of eventCounts) {
-      const [bucket, type, action] = key.split('|');
-      this._rollupEventStats.run(bucket, type, action, count);
+    for (const v of r.ipHourly.values()) {
+      this._rollupIpStats.run(v.bucket, v.ip, v.direction, v.event_count, v.blocked_count, v.threat_count);
     }
-    for (const [key, counts] of ipCounts) {
-      const [bucket, ip, dir] = key.split('|');
-      this._rollupIpStats.run(bucket, ip, dir, counts.event, counts.blocked, counts.threat);
+    for (const v of r.portHourly.values()) {
+      this._rollupPortStats.run(v.bucket, parseInt(v.port, 10), v.protocol, v.count);
     }
-    for (const [key, count] of portCounts) {
-      const [bucket, port, protocol] = key.split('|');
-      this._rollupPortStats.run(bucket, parseInt(port, 10), protocol, count);
+    for (const v of r.sigHourly.values()) {
+      this._rollupSigStats.run(v.bucket, v.signature, v.classification, v.count);
     }
-    for (const [key, count] of sigCounts) {
-      const [bucket, sig, cls] = key.split('|');
-      this._rollupSigStats.run(bucket, sig, cls, count);
-    }
-    for (const [key, counts] of clientCounts) {
-      const [bucket, mac] = key.split('|');
-      this._rollupClientStats.run(bucket, mac, counts.event, counts.wifi, counts.dhcp, counts.firewall);
+    for (const v of r.clientHourly.values()) {
+      this._rollupClientStats.run(v.bucket, v.mac, v.event_count, v.wifi_count, v.dhcp_count, v.firewall_count);
     }
   }
 
@@ -675,16 +611,10 @@ class SqliteBackend extends StorageBackend {
   // --- Stats / Aggregation ---
 
   _privateIpFilter(col) {
-    return `${col} NOT LIKE '10.%'
-      AND ${col} NOT LIKE '192.168.%'
-      AND ${col} NOT LIKE '172.16.%' AND ${col} NOT LIKE '172.17.%' AND ${col} NOT LIKE '172.18.%' AND ${col} NOT LIKE '172.19.%'
-      AND ${col} NOT LIKE '172.2_.%' AND ${col} NOT LIKE '172.30.%' AND ${col} NOT LIKE '172.31.%'
-      AND ${col} NOT LIKE '100.64.%' AND ${col} NOT LIKE '100.65.%' AND ${col} NOT LIKE '100.66.%' AND ${col} NOT LIKE '100.67.%'
-      AND ${col} NOT LIKE '100.68.%' AND ${col} NOT LIKE '100.69.%' AND ${col} NOT LIKE '100.7_.%'
-      AND ${col} NOT LIKE '100.8_.%' AND ${col} NOT LIKE '100.9_.%' AND ${col} NOT LIKE '100.1__.%'
-      AND ${col} NOT LIKE '100.12_.%'
-      AND ${col} NOT LIKE '127.%'
-      AND ${col} NOT LIKE '169.254.%'`;
+    // Generated from the canonical isPrivateIp predicate. See
+    // src/db/utils/private-ip-sql.js — keeps SQL exclusions in sync with
+    // the JS isPrivateIp the other backends apply post-query.
+    return buildPrivateIpFilter(col);
   }
 
   async getOverviewStats(since) {
@@ -932,6 +862,13 @@ class SqliteBackend extends StorageBackend {
     `, [limit]);
   }
 
+  // --- Threat Hunt ---
+
+  async gatherHuntIntel(target, since) {
+    const { gatherHuntIntel } = require('../../threat-hunt/intel/sqlite');
+    return gatherHuntIntel(this, target, since);
+  }
+
   // --- Enrichment Cache ---
 
   async getCachedEnrichment(ip) {
@@ -944,13 +881,27 @@ class SqliteBackend extends StorageBackend {
   }
 
   async setCachedEnrichment(ip, data) {
+    // M5: read-then-write merge to match OpenSearch's behavior. Without
+    // this, `setCachedEnrichment(ip, { is_private: true })` would null
+    // out previously-stored geo_country / abuse_score / hostname for an
+    // IP later flagged private. WardSONDB has its own NEW-C7 PATCH-only
+    // markPrivate path; OpenSearch already merges. Now all three
+    // backends preserve fields that aren't in the new `data` argument.
+    const existing = this.db.prepare('SELECT * FROM ip_enrichment_cache WHERE ip = ?').get(ip) || {};
     this.db.prepare(`
       INSERT OR REPLACE INTO ip_enrichment_cache
       (ip, geo_country, geo_city, geo_lat, geo_lon, abuse_score, hostname, is_private, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
-    `).run(ip, data.geo_country || null, data.geo_city || null, data.geo_lat || null,
-      data.geo_lon || null, data.abuse_score ?? null, data.hostname || null,
-      data.is_private ? 1 : 0);
+    `).run(
+      ip,
+      data.geo_country ?? existing.geo_country ?? null,
+      data.geo_city ?? existing.geo_city ?? null,
+      data.geo_lat ?? existing.geo_lat ?? null,
+      data.geo_lon ?? existing.geo_lon ?? null,
+      data.abuse_score ?? existing.abuse_score ?? null,
+      data.hostname ?? existing.hostname ?? null,
+      (data.is_private ?? existing.is_private) ? 1 : 0,
+    );
   }
 
   async markPrivate(ip) {
@@ -1003,7 +954,16 @@ class SqliteBackend extends StorageBackend {
   }
 
   async getAllSettings() {
-    return this.db.prepare('SELECT key, value FROM settings').all();
+    const rows = this.db.prepare('SELECT key, value FROM settings').all();
+    // Parse values so callers receive structured data (matches getSetting).
+    // Returning the raw JSON-encoded string here was the cause of the
+    // master-key/auth-token quote-wrapping bug: callers passed the
+    // doubly-encoded string into setMasterKey()/encrypt(), producing
+    // ciphertext that couldn't decrypt across restart.
+    return rows.map((row) => {
+      try { return { key: row.key, value: JSON.parse(row.value) }; }
+      catch { return { key: row.key, value: row.value }; }
+    });
   }
 
   // --- Direct DB access (for backward compatibility) ---

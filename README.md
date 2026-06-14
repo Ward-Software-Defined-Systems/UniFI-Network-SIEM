@@ -19,11 +19,11 @@ A self-contained, **AI-powered** Node.js application that collects syslog from U
 - **GeoIP & threat enrichment** — MaxMind GeoLite2 for geolocation, AbuseIPDB for threat scoring, reverse DNS — all async with caching
 - **Country flags & abuse badges** — 🇺🇸 emoji flags with country codes on external IPs; color-coded abuse score badges across all views
 - **Threat Intel** — sortable/filterable table of enriched IPs with abuse scores, event counts, and locations; period-filtered summary cards alongside all-time totals
-- **Threat Hunt (Beta)** — AI-powered threat actor investigation with SSE streaming. Enter any IP and choose a time window (`1h / 6h / 24h / 7d / 30d`) — the same period selector used by Dashboard / Live Map / Threat Intel — and every local-intel query is scoped to that window. Returns a full profile: local SIEM activity (events, ports, timeline, IDS signatures, related /24 IPs), external intel (rDNS, WHOIS/ASN), and a structured AI threat assessment streamed token-by-token with PDF export. Supports Anthropic (Opus 4.6 with adaptive thinking, 128K output), OpenAI (GPT-5.4, 128K output), and Google (Gemini 3.1 Pro, 65K output) with on-page API key management. *Currently tested with Anthropic only — OpenAI and Google integrations are implemented but untested.*
+- **Threat Hunt (Beta)** — AI-powered threat actor investigation with SSE streaming. Enter any IP and choose a time window (`1h / 6h / 24h / 7d / 30d`) — the same period selector used by Dashboard / Live Map / Threat Intel — and every local-intel query is scoped to that window. Returns a full profile: local SIEM activity (events, ports, timeline, IDS signatures, related /24 IPs), external intel (rDNS, WHOIS/ASN), and a structured AI threat assessment streamed token-by-token with PDF export. Supports Anthropic (Opus 4.8 with adaptive thinking at max effort, 128K output), OpenAI (GPT-5.4, 128K output), and Google (Gemini 3.1 Pro, 65K output) with on-page API key management. *Currently tested with Anthropic only — OpenAI and Google integrations are implemented but untested.*
 - **HTTPS by default** — auto-generated self-signed TLS certificate
 - **Pluggable storage backends** — SQLite (built-in default), WardSONDB (Beta), OpenSearch (Beta). OpenSearch runs via Docker with native aggregations (no rollup tables), batched enrichment backfill with `update_by_query`, and full Threat Hunt support. WardSONDB runs remotely over HTTPS with a per-client undici dispatcher for connect-timeout tuning
 - **SQLite storage** — WAL mode, batched inserts, automatic retention cleanup, worker thread enrichment. Materialized rollup tables (event_stats_5m, ip/port/sig/client_stats_hourly) are updated atomically on insert for sub-second dashboard stats at scale (tested to 8M+ events). A dedicated stats worker thread keeps the event loop responsive during queries. Existing databases self-heal on restart: legacy indexes are automatically dropped and replaced with optimized compound indexes, and rollup tables are backfilled from existing events on first upgrade
-- **WardSONDB storage** — daily event partitions (`events-YYYY-MM-DD`) with partition-drop retention (no `_delete_by_query` on event data), five pre-aggregated rollup collections matching SQLite's schemas exactly (`rollups-5m`, `rollups-ip-hourly`, `rollups-port-hourly`, `rollups-sig-hourly`, `rollups-client-hourly`) flushed every 5 seconds via read-then-increment. Dashboard stats, Live Map, and Threat Intel all query rollups exclusively; Threat Hunt fans out across the partitions overlapping the selected period with per-partition result merging. Running live at 12M+ events — still iterating on optimizations
+- **WardSONDB storage** — daily event partitions (`events-YYYY-MM-DD`) with partition-drop retention (no `_delete_by_query` on event data), five pre-aggregated rollup collections matching SQLite's schemas exactly (`rollups-5m`, `rollups-ip-hourly`, `rollups-port-hourly`, `rollups-sig-hourly`, `rollups-client-hourly`). Phase 10 replaced the original read-then-PATCH flush with append-only `_bulk` deltas — each 5s flush emits new docs (`delta: true`) and a 30-minute compaction job folds older deltas into a canonical doc (`delta: false`). Dashboard stats, Live Map, and Threat Intel all query rollups exclusively; Threat Hunt fans out across the partitions overlapping the selected period with per-partition result merging. Running live at 12M+ events
 - **Zero external services** — everything runs in one process
 
 ## Screenshots
@@ -185,8 +185,12 @@ For full functionality, three logging sources on the UniFi Console should be con
 | `GET /api/stats/geo-events` | Aggregated IPs with geo coordinates for map |
 | `GET /api/stats/recent-geo-events` | Recent events with geo data for flow lines |
 | `GET /api/health` | System health, event counts, DB size |
-| `GET /api/settings` | App settings (sensitive values redacted) |
-| `PUT /api/settings` | Update settings (AbuseIPDB key, etc.) |
+| `GET /api/settings` | Legacy flat-key settings (sensitive values redacted) |
+| `PUT /api/settings` | Legacy flat-key update (AbuseIPDB key, etc.) |
+| `GET /api/settings/v2` | Schema-aware settings: schema + current values (sensitive masked) |
+| `PUT /api/settings/v2` | Update one schema setting (rejects masked-value writes) |
+| `POST /api/settings/v2/reset` | Reset one setting to its schema default |
+| `POST /api/settings/v2/regenerate-token` | Rotate the API/WebSocket auth token |
 | `POST /api/settings/reset-db` | Clear all events and enrichment cache |
 | `GET /api/threat-hunt/settings` | Threat Hunt AI provider settings |
 | `PUT /api/threat-hunt/settings` | Update AI provider/keys |
@@ -194,42 +198,53 @@ For full functionality, three logging sources on the UniFi Console should be con
 | `POST /api/threat-hunt/investigate-stream` | SSE streaming AI investigation (primary endpoint) |
 | `WSS /ws/events` | Live event stream with filtering |
 
-## Configuration (.env)
+## Configuration
+
+Operator settings live in the SQLite database and are managed via the **Settings** view in the dashboard. `.env` is the bootstrap layer only — it carries the handful of values needed before the database is open, plus optional headless/CI overrides for the auth token and master key.
+
+### Bootstrap (`.env`)
 
 | Variable | Default | Description |
 |---|---|---|
-| `SYSLOG_PORT` | 5514 | UDP port for syslog listener |
-| `HTTP_PORT` | 3000 | Web dashboard port |
-| `DB_PATH` | ./data/events.db | SQLite database path |
-| `RETENTION_DAYS` | 60 | Auto-delete events older than this |
-| `LOG_LEVEL` | info | Logging level (trace/debug/info/warn/error) |
-| `GEOIP_DB_PATH` | ./data/GeoLite2-City.mmdb | Path to MaxMind GeoLite2 database |
-| `ABUSEIPDB_API_KEY` | *(empty)* | AbuseIPDB API key (free tier: 1000/day) |
-| `ABUSEIPDB_CACHE_HOURS` | 24 | Cache duration for abuse scores |
-| `RDNS_ENABLED` | false | Enable reverse DNS lookups |
-| `LOG_RAW_MESSAGES` | false | Store raw syslog text in DB |
-| `INSERT_BATCH_SIZE` | 50 | Batch insert threshold |
-| `INSERT_BATCH_INTERVAL_MS` | 500 | Batch insert flush interval |
-| `ENRICHMENT_CONCURRENCY` | 5 | Max parallel enrichment lookups |
-| `RDNS_TIMEOUT_MS` | 2000 | Reverse DNS lookup timeout (ms) |
-| `WS_BROADCAST_THROTTLE_MS` | 100 | WebSocket broadcast throttle interval (ms) |
-| `WARDSONDB_HEALTH_TIMEOUT_MS` | 5000 | WardSONDB health check timeout (ms) |
-| `WARDSONDB_CONNECT_TIMEOUT_MS` | 60000 | TCP connect timeout for the per-client undici Agent. Default is higher than undici's 10s stock timeout because saturated WardSONDB instances under heavy flush/backfill take longer to accept new connections |
-| `WARDSONDB_QUERY_TIMEOUT_MS` | 0 | Client-side headers/body timeout. `0` = no client-side limit (server-side `--query-timeout` governs). Operator escape hatch |
-| `WARDSONDB_FLUSH_CONCURRENCY` | 4 | Rollup flush worker-pool size. Lower values reduce accept-loop pressure on saturated WardSONDB instances |
-| `HEALTH_REBUILDING_DEBOUNCE_POLLS` | 2 | Consecutive `write_pressure: "high"` polls required before the Rebuilding banner fires. At the 10s poll cadence, `2` ≈ 20s. Eliminates single-poll flickers from volatile write-pressure signals |
-| `OPENSEARCH_HOST` | localhost | OpenSearch host |
-| `OPENSEARCH_PORT` | 9200 | OpenSearch port |
-| `OPENSEARCH_USERNAME` | *(empty)* | Basic auth username (empty = no auth) |
-| `OPENSEARCH_PASSWORD` | *(empty)* | Basic auth password |
-| `OPENSEARCH_USE_TLS` | false | Enable HTTPS connection |
-| `OPENSEARCH_VERIFY_CERTS` | true | Verify TLS certificates (set false for self-signed) |
-| `OPENSEARCH_INDEX_PREFIX` | siem- | Prefix for OpenSearch index names |
-| `OPENSEARCH_BULK_SIZE` | 50 | Bulk insert batch size |
+| `DB_PATH` | `./data/events.db` | SQLite database path. Required before the DB is open. |
+| `LOG_LEVEL` | `info` | Logging level. Required for boot-time logs. |
+| `HTTP_HOST` | `127.0.0.1` | HTTPS bind address. Set to your LAN IP or `0.0.0.0` for remote dashboard access. |
+| `SIEM_API_TOKEN` | *(auto-generated)* | API/WebSocket auth token. Auto-generated and logged once on first run if unset. Required for `/api` and `/ws` auth (Phase 3+). |
+| `SIEM_MASTER_KEY` | *(auto-generated)* | 64 hex chars (32 bytes). Decrypts sensitive settings at rest (AES-256-GCM). Auto-generated and logged once on first run if unset. |
+
+### First-run seeding (optional)
+
+Any setting that has an `envVar` in the schema can be pre-populated on first run by setting it in `.env`. After the first run the value is in the DB and `.env` becomes inert for that key — edit through the Settings UI thereafter. See `.env.example` for the full list of seedable env vars.
+
+### Settings UI
+
+All other settings (syslog port, retention, AbuseIPDB key, WardSONDB tunables, OpenSearch credentials, Threat Hunt model + max tokens, HTTPS timeouts, health debounce, etc.) are configurable in **Settings → Operator Settings**, grouped by category. Sensitive values (API keys, passwords, tokens) are encrypted at rest with the master key and shown masked in the UI.
 
 > **⚠️ Important:** Settings and configuration are always stored in the local SQLite database (`data/events.db`), regardless of which storage backend is active. Do not delete this file even when using WardSONDB or OpenSearch — it contains your backend configuration, API keys, and other settings needed to boot the application. Changing the storage backend requires a SIEM restart to take effect.
 
 > **WardSONDB query timeouts:** Query duration is controlled by WardSONDB's server-side `--query-timeout` flag (default 30s). For large datasets or Threat Hunt queries, launch WardSONDB with `--query-timeout 120` or higher. By default the SIEM has no client-side query timeout — this is intentional. If you need to override per-request (e.g. unreliable network, long-running server-side queries you want to cap), set `WARDSONDB_QUERY_TIMEOUT_MS` in `.env` as an escape hatch.
+
+> **Recommended WardSONDB launch flags (NEW-P9):** for production SIEM workloads. The bitmap-fields list below reflects what the reference deployment is actually running — every entry has been validated against real query patterns. `delta` is appended for the Phase 10 rollup model (see notes).
+>
+> ```bash
+> ulimit -n 65536 && wardsondb \
+>   --storage-engine rocksdb \
+>   --bitmap-fields "event_type,network.action,severity,network.protocol,source_format,is_private,geo_country,geo_city,network.direction,direction,ids.classification,classification,hostname,wifi.action,bucket,protocol,delta" \
+>   --query-timeout 120
+> ```
+>
+> Notes:
+> - `--storage-engine` is required (no default). Pick `rocksdb` for the SIEM's read-heavy + steady-write workload.
+> - `--bitmap-fields` is a single comma-separated list. Some entries are dotted (`network.action`, `ids.classification`) for the nested event-document fields; others are flat (`is_private`, `geo_country`, `bucket`) because they live on the cache or rollup collections. Bitmap accelerates equality filters on low-cardinality fields up to `--bitmap-max-cardinality` (default 1000) — fields that exceed the cap are auto-disabled, so leaving extra entries is harmless.
+> - `delta` is a field that Phase 10's append-only rollup model writes onto every flushed delta document (`delta: true`) and onto canonical docs from compaction (`delta: false`). Compaction filters on `{ bucket, delta: true }` to identify docs to delete after the canonical is written. **This works correctly whether or not `delta` is in `--bitmap-fields`** — the field is in `--bitmap-fields` here as a likely perf hint (cardinality 2, well under the cap, doesn't burn a useful slot). Whether bitmap actually accelerates the boolean filter vs the existing `bucket` bitmap pruning is unverified — measure `duration_ms` on `_delete_by_query` to confirm before/after.
+> - `--query-timeout 120` covers Threat Hunt fan-out across many partitions; the default 30s isn't enough for multi-partition aggregations.
+> - `ulimit -n 65536` is required per the `--help` "FILE DESCRIPTORS" notice — defaults are 256 (macOS) / 1024 (Linux), too low for production.
+>
+> Other flags worth tuning at scale (defaults shown): `--cache-size-mb 64`, `--write-buffer-mb 64`, `--memtable-mb 8`, `--flush-workers 2`, `--compaction-workers 2`, `--bitmap-max-cardinality 1000`. Increase memory-related flags proportionally to available RAM if you see disk read pressure or compaction lag.
+>
+> **Phase 10 rollup model:** rollup writes are now append-only via `/{col}/docs/_bulk`. Each flush emits delta documents tagged `delta: true` with deterministic `_id = ${bucket}|${keys}|${flushId}`. A 30-minute compaction job folds delta docs older than 1h into a single canonical doc per `(bucket, keys)` (`_id = ...|c`, `delta: false`) and `_delete_by_query` removes the deltas. Queries (`$group + $sum`) are unchanged — they correctly sum across deltas + canonical regardless of compaction state.
+
+> **OpenSearch native rollup jobs (Phase 11A — H10):** the OpenSearch backend now creates five continuous rollup jobs on startup — `siem-rollup-{5m,ip-hourly,port-hourly,sig-hourly,client-hourly}` — paralleling SQLite's rollup tables and feeding the Index Management plugin's server-side rollup engine. New ingest is rolled up automatically every 5 minutes (60s delay buffer for late-arriving events). **Continuous rollup jobs do not backfill data that existed before they were created** — rollup indexes accumulate forward-only. Until enough history has accumulated for your longest dashboard window, the SIEM continues serving stats from raw `siem-events`; the speed-up landings as a follow-up (Phase 11B). Inspect a job's progress with `GET /_plugins/_rollup/jobs/<id>/_explain`; pause one with `POST /_plugins/_rollup/jobs/<id>/_stop`.
 
 ## Project Structure
 
@@ -257,12 +272,12 @@ src/
       cef.js                   # CEF (Activity Logging) parser
       system.js                # Catch-all parser
   db/
-    database.js                # SQLite connection & schema
-    events.js                  # Event CRUD & batch insert
-    cache.js                   # IP enrichment cache
-    retention.js               # Periodic cleanup
-    storage.js                 # Active backend manager (singleton)
-    stats-worker.js            # Read-only stats worker thread
+    storage.js                 # Active backend orchestrator (getBackend/getSettingsBackend/getDb)
+    stats-worker.js            # Read-only stats worker thread (SQLite)
+    cache.js                   # IP enrichment cache (SQLite accessor; imports getDb from storage.js)
+    rollups.js                 # Pure rollup aggregation (shared by SQLite + WardSONDB)
+    utils/
+      private-ip-sql.js        # SQL private-IP fragment (mirrors src/utils/ip-utils.js)
     backends/
       interface.js             # StorageBackend base class
       index.js                 # Backend registry & factory
@@ -272,20 +287,30 @@ src/
   api/
     server.js                  # Express + static serving
     websocket.js               # WebSocket live stream
+    middleware/
+      auth.js                  # Bearer-token validation (API + WebSocket)
     routes/                    # REST API routes
+  threat-hunt/                 # AI investigation internals (Phase 9 split out of routes)
+    prompt.js                  # Prompt builder (wraps untrusted fields)
+    intel/                     # Per-backend intel gathering (sqlite/wardsondb/opensearch)
+    providers/                 # anthropic / openai / gemini + util
+  config/
+    schema.js                  # Operator settings schema (single source of truth)
   enrichment/
     geoip.js                   # MaxMind GeoLite2 lookup
     abuseipdb.js               # AbuseIPDB API client
     rdns.js                    # Reverse DNS lookup
     enrichment-queue.js        # Async enrichment coordinator
     enrichment-worker.js       # Worker thread for SQLite UPDATEs
-  utils/                       # IP utils, port names, constants
+  utils/                       # IP/crypto/period/sse/cidr utils, port names, constants
 
 frontend/                      # React + Vite + Tailwind
   src/
     components/
       Layout.jsx               # App shell + navigation
-      Settings.jsx              # Settings view
+      TokenGate.jsx            # Bearer-token login screen
+      Settings.jsx             # Settings view
+      settings/                # Schema-driven settings UI (SchemaSettings.jsx)
       live/                    # Live stream view
       dashboard/               # Analytics dashboard
       map/                     # Live Map (Leaflet)
@@ -319,18 +344,23 @@ The app runs HTTPS by default with an auto-generated self-signed certificate. Be
 
 | Concern | Severity | Description |
 |---|---|---|
-| No authentication | **Medium** | The web UI, API, and database reset are accessible to anyone who can reach port 3000. On a trusted home network this is acceptable. If exposed beyond your LAN, put it behind a reverse proxy with auth (nginx/Caddy with basic auth or mTLS). |
-| Syslog spoofing | **Low** | The UDP syslog listener accepts messages from any source on the network. A device on your LAN could send crafted syslog to inject fake events. UDP has no authentication by design — this is inherent to syslog. |
-| Database reset without auth | **Low** | The `POST /api/settings/reset-db` endpoint requires no credentials. Mitigated by the network-only access constraint and the two-click confirmation in the UI. |
+| Single shared API token | **Low** | The web UI, REST API, and WebSocket are bearer-token gated (Phase 3). The token is auto-generated on first run and logged once to the console — copy it to log in via the browser TokenGate or send `Authorization: Bearer <token>` on API calls. It's a single shared token (no per-user accounts or RBAC) and can be rotated via Settings or by setting `SIEM_API_TOKEN`. For multi-user or internet-exposed deployments, put a reverse proxy (nginx/Caddy basic auth, OAuth2 proxy, mTLS) in front of port 3000. |
+| Syslog spoofing | **Low** | UDP has no authentication by design — a device on your LAN could send crafted syslog to inject fake events. Mitigations available: set `SYSLOG_ALLOWED_SOURCES` to a CIDR allowlist (Phase 3B) so the listener drops packets from anywhere outside; the listener also has a per-source rate cap to limit a single misbehaving sender. Without an allowlist, any host on the broadcast domain can submit events. |
 | TLS certificate trust | **Info** | The self-signed certificate will trigger browser warnings. For production, replace `data/server.key` and `data/server.cert` with certs from a trusted CA or your own internal CA. |
 
-**Known advisories:**
-- **esbuild ≤ 0.24.2 (moderate)** — allows any website to send requests to the Vite dev server and read responses ([GHSA-67mh-4wv8-2f99](https://github.com/advisories/GHSA-67mh-4wv8-2f99)). This is a dev-only dependency used during frontend development — it does not affect production builds or the deployed SIEM. Fix requires upgrading Vite to 7.x (breaking change).
+**Known advisories** (after the 2026-04-28 patch-level audit cleanup):
+- **esbuild ≤ 0.24.2 (moderate, dev-only)** — affects the Vite dev server (`npm run dev`, port 5173) and the Vitest test runner: a page in the operator's browser can send requests to a running dev/test server and read responses ([GHSA-67mh-4wv8-2f99](https://github.com/advisories/GHSA-67mh-4wv8-2f99)). Production builds and `npm start` are unaffected. Cleared by upgrading Vite 5 → 8 (frontend) and Vitest 2 → 4 (backend); both are semver-major and gated on a focused upgrade pass. This is the only residual advisory in either tree — `path-to-regexp`, `brace-expansion`, `lodash`, `picomatch`, and `postcss` were all patched in-range during the cleanup.
 
 **Already mitigated:**
+- **API + WebSocket authentication** — bearer-token middleware on every `/api/*` route; WebSocket validates the same token via `?token=` query at upgrade time; frontend `TokenGate.jsx` login screen + global fetch wrapper. The reset-DB endpoint sits behind this same gate (Phase 3). The fetch wrapper scopes the `Authorization` header to **same-origin `/api/`** requests only, so the token is never attached to cross-origin URLs (e.g. map-tile CDNs)
+- **Sensitive settings at rest** — AbuseIPDB / Anthropic / OpenAI / Gemini keys, OpenSearch password, etc. are AES-256-GCM-encrypted in the SQLite settings table (`v1:iv:tag:ct` envelope). Master key auto-generated on first run, logged once, rotatable via Settings (Phase 2)
+- **Default localhost bind** — `HTTP_HOST` defaults to `127.0.0.1`; the server is reachable only from the host until you explicitly set a LAN IP or `0.0.0.0`
+- **Request body limit** — `express.json({ limit: '64kb' })` caps API request bodies; Helmet sets a CSP scoped for OSM/CartoDB tiles + `wss:`
+- **LLM prompt-injection defense** — every attacker-influenceable Threat Hunt field (IDS signature, hostname, geo_country, whois fields) is wrapped in `<untrusted>...</untrusted>` after control-char strip + 256-char truncation + closing-tag entity-escape; system prompt sent via the elevated-trust channel of each provider (Phase 13)
+- **LLM output rendering** — markdown rendered via `marked` + `DOMPurify` with `ALLOWED_TAGS` restricted to formatting + lists; no attributes, no `<a>`, no `<img>`. PDF export escapes operator-supplied interpolated values (Phase 13)
 - **SQL injection** — all queries use parameterized prepared statements. The `getTimeline()` strftime format string is derived from a fixed internal lookup (not from caller input), eliminating the previous injection surface
 - **XSS** — React auto-escapes all rendered content including untrusted syslog data
-- **API key exposure** — AbuseIPDB key is redacted in API responses (last 4 chars only)
+- **API key exposure** — sensitive keys are redacted to last 4 chars in API responses; writes containing the U+2022 mask sentinel are rejected and the Settings UI seeds sensitive fields empty, so a masked echo can't overwrite a stored secret
 - **Transport security** — HTTPS/WSS enabled by default with auto-generated TLS certificate
 - **Parser crashes** — all parsers wrapped in try/catch with fallback to system parser
 - **AbuseIPDB rate limits** — automatic 1-hour backoff when daily limit is reached

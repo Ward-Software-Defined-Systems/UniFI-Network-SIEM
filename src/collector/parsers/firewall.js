@@ -22,23 +22,28 @@ function parseFirewall(message, header) {
 
   const rulePrefix = prefixMatch[1];
 
-  // Determine action from prefix: -A- = allow, -D- = drop/block
+  // Determine action from prefix. The action set is intentionally just
+  // {allow, block} — the REJECT pattern is captured by the broad block
+  // regex above, and treating "rejected" packets as "blocked" matches
+  // the operator's mental model (both deny the connection). Keeping a
+  // single canonical 'block' value means SQLite, WardSONDB, and
+  // OpenSearch aggregations all count the same set of events.
   let action = 'allow';
   if (/-D-/.test(rulePrefix) || /DROP|BLOCK|DENY|REJECT/i.test(rulePrefix)) {
     action = 'block';
-  } else if (/REJECT/i.test(rulePrefix)) {
-    action = 'reject';
   }
 
   // Extract DESCR
   const descrMatch = message.match(DESCR_RE);
   const ruleDescription = descrMatch ? descrMatch[1] : null;
 
-  // Extract key=value pairs
+  // Extract key=value pairs. Use matchAll instead of exec/lastIndex —
+  // exec mutates the global regex's lastIndex, so an exception thrown
+  // mid-loop would leave it at a stale offset and break the next call.
+  // matchAll is stateless. (L10)
   const fields = {};
-  let kvMatch;
-  while ((kvMatch = KV_RE.exec(message)) !== null) {
-    fields[kvMatch[1]] = kvMatch[2];
+  for (const m of message.matchAll(KV_RE)) {
+    fields[m[1]] = m[2];
   }
 
   // Extract TCP flags
