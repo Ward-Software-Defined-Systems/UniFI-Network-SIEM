@@ -6,7 +6,7 @@ import PeriodSelector from '../shared/PeriodSelector';
 import './ThreatHunt.css';
 
 const API_PROVIDERS = [
-  { id: 'anthropic', name: 'Anthropic (Opus 4.6)', icon: '🟣' },
+  { id: 'anthropic', name: 'Anthropic (Opus 4.8)', icon: '🟣' },
   { id: 'openai', name: 'OpenAI (GPT-5.4)', icon: '🟢' },
   { id: 'gemini', name: 'Google (Gemini 3.1 Pro)', icon: '🔵' },
 ];
