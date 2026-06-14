@@ -185,8 +185,12 @@ For full functionality, three logging sources on the UniFi Console should be con
 | `GET /api/stats/geo-events` | Aggregated IPs with geo coordinates for map |
 | `GET /api/stats/recent-geo-events` | Recent events with geo data for flow lines |
 | `GET /api/health` | System health, event counts, DB size |
-| `GET /api/settings` | App settings (sensitive values redacted) |
-| `PUT /api/settings` | Update settings (AbuseIPDB key, etc.) |
+| `GET /api/settings` | Legacy flat-key settings (sensitive values redacted) |
+| `PUT /api/settings` | Legacy flat-key update (AbuseIPDB key, etc.) |
+| `GET /api/settings/v2` | Schema-aware settings: schema + current values (sensitive masked) |
+| `PUT /api/settings/v2` | Update one schema setting (rejects masked-value writes) |
+| `POST /api/settings/v2/reset` | Reset one setting to its schema default |
+| `POST /api/settings/v2/regenerate-token` | Rotate the API/WebSocket auth token |
 | `POST /api/settings/reset-db` | Clear all events and enrichment cache |
 | `GET /api/threat-hunt/settings` | Threat Hunt AI provider settings |
 | `PUT /api/threat-hunt/settings` | Update AI provider/keys |
@@ -270,10 +274,10 @@ src/
   db/
     storage.js                 # Active backend orchestrator (getBackend/getSettingsBackend/getDb)
     stats-worker.js            # Read-only stats worker thread (SQLite)
-    database.js                # SQLite connection & schema (legacy — still used by threat-hunt.js)
-    events.js                  # Event CRUD & batch insert (legacy — no current importers)
-    cache.js                   # IP enrichment cache (used on SQLite cache-accessor path)
-    retention.js               # Periodic cleanup (legacy — backend.runRetention is the active path)
+    cache.js                   # IP enrichment cache (SQLite accessor; imports getDb from storage.js)
+    rollups.js                 # Pure rollup aggregation (shared by SQLite + WardSONDB)
+    utils/
+      private-ip-sql.js        # SQL private-IP fragment (mirrors src/utils/ip-utils.js)
     backends/
       interface.js             # StorageBackend base class
       index.js                 # Backend registry & factory
@@ -283,20 +287,30 @@ src/
   api/
     server.js                  # Express + static serving
     websocket.js               # WebSocket live stream
+    middleware/
+      auth.js                  # Bearer-token validation (API + WebSocket)
     routes/                    # REST API routes
+  threat-hunt/                 # AI investigation internals (Phase 9 split out of routes)
+    prompt.js                  # Prompt builder (wraps untrusted fields)
+    intel/                     # Per-backend intel gathering (sqlite/wardsondb/opensearch)
+    providers/                 # anthropic / openai / gemini + util
+  config/
+    schema.js                  # Operator settings schema (single source of truth)
   enrichment/
     geoip.js                   # MaxMind GeoLite2 lookup
     abuseipdb.js               # AbuseIPDB API client
     rdns.js                    # Reverse DNS lookup
     enrichment-queue.js        # Async enrichment coordinator
     enrichment-worker.js       # Worker thread for SQLite UPDATEs
-  utils/                       # IP utils, port names, constants
+  utils/                       # IP/crypto/period/sse/cidr utils, port names, constants
 
 frontend/                      # React + Vite + Tailwind
   src/
     components/
       Layout.jsx               # App shell + navigation
-      Settings.jsx              # Settings view
+      TokenGate.jsx            # Bearer-token login screen
+      Settings.jsx             # Settings view
+      settings/                # Schema-driven settings UI (SchemaSettings.jsx)
       live/                    # Live stream view
       dashboard/               # Analytics dashboard
       map/                     # Live Map (Leaflet)
@@ -338,7 +352,7 @@ The app runs HTTPS by default with an auto-generated self-signed certificate. Be
 - **esbuild ≤ 0.24.2 (moderate, dev-only)** — affects the Vite dev server (`npm run dev`, port 5173) and the Vitest test runner: a page in the operator's browser can send requests to a running dev/test server and read responses ([GHSA-67mh-4wv8-2f99](https://github.com/advisories/GHSA-67mh-4wv8-2f99)). Production builds and `npm start` are unaffected. Cleared by upgrading Vite 5 → 8 (frontend) and Vitest 2 → 4 (backend); both are semver-major and gated on a focused upgrade pass. This is the only residual advisory in either tree — `path-to-regexp`, `brace-expansion`, `lodash`, `picomatch`, and `postcss` were all patched in-range during the cleanup.
 
 **Already mitigated:**
-- **API + WebSocket authentication** — bearer-token middleware on every `/api/*` route; WebSocket validates the same token via `?token=` query at upgrade time; frontend `TokenGate.jsx` login screen + global fetch wrapper. The reset-DB endpoint sits behind this same gate (Phase 3)
+- **API + WebSocket authentication** — bearer-token middleware on every `/api/*` route; WebSocket validates the same token via `?token=` query at upgrade time; frontend `TokenGate.jsx` login screen + global fetch wrapper. The reset-DB endpoint sits behind this same gate (Phase 3). The fetch wrapper scopes the `Authorization` header to **same-origin `/api/`** requests only, so the token is never attached to cross-origin URLs (e.g. map-tile CDNs)
 - **Sensitive settings at rest** — AbuseIPDB / Anthropic / OpenAI / Gemini keys, OpenSearch password, etc. are AES-256-GCM-encrypted in the SQLite settings table (`v1:iv:tag:ct` envelope). Master key auto-generated on first run, logged once, rotatable via Settings (Phase 2)
 - **Default localhost bind** — `HTTP_HOST` defaults to `127.0.0.1`; the server is reachable only from the host until you explicitly set a LAN IP or `0.0.0.0`
 - **Request body limit** — `express.json({ limit: '64kb' })` caps API request bodies; Helmet sets a CSP scoped for OSM/CartoDB tiles + `wss:`
@@ -346,7 +360,7 @@ The app runs HTTPS by default with an auto-generated self-signed certificate. Be
 - **LLM output rendering** — markdown rendered via `marked` + `DOMPurify` with `ALLOWED_TAGS` restricted to formatting + lists; no attributes, no `<a>`, no `<img>`. PDF export escapes operator-supplied interpolated values (Phase 13)
 - **SQL injection** — all queries use parameterized prepared statements. The `getTimeline()` strftime format string is derived from a fixed internal lookup (not from caller input), eliminating the previous injection surface
 - **XSS** — React auto-escapes all rendered content including untrusted syslog data
-- **API key exposure** — sensitive keys are redacted to last 4 chars in API responses
+- **API key exposure** — sensitive keys are redacted to last 4 chars in API responses; writes containing the U+2022 mask sentinel are rejected and the Settings UI seeds sensitive fields empty, so a masked echo can't overwrite a stored secret
 - **Transport security** — HTTPS/WSS enabled by default with auto-generated TLS certificate
 - **Parser crashes** — all parsers wrapped in try/catch with fallback to system parser
 - **AbuseIPDB rate limits** — automatic 1-hour backoff when daily limit is reached
