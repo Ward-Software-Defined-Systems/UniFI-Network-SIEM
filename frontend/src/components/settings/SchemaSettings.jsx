@@ -121,7 +121,14 @@ function CategorySection({ name, entries, defaultOpen, onChange }) {
 }
 
 function SettingRow({ entry, onChange }) {
-  const initial = entry.value ?? (entry.type === 'boolean' ? false : '');
+  // Sensitive entries arrive masked from the server (••••••••XXXX). Seeding the
+  // draft with that masked string lets a non-clearing edit (e.g. click End +
+  // type) save the mask back as the new secret — corrupting it, and for
+  // auth.apiToken locking the operator out. Start blank; the placeholder shows
+  // the masked hint instead.
+  const initial = entry.sensitivity === 'private'
+    ? ''
+    : (entry.value ?? (entry.type === 'boolean' ? false : ''));
   const [draft, setDraft] = useState(initial);
   const [saving, setSaving] = useState(false);
   const [savedAt, setSavedAt] = useState(0);
@@ -132,9 +139,9 @@ function SettingRow({ entry, onChange }) {
   const isPassword = entry.sensitivity === 'private';
   const isToken = entry.key === 'auth.apiToken';
 
-  // For sensitive entries, the displayed value is "(set)" or "(not set)".
-  // The draft starts empty; user types a new value to replace.
-  const sensitiveDraftEmpty = isPassword && draft === '' || draft === entry.value;
+  // Sensitive fields start empty (placeholder shows the masked hint); the user
+  // types a full new value to replace the stored secret. Save stays disabled
+  // until they do, so the masked echo is never persisted.
   const isDirty = isPassword
     ? draft !== '' && draft !== entry.value
     : draft !== entry.value;

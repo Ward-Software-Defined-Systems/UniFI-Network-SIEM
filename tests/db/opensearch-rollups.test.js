@@ -77,7 +77,10 @@ describe('buildRollupJobs', () => {
     const validFields = new Set([
       'event_type', 'network_action', 'src_ip', 'dst_ip', 'direction',
       'dst_port', 'protocol', 'ids_signature', 'ids_category',
-      'client_mac', 'wifi_client_mac', 'dhcp_mac',
+      // mac_address is the canonical first-non-null mac set at ingest; the
+      // three raw mac fields still exist in the mapping but are no longer
+      // rolled up directly (see client-hourly).
+      'mac_address', 'client_mac', 'wifi_client_mac', 'dhcp_mac',
     ]);
     for (const j of jobs) {
       for (const d of j.body.rollup.dimensions) {
@@ -98,6 +101,17 @@ describe('buildRollupJobs', () => {
       const types = recv.metrics.flatMap((x) => Object.keys(x));
       expect(types).toContain('value_count');
     }
+  });
+
+  it('client-hourly rolls up the single canonical mac_address dimension', () => {
+    // Regression for the chained-3-mac-fields bug: rolling up client_mac +
+    // wifi_client_mac + dhcp_mac as separate dimensions Cartesian-products the
+    // buckets and drops events that populate only one mac field. Must be one
+    // terms dimension on the canonical mac_address (parity with SQLite/WardSONDB).
+    const j = jobs.find((x) => x.id === 'siem-rollup-client-hourly');
+    const terms = j.body.rollup.dimensions.filter((d) => d.terms);
+    expect(terms).toHaveLength(1);
+    expect(terms[0].terms.source_field).toBe('mac_address');
   });
 
   it('5m rollup uses 5m fixed_interval; hourly rollups use 1h', () => {

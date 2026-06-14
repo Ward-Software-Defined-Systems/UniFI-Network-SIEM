@@ -209,16 +209,16 @@ function buildRollupJobs(prefix) {
       { terms: { source_field: 'ids_signature' } },
       { terms: { source_field: 'ids_category' } },
     ]),
-    // Hourly client MAC — feeds getTopClients. We register one rollup per
-    // mac field rather than chaining all three terms aggs into one job
-    // because docs typically have only one of {client_mac, wifi_client_mac,
-    // dhcp_mac} populated, and combining them in a single rollup would
-    // explode cardinality with mostly-empty bucket combinations.
+    // Hourly client MAC — feeds getTopClients. Rolls up the single canonical
+    // `mac_address` field (set at ingest as the first-non-null of
+    // client_mac/dhcp_mac/wifi_client_mac/mac_src — see _serializeEvent), which
+    // matches SQLite's first-non-null `mac` rollup and WardSONDB's `$id:'mac'`
+    // grouping. Chaining the three raw mac fields would Cartesian-product the
+    // buckets and (with default missing_bucket) drop the common case of an
+    // event populating only one of them.
     mk('client-hourly', 'client-hourly', [
       { date_histogram: { source_field: 'received_at', fixed_interval: '1h' } },
-      { terms: { source_field: 'client_mac' } },
-      { terms: { source_field: 'wifi_client_mac' } },
-      { terms: { source_field: 'dhcp_mac' } },
+      { terms: { source_field: 'mac_address' } },
     ]),
   ];
 }

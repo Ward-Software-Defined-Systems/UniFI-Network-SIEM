@@ -508,17 +508,28 @@ class WardsonDbBackend extends StorageBackend {
   }
 
   /**
-   * Compact buckets that closed at least `minAgeHours` ago. The window
-   * is intentionally generous so we never collide with an in-flight
-   * flush for the same bucket.
+   * Compact buckets that closed at least `minAgeHours` ago.
    *
-   * Order is: aggregate → upsert canonical → delete deltas. A crash
-   * between the upsert and the delete leaves the canonical correct AND
-   * the deltas present — queries see the same total counted twice for
-   * a brief window. The next compaction run is idempotent because
-   * canonical docs ALSO carry their `bucket` field, and we sum
-   * everything in the bucket (delta + existing canonical) before doing
-   * a full PUT replacement of the canonical.
+   * Per bucket: CLAIM a snapshot of the exact delta `_id`s, SUM those claimed
+   * deltas + the existing canonical, PUT the canonical (full replacement), then
+   * DELETE only the claimed `_id`s. The claim set is the load-bearing detail —
+   * a flush that writes a new delta into the same bucket AFTER the snapshot is
+   * neither summed (the sum matches only claimed `_id`s) nor deleted (the delete
+   * targets only claimed `_id`s), so it survives and is folded by the next
+   * cycle. The previous implementation aggregated the whole bucket then deleted
+   * by `{bucket, delta:true}` — any delta flushed between those two calls was
+   * deleted but never counted, silently losing it (acute during startup backfill,
+   * which flushes deltas into old buckets exactly while compaction scans them).
+   *
+   * Folding the existing canonical (delta:false) into the sum keeps the PUT a
+   * full replacement, so re-runs are idempotent; canonicals are written only by
+   * this single-threaded compactor (the `_compacting` guard), so reading them
+   * never races a flush. NOTE: a process crash in the sub-second window between
+   * the canonical PUT and the delete can over-count that bucket (the surviving
+   * claimed deltas get re-folded into the already-updated canonical next run).
+   * PUT-first is deliberate — it risks over-count, never the under-count that
+   * delete-first would cause. This crash edge predates this change and is out of
+   * scope; the fix here is the flush-vs-compaction race, not crash atomicity.
    */
   async _compactRollups(minAgeHours = 1) {
     if (this._compacting) return;
@@ -568,37 +579,63 @@ class WardsonDbBackend extends StorageBackend {
     let canonicals = 0;
     let deltas = 0;
 
+    const CHUNK = 500; // mirrors the $in chunking in _lookupCacheForIps
+
     for (const bucket of buckets) {
       try {
-        // Aggregate ALL docs in the bucket (delta + any existing canonical)
-        // grouped by natural key. Including canonical in the sum is what
-        // makes re-runs idempotent: the canonical's count is folded into
-        // the new canonical, then deltas are deleted, then on the next
-        // run there are no deltas so canonicals are unchanged.
+        // 1. CLAIM: snapshot the exact delta _ids we will fold and delete.
+        //    Anything flushed after this snapshot is left for the next cycle.
+        const ids = await this._snapshotDeltaIds(col, bucket);
+        if (ids.length === 0) continue;
+
         const groupSpec = { _id: keyFields };
         for (const f of sumFields) groupSpec[f] = { '$sum': f };
-        const agg = await this._post(`/${col}/aggregate`, {
+
+        // 2. SUM the claimed deltas, grouped by natural key. Chunk the $in so a
+        //    backfilled hour-bucket with thousands of deltas stays within the
+        //    server's query payload caps.
+        const totals = new Map(); // keyJSON -> { key, sums }
+        const fold = (rows) => {
+          for (const row of rows || []) {
+            const k = JSON.stringify(row._id);
+            const acc = totals.get(k) || { key: row._id, sums: {} };
+            for (const f of sumFields) acc.sums[f] = (acc.sums[f] || 0) + (row[f] || 0);
+            totals.set(k, acc);
+          }
+        };
+        for (let i = 0; i < ids.length; i += CHUNK) {
+          const chunk = ids.slice(i, i + CHUNK);
+          const agg = await this._post(`/${col}/aggregate`, {
+            pipeline: [
+              { '$match': { _id: { '$in': chunk } } },
+              { '$group': groupSpec },
+            ],
+          });
+          fold(agg.data);
+        }
+
+        // 3. FOLD the existing canonical (delta:false) into the totals so the
+        //    PUT is a full replacement (idempotent). Canonicals are written
+        //    only by this single-threaded compactor, so this read never races
+        //    a flush.
+        const canonAgg = await this._post(`/${col}/aggregate`, {
           pipeline: [
-            { '$match': { bucket } },
+            { '$match': { bucket, delta: false } },
             { '$group': groupSpec },
           ],
         });
-        const rows = agg.data || [];
-        if (rows.length === 0) continue;
+        fold(canonAgg.data);
+        if (totals.size === 0) continue;
 
-        // Build canonical docs and PUT them (replace if exists, insert if not).
-        // Per WardSONDB API.md: PUT replaces, returns 404 if missing. We
-        // try POST first with a deterministic _id; on 409 we fall back to
-        // PUT for the in-place replacement.
-        for (const row of rows) {
-          const doc = { bucket, ...row._id, delta: false };
-          for (const f of sumFields) doc[f] = row[f] || 0;
+        // 4. PUT canonical docs (replace if exists, insert if not). Per
+        //    WardSONDB API.md: PUT replaces and returns 404 if missing, so on
+        //    404 we POST to create, retrying the PUT on a concurrent-create 409.
+        for (const { key, sums } of totals.values()) {
+          const doc = { bucket, ...key, delta: false };
+          for (const f of sumFields) doc[f] = sums[f] || 0;
           const id = canonicalIdFor(doc);
           const path = `/${col}/docs/${encodeURIComponent(id)}`;
 
-          // PUT replaces atomically when the doc exists; on 404 we POST
-          // to create. Either way the canonical reflects the freshly
-          // aggregated total.
           const replaced = await this._put(path, doc);
           if (replaced._notFound) {
             const created = await this._post(`/${col}/docs`, { _id: id, ...doc });
@@ -610,18 +647,60 @@ class WardsonDbBackend extends StorageBackend {
           canonicals++;
         }
 
-        // Delete deltas for this bucket. Canonical docs carry `delta: false`
-        // so they're left intact.
-        const del = await this._post(`/${col}/docs/_delete_by_query`, {
-          filter: { bucket, delta: true },
-        });
-        deltas += del.data?.deleted || 0;
+        // 5. DELETE only the claimed delta _ids (chunked to match step 2).
+        //    Canonical docs (delta:false) and any deltas flushed after step 1
+        //    are not in `ids`, so they're left intact.
+        for (let i = 0; i < ids.length; i += CHUNK) {
+          const chunk = ids.slice(i, i + CHUNK);
+          const del = await this._post(`/${col}/docs/_delete_by_query`, {
+            filter: { _id: { '$in': chunk } },
+          });
+          deltas += del.data?.deleted || 0;
+        }
       } catch (err) {
         logger.warn({ err: err.message, col, bucket }, 'Per-bucket compaction failed');
       }
     }
 
     return { canonicals, deltas };
+  }
+
+  /**
+   * Snapshot the `_id`s of every delta doc in a closed bucket — the claim set
+   * for compaction. Pages through with `fields:['_id']` (stable `_id` sort),
+   * deduping defensively since offset paging can re-surface a boundary row when
+   * a concurrent flush inserts ahead of the cursor. Bounded so a pathological
+   * bucket can't spin forever; any overflow is simply folded by a later cycle.
+   */
+  async _snapshotDeltaIds(col, bucket) {
+    const PAGE = 1000;
+    const MAX_PAGES = 200; // 200k _ids/bucket ceiling — far above any real bucket
+    const seen = new Set();
+    let offset = 0;
+    for (let page = 0; page < MAX_PAGES; page++) {
+      let rows;
+      try {
+        const r = await this._post(`/${col}/query`, {
+          filter: { bucket, delta: true },
+          fields: ['_id'],
+          sort: [{ _id: 'asc' }],
+          limit: PAGE,
+          offset,
+        });
+        rows = r.data || [];
+      } catch (err) {
+        logger.warn({ err: err.message, col, bucket }, 'Compaction delta-id snapshot failed');
+        break;
+      }
+      if (rows.length === 0) break;
+      for (const d of rows) if (d._id) seen.add(d._id);
+      if (rows.length < PAGE) break;
+      offset += rows.length;
+      if (page === MAX_PAGES - 1) {
+        logger.warn({ col, bucket, claimed: seen.size }, 'Compaction snapshot hit page cap — remainder deferred to next cycle');
+      }
+    }
+    return [...seen];
   }
 
   _startCompactionInterval() {

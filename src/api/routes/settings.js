@@ -246,6 +246,14 @@ router.put('/v2', async (req, res) => {
       return res.status(400).json({ error: `value must be a number for ${key}` });
     }
 
+    // Never accept the masked echo as a real secret. GET masks private values
+    // with U+2022 bullets (maskSensitive), which a real key/token never
+    // contains. Rejecting here prevents the corrupt-secret / auth.apiToken
+    // lockout from ANY client, not just the dashboard UI.
+    if (entry.sensitivity === 'private' && typeof value === 'string' && value.includes('•')) {
+      return res.status(400).json({ error: `Refusing to store a masked value for ${key}. Type the new secret in full.` });
+    }
+
     await persistSetting(entry, value);
     res.json({ ok: true, schema: buildSchemaResponse() });
   } catch (err) {

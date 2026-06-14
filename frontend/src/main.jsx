@@ -11,7 +11,11 @@ import { getStoredToken } from './lib/api';
 const originalFetch = window.fetch.bind(window);
 window.fetch = async (input, init = {}) => {
   const url = typeof input === 'string' ? input : (input?.url || '');
-  const isApi = url.includes('/api/') || url.startsWith('/api');
+  // Same-origin /api/ only. A substring check (url.includes('/api/')) would
+  // also match cross-origin URLs like https://attacker.example/api/log and
+  // leak the bearer token to them. Relative paths and absolute same-origin
+  // URLs are the only legitimate API call sites.
+  const isApi = url.startsWith('/api/') || url.startsWith(window.location.origin + '/api/');
   if (isApi) {
     const token = getStoredToken();
     if (token) {
