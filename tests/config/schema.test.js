@@ -173,17 +173,46 @@ describe('config (schema-driven loader)', () => {
       expect(config.wardsondb.flushConcurrency).toBe(8);
     });
 
-    it('overlays a boolean', () => {
+    it('overlays a boolean via the legacy DB key, independent of .env', () => {
+      // enrichment.rdnsEnabled is stored under its legacyKey `rdnsEnabled`
+      // (that is what persistSetting writes), so rows must use that key.
+      // Toggle both ways so a developer .env (RDNS_ENABLED=…) can't mask it —
+      // the original one-way assertion only held because of exactly that.
       const config = loadConfig();
-      config.applyDbOverrides([{ key: 'enrichment.rdnsEnabled', value: true }]);
+      config.applyDbOverrides([{ key: 'rdnsEnabled', value: true }]);
       expect(config.enrichment.rdnsEnabled).toBe(true);
+      config.applyDbOverrides([{ key: 'rdnsEnabled', value: 'false' }]);
+      expect(config.enrichment.rdnsEnabled).toBe(false);
     });
 
-    it('treats empty-string DB values as "not set" (does not clobber prior value)', () => {
+    it('ignores rows keyed by the schema key when the entry has a legacyKey', () => {
       const config = loadConfig();
-      const before = config.enrichment.abuseIpDbKey;
-      config.applyDbOverrides([{ key: 'enrichment.abuseIpDbKey', value: '' }]);
-      expect(config.enrichment.abuseIpDbKey).toBe(before);
+      const before = config.enrichment.rdnsEnabled;
+      config.applyDbOverrides([{ key: 'enrichment.rdnsEnabled', value: !before }]);
+      expect(config.enrichment.rdnsEnabled).toBe(before);
+    });
+
+    it('every legacyKey entry overlays through its legacy key', () => {
+      for (const entry of SCHEMA.filter((e) => e.legacyKey)) {
+        const config = loadConfig();
+        const current = config.get(entry.key);
+        const sample = entry.type === 'boolean'
+          ? !current
+          : entry.type === 'number' ? (Number(current) || 0) + 1 : `${current || ''}-overlay-test`;
+        config.applyDbOverrides([{ key: entry.legacyKey, value: sample }]);
+        expect(config.get(entry.key)).toBe(sample);
+      }
+    });
+
+    it('treats an empty DB value as "not set" for entries with a non-empty default', () => {
+      // config.js skips '' only when entry.default is non-empty; opensearch.host
+      // defaults to 'localhost'. (The previous version of this test targeted
+      // enrichment.abuseIpDbKey by its schema key, which the loader never
+      // matches — it passed without exercising anything.)
+      const config = loadConfig();
+      const before = config.opensearch.host;
+      config.applyDbOverrides([{ key: 'opensearch.host', value: '' }]);
+      expect(config.opensearch.host).toBe(before);
     });
 
     it('skips unknown keys silently (e.g. database_engine)', () => {
