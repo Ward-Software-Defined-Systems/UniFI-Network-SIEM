@@ -47,7 +47,7 @@ function FlowLines({ events }) {
 
 function MapLegend() {
   return (
-    <div className="absolute bottom-4 left-4 z-[1000] bg-gray-900/90 border border-gray-700 rounded-lg p-3 space-y-1.5">
+    <div className="absolute bottom-4 left-4 z-1000 bg-gray-900/90 border border-gray-700 rounded-lg p-3 space-y-1.5">
       <div className="text-xs font-medium text-gray-300 mb-1">Legend</div>
       <div className="flex items-center gap-2">
         <span className="w-3 h-3 rounded-full bg-blue-500 inline-block" />
@@ -72,7 +72,7 @@ function StatsOverlay({ geoEvents, recentEvents }) {
   const countries = new Set(geoEvents.map(e => e.country).filter(Boolean)).size;
 
   return (
-    <div className="absolute top-4 right-4 z-[1000] bg-gray-900/90 border border-gray-700 rounded-lg p-3 space-y-1">
+    <div className="absolute top-4 right-4 z-1000 bg-gray-900/90 border border-gray-700 rounded-lg p-3 space-y-1">
       <div className="text-xs font-medium text-gray-300 mb-1">Map Stats</div>
       <div className="text-xs text-gray-400">
         <span className="text-gray-200 font-medium">{formatNumber(totalIPs)}</span> IPs plotted
@@ -167,7 +167,7 @@ export default function LiveMap({ period, setPeriod, refreshRate, setRefreshRate
 
       <div className="flex-1 relative">
         {!hasData && !loading && (
-          <div className="absolute inset-0 z-[1000] flex items-center justify-center bg-gray-950/80">
+          <div className="absolute inset-0 z-1000 flex items-center justify-center bg-gray-950/80">
             <div className="text-center space-y-2">
               <p className="text-gray-400">No geo-enriched events yet</p>
               <p className="text-xs text-gray-600">

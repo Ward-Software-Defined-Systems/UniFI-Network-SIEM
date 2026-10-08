@@ -11,7 +11,7 @@ export default function SeverityBadge({ severity }) {
   const label = SEVERITY_LABELS[severity] || `Sev ${severity}`;
   const color = SEV_COLORS[severity] || 'bg-gray-500';
   return (
-    <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-xs font-medium ${color} text-white`}>
+    <span className={`inline-flex items-center px-1.5 py-0.5 rounded-sm text-xs font-medium ${color} text-white`}>
       {label}
     </span>
   );

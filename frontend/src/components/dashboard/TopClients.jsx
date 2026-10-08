@@ -20,7 +20,7 @@ export default function TopClients({ data }) {
         {data.map((row, i) => (
           <div key={i} className="relative">
             <div
-              className="absolute inset-0 bg-indigo-500/10 rounded"
+              className="absolute inset-0 bg-indigo-500/10 rounded-sm"
               style={{ width: `${(row.eventCount / maxCount) * 100}%` }}
             />
             <div className="relative px-2 py-1.5">

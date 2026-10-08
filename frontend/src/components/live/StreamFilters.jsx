@@ -29,7 +29,7 @@ export default function StreamFilters({ activeTypes, onToggleType, search, onSea
             value={search}
             onChange={(e) => onSearchChange(e.target.value)}
             placeholder="Search IPs, domains, messages..."
-            className="w-full pl-8 pr-3 py-1.5 text-sm bg-gray-800 border border-gray-700 rounded text-gray-200 placeholder-gray-500 focus:outline-none focus:border-blue-500"
+            className="w-full pl-8 pr-3 py-1.5 text-sm bg-gray-800 border border-gray-700 rounded-sm text-gray-200 placeholder-gray-500 focus:outline-hidden focus:border-blue-500"
           />
         </div>
       </div>
@@ -37,14 +37,14 @@ export default function StreamFilters({ activeTypes, onToggleType, search, onSea
       <div className="flex gap-1.5">
         <button
           onClick={onPauseToggle}
-          className={`p-1.5 rounded ${paused ? 'bg-yellow-600 text-white' : 'bg-gray-800 text-gray-400 hover:text-white'}`}
+          className={`p-1.5 rounded-sm ${paused ? 'bg-yellow-600 text-white' : 'bg-gray-800 text-gray-400 hover:text-white'}`}
           title={paused ? 'Resume' : 'Pause'}
         >
           {paused ? <Play className="w-4 h-4" /> : <Pause className="w-4 h-4" />}
         </button>
         <button
           onClick={onClear}
-          className="p-1.5 rounded bg-gray-800 text-gray-400 hover:text-white"
+          className="p-1.5 rounded-sm bg-gray-800 text-gray-400 hover:text-white"
           title="Clear"
         >
           <Trash2 className="w-4 h-4" />

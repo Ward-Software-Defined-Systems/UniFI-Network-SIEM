@@ -22,14 +22,14 @@ export default function EventRow({ event, onClick }) {
         <span className="inline-flex items-center gap-1">
           {event.src_ip || event.dns_client_ip || event.dhcp_ip || event.client_ip || '-'}
           {event.src_geo_country && <span className="text-gray-500">{countryFlag(event.src_geo_country)} {event.src_geo_country}</span>}
-          {event.src_abuse_score > 0 && (() => { const c = abuseScoreColor(event.src_abuse_score); return c ? <span className={`text-[10px] px-1 py-0 rounded border ${c.bg} ${c.text} ${c.border}`}>{event.src_abuse_score}</span> : null; })()}
+          {event.src_abuse_score > 0 && (() => { const c = abuseScoreColor(event.src_abuse_score); return c ? <span className={`text-[10px] px-1 py-0 rounded-sm border ${c.bg} ${c.text} ${c.border}`}>{event.src_abuse_score}</span> : null; })()}
         </span>
       </td>
       <td className="px-3 py-1.5 text-xs text-gray-400 whitespace-nowrap font-mono">
         <span className="inline-flex items-center gap-1">
           {event.dst_ip || '-'}
           {event.dst_geo_country && <span className="text-gray-500">{countryFlag(event.dst_geo_country)} {event.dst_geo_country}</span>}
-          {event.dst_abuse_score > 0 && (() => { const c = abuseScoreColor(event.dst_abuse_score); return c ? <span className={`text-[10px] px-1 py-0 rounded border ${c.bg} ${c.text} ${c.border}`}>{event.dst_abuse_score}</span> : null; })()}
+          {event.dst_abuse_score > 0 && (() => { const c = abuseScoreColor(event.dst_abuse_score); return c ? <span className={`text-[10px] px-1 py-0 rounded-sm border ${c.bg} ${c.text} ${c.border}`}>{event.dst_abuse_score}</span> : null; })()}
         </span>
       </td>
       <td className="px-3 py-1.5 text-xs text-gray-400 whitespace-nowrap font-mono">

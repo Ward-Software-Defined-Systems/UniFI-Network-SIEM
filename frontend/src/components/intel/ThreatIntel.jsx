@@ -265,7 +265,7 @@ export default function ThreatIntel({ period, setPeriod, refreshRate, setRefresh
                         value={filters[col.field] || ''}
                         onChange={(e) => setFilter(col.field, e.target.value)}
                         placeholder={col.type === 'number' ? '>0, <50...' : 'Filter...'}
-                        className="w-full px-2 py-1 text-xs bg-gray-900 border border-gray-700 rounded text-gray-200 placeholder-gray-600 focus:outline-none focus:border-blue-500"
+                        className="w-full px-2 py-1 text-xs bg-gray-900 border border-gray-700 rounded-sm text-gray-200 placeholder-gray-600 focus:outline-hidden focus:border-blue-500"
                       />
                     </th>
                   ))}
