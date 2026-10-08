@@ -218,9 +218,9 @@ Operator settings live in the SQLite database and are managed via the **Settings
 | `SIEM_API_TOKEN` | *(auto-generated)* | API/WebSocket auth token. Auto-generated and logged once on first run if unset. Required for `/api` and `/ws` auth (Phase 3+). |
 | `SIEM_MASTER_KEY` | *(auto-generated)* | 64 hex chars (32 bytes). Decrypts sensitive settings at rest (AES-256-GCM). Auto-generated and logged once on first run if unset. |
 
-### First-run seeding (optional)
+### Environment defaults (optional)
 
-Any setting that has an `envVar` in the schema can be pre-populated on first run by setting it in `.env`. After the first run the value is in the DB and `.env` becomes inert for that key — edit through the Settings UI thereafter. See `.env.example` for the full list of seedable env vars.
+Any setting that has an `envVar` in the schema can also be set in `.env`. Startup layers schema default → `.env` → database row and never copies `.env` into the database, so an `.env` value applies on every boot until that setting has a row in the database — that is, until you save it (or clear/reset it, which stores an empty value) in the Settings UI. From then on the database row wins and the `.env` line is ignored for that key. For settings whose default is empty, such as API keys, that includes an empty row: a key cleared in Settings stays cleared across restarts even if `.env` still carries one. See `.env.example` for the full list.
 
 ### Settings UI
 
@@ -340,7 +340,7 @@ scripts/
 
 ### Live Map basemap
 
-The Live Map needs a basemap tile provider. The default works with zero configuration; the others are selectable under **Settings → Live Map** (`map.*` settings, seedable via `MAP_*` env vars on first run) and apply on the next page load — no restart.
+The Live Map needs a basemap tile provider. The default works with zero configuration; the others are selectable under **Settings → Live Map** (`map.*` settings, or the matching `MAP_*` env vars until a Settings-UI value exists) and apply on the next page load — no restart.
 
 | Provider (`map.provider`) | Kind | Key? | Notes |
 |---|---|---|---|
