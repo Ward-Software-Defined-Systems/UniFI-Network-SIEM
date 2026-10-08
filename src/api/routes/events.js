@@ -1,12 +1,14 @@
 const express = require('express');
 const storage = require('../../db/storage');
+const { flatStringParams } = require('../../utils/query');
 
 const router = express.Router();
 
 router.get('/', async (req, res) => {
   try {
     const backend = storage.getBackend();
-    const result = await backend.queryEvents(req.query);
+    // Only flat string params reach the backends — see utils/query.js.
+    const result = await backend.queryEvents(flatStringParams(req.query));
     // M4: response shape is now `{events, hasMore, nextCursor}` for
     // backends that support keyset pagination (currently WardSONDB).
     // Frontend code that treats the body as just an array still works
