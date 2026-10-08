@@ -48,6 +48,13 @@ function ensureCerts() {
 function createServer() {
   const app = express();
 
+  // Query strings: Express 4 defaults to the "extended" qs parser, which turns
+  // `?src_ip[$ne]=x` into a nested object that WardSONDB's filter builder
+  // would treat as an operator. The 'simple' parser (Node querystring) never
+  // nests; routes that forward req.query also pass it through
+  // utils/query.flatStringParams() as a second layer.
+  app.set('query parser', 'simple');
+
   // Security headers — CSP allows OpenStreetMap + CartoDB tiles for the
   // Live Map, inline styles for Tailwind, and wss: for the live event
   // WebSocket. Adjust if you swap tile providers or add inline scripts.
