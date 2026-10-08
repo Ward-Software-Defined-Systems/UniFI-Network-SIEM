@@ -17,6 +17,8 @@
  *     `src/utils/crypto.js` (AES-256-GCM, format: `v1:iv:tag:ct`)
  */
 
+const { PROVIDER_IDS, OPENFREEMAP_STYLES, CARTO_STYLES } = require('../map/providers');
+
 const SCHEMA = [
   // ----------------------------------------------------------------- network
   { key: 'syslog.port', envVar: 'SYSLOG_PORT', type: 'number', default: 5514,
@@ -69,6 +71,32 @@ const SCHEMA = [
     default: 50000, category: 'enrichment',
     description: 'High-watermark for the enrichment update queue. When the backend (OpenSearch / WardSONDB) falls behind ingest, the oldest queued updates are dropped rather than letting the queue grow unbounded.' },
 
+  // --------------------------------------------------------------------- map
+  // Live Map basemap. Resolved per request by src/map/providers.js (the
+  // CARTO key is substituted into the tile URL by GET /api/map/config);
+  // Helmet's img-src follows these settings live, so nothing needs a restart.
+  { key: 'map.provider', envVar: 'MAP_PROVIDER', type: 'string', default: 'openfreemap',
+    category: 'map', options: PROVIDER_IDS,
+    description: 'Live Map basemap. openfreemap = free vector tiles, no key or registration (default); carto = CARTO raster tiles (API key required since Sep 2026); osm = OpenStreetMap raster (light style, best-effort public tile servers); custom-raster = your own XYZ tile template; custom-vector = your own MapLibre style URL. Applies on the next page load — no restart.' },
+  { key: 'map.openfreemapStyle', envVar: 'MAP_OPENFREEMAP_STYLE', type: 'string', default: 'dark',
+    category: 'map', options: OPENFREEMAP_STYLES,
+    description: 'OpenFreeMap style: dark (the OpenMapTiles port of CARTO Dark Matter — default), fiord (dark blue), positron (light), liberty, bright.' },
+  { key: 'map.cartoStyle', envVar: 'MAP_CARTO_STYLE', type: 'string', default: 'dark_all',
+    category: 'map', options: CARTO_STYLES,
+    description: 'CARTO raster basemap style (dark_all / dark_nolabels / light_all / light_nolabels / voyager / voyager_nolabels / voyager_labels_under).' },
+  { key: 'map.cartoApiKey', envVar: 'MAP_CARTO_API_KEY', type: 'string', default: '',
+    category: 'map', sensitivity: 'private',
+    description: 'CARTO Basemaps API key — required for CARTO tiles since Sep 2026 (free key at carto.com/basemaps/apikey: 5M requests/month non-commercial, 1M commercial). Encrypted at rest, but delivered to the browser inside tile URLs — it is a client-side key by design. The dashboard sends no Referer, so leave CARTO "website restrictions" off or allow this host.' },
+  { key: 'map.customRasterUrl', envVar: 'MAP_CUSTOM_RASTER_URL', type: 'string', default: '',
+    category: 'map',
+    description: 'XYZ tile template for provider custom-raster, e.g. https://tiles.example.com/{z}/{x}/{y}.png or https://{s}.example.com/{z}/{x}/{y}{r}.png?key=… ({s} only as the first host label; {r} = retina suffix). HTTPS only. Empty or invalid → the map falls back to OpenFreeMap and shows a warning.' },
+  { key: 'map.customVectorStyleUrl', envVar: 'MAP_CUSTOM_VECTOR_STYLE_URL', type: 'string', default: '',
+    category: 'map',
+    description: 'MapLibre style JSON URL for provider custom-vector (self-hosted OpenFreeMap / VersaTiles / Protomaps, or MapTiler / Stadia with the key in the URL). HTTPS only; needs WebGL in the browser.' },
+  { key: 'map.customAttribution', envVar: 'MAP_CUSTOM_ATTRIBUTION', type: 'string', default: '',
+    category: 'map',
+    description: 'Attribution shown for custom providers (plain text — HTML is escaped). OSM-derived tiles require it, e.g. "© OpenStreetMap contributors, © MapTiler".' },
+
   // ------------------------------------------------------------- performance
   { key: 'performance.insertBatchSize', envVar: 'INSERT_BATCH_SIZE',
     type: 'number', default: 50, category: 'performance',
@@ -94,9 +122,9 @@ const SCHEMA = [
 
   // -------------------------------------------------------------- threathunt
   { key: 'threathunt.provider', type: 'string', default: 'anthropic',
-    category: 'threathunt',
+    category: 'threathunt', options: ['anthropic', 'openai', 'gemini'],
     legacyKey: 'hunt_provider',
-    description: 'Active AI provider for Threat Hunt (anthropic | openai | gemini)' },
+    description: 'Active AI provider for Threat Hunt' },
   { key: 'threathunt.anthropicKey', type: 'string', default: '',
     category: 'threathunt', sensitivity: 'private',
     legacyKey: 'hunt_anthropicKey',
@@ -217,6 +245,7 @@ const CATEGORY_ORDER = [
   'network',
   'storage',
   'enrichment',
+  'map',
   'threathunt',
   'performance',
   'wardsondb',

@@ -73,3 +73,4 @@ export const getTopThreats = (period, limit) => fetchApi('/api/stats/top-threats
 export const getThreatIntel = (period, limit) => fetchApi('/api/stats/threat-intel', { period, limit });
 export const getGeoEvents = (period, limit) => fetchApi('/api/stats/geo-events', { period, limit });
 export const getRecentGeoEvents = (limit) => fetchApi('/api/stats/recent-geo-events', { limit });
+export const getMapConfig = () => fetchApi('/api/map/config');

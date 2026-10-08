@@ -209,3 +209,34 @@ describe('config (schema-driven loader)', () => {
     });
   });
 });
+
+describe('settings schema — options + map category', () => {
+  it('options (when present) are non-empty unique string lists on string entries that include the default', () => {
+    for (const e of SCHEMA) {
+      if (e.options === undefined) continue;
+      expect(e.type).toBe('string');
+      expect(Array.isArray(e.options)).toBe(true);
+      expect(e.options.length).toBeGreaterThan(0);
+      for (const o of e.options) expect(typeof o).toBe('string');
+      expect(new Set(e.options).size).toBe(e.options.length);
+      expect(e.options).toContain(e.default);
+    }
+  });
+
+  it('map category is ordered and its seven keys resolve', () => {
+    expect(CATEGORY_ORDER).toContain('map');
+    const keys = [
+      'map.provider', 'map.openfreemapStyle', 'map.cartoStyle', 'map.cartoApiKey',
+      'map.customRasterUrl', 'map.customVectorStyleUrl', 'map.customAttribution',
+    ];
+    for (const k of keys) {
+      expect(getEntry(k)).not.toBeNull();
+      expect(getEntry(k).category).toBe('map');
+    }
+    expect(getEntry('map.cartoApiKey').sensitivity).toBe('private');
+    expect(getEntryByEnv('MAP_PROVIDER').key).toBe('map.provider');
+    expect(getEntry('map.provider').default).toBe('openfreemap');
+    expect(getEntry('map.provider').options).toContain('carto');
+    expect(getEntry('threathunt.provider').options).toEqual(['anthropic', 'openai', 'gemini']);
+  });
+});

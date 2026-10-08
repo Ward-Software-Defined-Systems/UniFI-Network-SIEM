@@ -174,6 +174,28 @@ router.put('/', async (req, res) => {
 // re-encrypting every sensitive row, which is a separate workflow.
 const UNMUTABLE_KEYS = new Set(['security.masterKey']);
 
+/**
+ * Validate a value for a schema entry before it is persisted. Returns an
+ * error message or null. Pure so it can be unit-tested without an HTTP
+ * harness; PUT /v2 maps a non-null result to a 400.
+ */
+function validateSettingValue(entry, value) {
+  if (entry.type === 'number' && value !== '' && !Number.isFinite(Number(value))) {
+    return `value must be a number for ${entry.key}`;
+  }
+  if (Array.isArray(entry.options) && entry.options.length > 0 && !entry.options.includes(value)) {
+    return `value must be one of: ${entry.options.join(', ')}`;
+  }
+  // Never accept the masked echo as a real secret. GET masks private values
+  // with U+2022 bullets (maskSensitive), which a real key/token never
+  // contains. Rejecting here prevents the corrupt-secret / auth.apiToken
+  // lockout from ANY client, not just the dashboard UI.
+  if (entry.sensitivity === 'private' && typeof value === 'string' && value.includes('•')) {
+    return `Refusing to store a masked value for ${entry.key}. Type the new secret in full.`;
+  }
+  return null;
+}
+
 function readCurrentValue(entry) {
   const parts = entry.key.split('.');
   let cur = config;
@@ -204,6 +226,7 @@ function buildSchemaResponse() {
         sensitivity: entry.sensitivity || 'public',
         envVar: entry.envVar || null,
         requiresRestart: !!entry.requiresRestart,
+        options: Array.isArray(entry.options) ? entry.options.slice() : null,
         readOnly: UNMUTABLE_KEYS.has(entry.key),
         value: masked,
         isSet,
@@ -241,18 +264,9 @@ router.put('/v2', async (req, res) => {
       return res.status(404).json({ error: `Unknown setting: ${key}` });
     }
 
-    // Type validation
-    if (entry.type === 'number' && value !== '' && !Number.isFinite(Number(value))) {
-      return res.status(400).json({ error: `value must be a number for ${key}` });
-    }
-
-    // Never accept the masked echo as a real secret. GET masks private values
-    // with U+2022 bullets (maskSensitive), which a real key/token never
-    // contains. Rejecting here prevents the corrupt-secret / auth.apiToken
-    // lockout from ANY client, not just the dashboard UI.
-    if (entry.sensitivity === 'private' && typeof value === 'string' && value.includes('•')) {
-      return res.status(400).json({ error: `Refusing to store a masked value for ${key}. Type the new secret in full.` });
-    }
+    // Type / options / masked-echo validation (pure, unit-tested).
+    const problem = validateSettingValue(entry, value);
+    if (problem) return res.status(400).json({ error: problem });
 
     await persistSetting(entry, value);
     res.json({ ok: true, schema: buildSchemaResponse() });
@@ -355,3 +369,4 @@ router.post('/reset-db', async (req, res) => {
 
 module.exports = router;
 module.exports.getResetGraceStatus = getResetGraceStatus;
+module.exports.validateSettingValue = validateSettingValue;
