@@ -1,0 +1,74 @@
+# GitLab CI for UniFi Network SIEM.
+#
+# Pipelines run on merge requests, pushes to main, and scheduled runs.
+#   backend:test   -> vitest suite (tests/**/*.test.js)
+#   frontend:build -> Vite production build (artifact: frontend/dist)
+#   audit          -> `npm audit` in both trees. Informational on MR/push
+#                     pipelines; blocking on the weekly schedule
+#                     (CI/CD -> Schedules) so new advisories surface on their own.
+#
+# Dependabot still scans the GitHub mirror, but its PRs can't be merged on a
+# mirror, so this pipeline is the actionable signal.
+
+image: node:22   # full Debian image: python3/make/g++ for better-sqlite3's native build
+
+stages:
+  - test
+  - build
+  - audit
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never          # the MR pipeline already covers this push
+    - if: $CI_COMMIT_BRANCH
+
+variables:
+  npm_config_cache: $CI_PROJECT_DIR/.npm
+  npm_config_fund: "false"
+  npm_config_audit: "false"   # audit has its own job below
+
+.node_cache: &node_cache
+  key:
+    files:
+      - package-lock.json
+      - frontend/package-lock.json
+  paths:
+    - .npm/
+
+backend:test:
+  stage: test
+  cache: *node_cache
+  script:
+    - npm ci
+    - npm test
+
+frontend:build:
+  stage: build
+  cache: *node_cache
+  script:
+    - cd frontend
+    - npm ci
+    - npm run build
+  artifacts:
+    paths:
+      - frontend/dist/
+    expire_in: 1 week
+
+audit:
+  stage: audit
+  cache: *node_cache
+  script:
+    - npm ci
+    - npm audit --audit-level=moderate
+    - cd frontend
+    - npm ci
+    - npm audit --audit-level=moderate
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      allow_failure: false
+    - when: on_success
+      allow_failure: true
