@@ -6,6 +6,8 @@
 
 A self-contained, **AI-powered** Node.js application that collects syslog from UniFi consoles and gateways, parses all event types, stores them in SQLite (or OpenSearch/WardSONDB), and serves a real-time security dashboard with built-in AI threat hunting.
 
+> **Source & mirroring:** this project is developed on an internal GitLab instance; the GitHub repository is an automatic read-only mirror of it. Issues and feature requests are welcome on GitHub — see [CONTRIBUTING.md](CONTRIBUTING.md). Pull requests can't be merged on the mirror.
+
 > **📊 Backend Recommendation for Scale:** Both **OpenSearch** and **SQLite** are production-ready at scale. OpenSearch uses native aggregations (`date_histogram`, `terms`, `cardinality`) for sub-second dashboard queries. SQLite uses five materialized rollup tables updated atomically on insert plus a dedicated stats worker thread, tested stable at 8M+ events. **WardSONDB** mirrors SQLite's rollup pattern (daily event partitions + five rollup collections) and is running live at 12M+ events — optimizations are still being iterated on and tested, so treat it as Beta for now. See [Using OpenSearch Backend](#using-opensearch-backend-optional) below to get started.
 
 ## Features
@@ -87,6 +89,8 @@ cd frontend && npm run dev   # Vite HMR (port 5173)
 ```
 
 Open https://localhost:3000 in your browser. Accept the self-signed certificate warning on first visit.
+
+Continuous integration runs on the internal GitLab: every merge request runs `npm test`, builds the frontend, and runs `npm audit` in both dependency trees (see `.gitlab-ci.yml`); a weekly scheduled pipeline turns new advisories into a failing run.
 
 ### Using OpenSearch Backend (Optional)
 
