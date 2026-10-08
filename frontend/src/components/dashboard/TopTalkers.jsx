@@ -20,7 +20,7 @@ export default function TopTalkers({ data, title = 'Top Talkers' }) {
         {data.map((row, i) => (
           <div key={i} className="relative">
             <div
-              className="absolute inset-0 bg-blue-500/10 rounded"
+              className="absolute inset-0 bg-blue-500/10 rounded-sm"
               style={{ width: `${(row.count / maxCount) * 100}%` }}
             />
             <div className="relative flex items-center justify-between px-2 py-1.5 gap-2">

@@ -55,7 +55,7 @@ export default function Settings({ setRebuilding }) {
             Select the storage backend for event data. SQLite is the default zero-dependency option.
             External engines offer higher scalability for large deployments.
           </p>
-          <div className="flex items-start gap-2 p-2 rounded bg-yellow-900/20 border border-yellow-800/30">
+          <div className="flex items-start gap-2 p-2 rounded-sm bg-yellow-900/20 border border-yellow-800/30">
             <span className="text-yellow-500 text-xs mt-0.5">⚠️</span>
             <p className="text-xs text-yellow-600">
               Settings and configuration are always stored in the local SQLite database, regardless of the active backend. Do not delete the SQLite database file (<code className="text-yellow-500">data/events.db</code>) even when using an external backend.
@@ -102,10 +102,10 @@ export default function Settings({ setRebuilding }) {
                         <div className="flex items-center gap-2">
                           <span className="text-sm font-medium text-gray-200">{backend.name}</span>
                           {backend.isDefault && (
-                            <span className="px-1.5 py-0.5 text-[10px] bg-green-900/50 text-green-400 rounded">DEFAULT</span>
+                            <span className="px-1.5 py-0.5 text-[10px] bg-green-900/50 text-green-400 rounded-sm">DEFAULT</span>
                           )}
                           {isComingSoon && (
-                            <span className="px-1.5 py-0.5 text-[10px] bg-yellow-900/50 text-yellow-400 rounded">BETA — COMING SOON</span>
+                            <span className="px-1.5 py-0.5 text-[10px] bg-yellow-900/50 text-yellow-400 rounded-sm">BETA — COMING SOON</span>
                           )}
                         </div>
                         <p className="text-xs text-gray-500 mt-0.5">{backend.description}</p>
@@ -142,7 +142,7 @@ export default function Settings({ setRebuilding }) {
                               }}
                               onClick={(e) => e.stopPropagation()}
                               placeholder={field.placeholder}
-                              className="flex-1 px-3 py-1.5 text-xs bg-gray-800 border border-gray-700 rounded text-gray-200 placeholder-gray-500 focus:outline-none focus:border-blue-500"
+                              className="flex-1 px-3 py-1.5 text-xs bg-gray-800 border border-gray-700 rounded-sm text-gray-200 placeholder-gray-500 focus:outline-hidden focus:border-blue-500"
                             />
                           )}
                         </div>
@@ -174,7 +174,7 @@ export default function Settings({ setRebuilding }) {
                   setTimeout(() => setEngineSaved(false), 3000);
                 }
               }}
-              className="px-4 py-2 text-sm bg-blue-600 text-white rounded hover:bg-blue-500 transition-colors"
+              className="px-4 py-2 text-sm bg-blue-600 text-white rounded-sm hover:bg-blue-500 transition-colors"
             >
               Save Database Engine
             </button>
@@ -274,7 +274,7 @@ export default function Settings({ setRebuilding }) {
         {!confirmReset ? (
           <button
             onClick={() => setConfirmReset(true)}
-            className="px-4 py-2 text-sm bg-gray-800 border border-red-700 text-red-400 rounded hover:bg-red-900/30 transition-colors"
+            className="px-4 py-2 text-sm bg-gray-800 border border-red-700 text-red-400 rounded-sm hover:bg-red-900/30 transition-colors"
           >
             Initialize Database
           </button>
@@ -294,13 +294,13 @@ export default function Settings({ setRebuilding }) {
                   setRebuilding?.(false);
                 }
               }}
-              className="px-4 py-2 text-sm bg-red-600 text-white rounded hover:bg-red-500 transition-colors"
+              className="px-4 py-2 text-sm bg-red-600 text-white rounded-sm hover:bg-red-500 transition-colors"
             >
               Confirm — Delete All Data
             </button>
             <button
               onClick={() => setConfirmReset(false)}
-              className="px-4 py-2 text-sm bg-gray-800 text-gray-400 rounded hover:text-gray-200 transition-colors"
+              className="px-4 py-2 text-sm bg-gray-800 text-gray-400 rounded-sm hover:text-gray-200 transition-colors"
             >
               Cancel
             </button>

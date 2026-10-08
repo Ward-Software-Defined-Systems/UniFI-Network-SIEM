@@ -101,7 +101,7 @@ function CategorySection({ name, entries, defaultOpen, onChange }) {
   const [open, setOpen] = useState(defaultOpen);
   const label = CATEGORY_LABEL[name] || name;
   return (
-    <div className="border border-gray-800 rounded">
+    <div className="border border-gray-800 rounded-sm">
       <button
         onClick={() => setOpen(!open)}
         className="w-full flex items-center justify-between px-3 py-2 text-left hover:bg-gray-800/30 transition-colors"
@@ -222,13 +222,13 @@ function SettingRow({ entry, onChange }) {
           <div className="flex items-center gap-2 flex-wrap">
             <code className="text-xs text-gray-300">{entry.key}</code>
             {entry.requiresRestart && (
-              <span className="px-1.5 py-0.5 text-[10px] bg-yellow-900/50 text-yellow-400 rounded">RESTART REQUIRED</span>
+              <span className="px-1.5 py-0.5 text-[10px] bg-yellow-900/50 text-yellow-400 rounded-sm">RESTART REQUIRED</span>
             )}
             {entry.envVar && (
-              <span className="px-1.5 py-0.5 text-[10px] bg-gray-800 text-gray-500 rounded">env: {entry.envVar}</span>
+              <span className="px-1.5 py-0.5 text-[10px] bg-gray-800 text-gray-500 rounded-sm">env: {entry.envVar}</span>
             )}
             {entry.readOnly && (
-              <span className="px-1.5 py-0.5 text-[10px] bg-gray-800 text-gray-500 rounded">READ-ONLY</span>
+              <span className="px-1.5 py-0.5 text-[10px] bg-gray-800 text-gray-500 rounded-sm">READ-ONLY</span>
             )}
           </div>
           <p className="text-xs text-gray-500 mt-1">{entry.description}</p>
@@ -245,7 +245,7 @@ function SettingRow({ entry, onChange }) {
           <button
             disabled={entry.readOnly || saving}
             onClick={() => setDraft(!draft)}
-            className={`px-3 py-1 text-xs rounded ${draft ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-400'} disabled:opacity-50`}
+            className={`px-3 py-1 text-xs rounded-sm ${draft ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-400'} disabled:opacity-50`}
           >
             {draft ? 'Enabled' : 'Disabled'}
           </button>
@@ -257,7 +257,7 @@ function SettingRow({ entry, onChange }) {
               disabled={entry.readOnly || saving}
               onChange={(e) => setDraft(e.target.value)}
               placeholder={entry.isSet ? entry.value : 'Not set'}
-              className="flex-1 px-3 py-1.5 text-xs bg-gray-800 border border-gray-700 rounded text-gray-200 placeholder-gray-500 focus:outline-none focus:border-blue-500 disabled:opacity-50"
+              className="flex-1 px-3 py-1.5 text-xs bg-gray-800 border border-gray-700 rounded-sm text-gray-200 placeholder-gray-500 focus:outline-hidden focus:border-blue-500 disabled:opacity-50"
             />
             <button
               onClick={() => setShowSecret(!showSecret)}
@@ -273,7 +273,7 @@ function SettingRow({ entry, onChange }) {
             value={draft}
             disabled={entry.readOnly || saving}
             onChange={(e) => setDraft(e.target.value === '' ? '' : Number(e.target.value))}
-            className="w-32 px-3 py-1.5 text-xs bg-gray-800 border border-gray-700 rounded text-gray-200 focus:outline-none focus:border-blue-500 disabled:opacity-50"
+            className="w-32 px-3 py-1.5 text-xs bg-gray-800 border border-gray-700 rounded-sm text-gray-200 focus:outline-hidden focus:border-blue-500 disabled:opacity-50"
           />
         ) : (
           <input
@@ -281,14 +281,14 @@ function SettingRow({ entry, onChange }) {
             value={draft}
             disabled={entry.readOnly || saving}
             onChange={(e) => setDraft(e.target.value)}
-            className="flex-1 px-3 py-1.5 text-xs bg-gray-800 border border-gray-700 rounded text-gray-200 focus:outline-none focus:border-blue-500 disabled:opacity-50"
+            className="flex-1 px-3 py-1.5 text-xs bg-gray-800 border border-gray-700 rounded-sm text-gray-200 focus:outline-hidden focus:border-blue-500 disabled:opacity-50"
           />
         )}
 
         <button
           disabled={!isDirty || saving || entry.readOnly}
           onClick={save}
-          className="flex items-center gap-1 px-3 py-1.5 text-xs bg-blue-600 text-white rounded hover:bg-blue-500 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+          className="flex items-center gap-1 px-3 py-1.5 text-xs bg-blue-600 text-white rounded-sm hover:bg-blue-500 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
         >
           {Date.now() - savedAt < 2000 ? <Check className="w-3 h-3" /> : <Save className="w-3 h-3" />}
           Save
@@ -298,7 +298,7 @@ function SettingRow({ entry, onChange }) {
           disabled={saving || entry.readOnly}
           onClick={reset}
           title="Reset to default"
-          className="flex items-center gap-1 px-2 py-1.5 text-xs bg-gray-800 text-gray-400 rounded hover:bg-gray-700 disabled:opacity-50 transition-colors"
+          className="flex items-center gap-1 px-2 py-1.5 text-xs bg-gray-800 text-gray-400 rounded-sm hover:bg-gray-700 disabled:opacity-50 transition-colors"
         >
           <RotateCcw className="w-3 h-3" />
         </button>
@@ -308,7 +308,7 @@ function SettingRow({ entry, onChange }) {
             disabled={saving}
             onClick={regenerateToken}
             title="Generate a new token"
-            className="flex items-center gap-1 px-3 py-1.5 text-xs bg-yellow-700 text-white rounded hover:bg-yellow-600 disabled:opacity-50 transition-colors"
+            className="flex items-center gap-1 px-3 py-1.5 text-xs bg-yellow-700 text-white rounded-sm hover:bg-yellow-600 disabled:opacity-50 transition-colors"
           >
             <RefreshCw className="w-3 h-3" />
             Regenerate
@@ -317,7 +317,7 @@ function SettingRow({ entry, onChange }) {
       </div>
 
       {revealed && (
-        <div className="p-2 bg-yellow-900/20 border border-yellow-800/40 rounded space-y-1">
+        <div className="p-2 bg-yellow-900/20 border border-yellow-800/40 rounded-sm space-y-1">
           <p className="text-[11px] text-yellow-400 font-medium">New token — copy it now, you won't see it again:</p>
           <code className="block text-xs text-yellow-200 break-all select-all">{revealed}</code>
         </div>

@@ -78,13 +78,13 @@ export default function TokenGate({ children }) {
             autoFocus
             spellCheck="false"
             autoComplete="off"
-            className="w-full px-3 py-2 text-sm bg-gray-800 border border-gray-700 rounded text-gray-200 placeholder-gray-500 focus:outline-none focus:border-blue-500"
+            className="w-full px-3 py-2 text-sm bg-gray-800 border border-gray-700 rounded-sm text-gray-200 placeholder-gray-500 focus:outline-hidden focus:border-blue-500"
           />
           {error && <p className="text-xs text-red-400">{error}</p>}
           <button
             type="submit"
             disabled={!token.trim() || checking}
-            className="w-full px-4 py-2 text-sm bg-blue-600 text-white rounded hover:bg-blue-500 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+            className="w-full px-4 py-2 text-sm bg-blue-600 text-white rounded-sm hover:bg-blue-500 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
           >
             {checking ? 'Verifying…' : 'Sign in'}
           </button>

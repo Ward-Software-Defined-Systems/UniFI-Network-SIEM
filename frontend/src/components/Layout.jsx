@@ -118,7 +118,7 @@ export default function Layout({ activeView, onViewChange, rebuilding: appRebuil
 
       {/* Heavy load / rebuilding overlay — sits on top of content, does not unmount it */}
       {showRebuilding && !dismissRebuilding && (
-        <div className="fixed inset-0 z-[9999] flex items-center justify-center bg-gray-950/80 backdrop-blur-sm">
+        <div className="fixed inset-0 z-9999 flex items-center justify-center bg-gray-950/80 backdrop-blur-xs">
           <div className="text-center space-y-3">
             <div className="animate-spin w-8 h-8 border-2 border-blue-500 border-t-transparent rounded-full mx-auto" />
             <h2 className="text-lg font-medium text-gray-200">
@@ -132,7 +132,7 @@ export default function Layout({ activeView, onViewChange, rebuilding: appRebuil
             <p className="text-xs text-gray-600">Events are still being ingested during this time.</p>
             <button
               onClick={() => setDismissRebuilding(true)}
-              className="mt-2 px-4 py-1.5 text-xs bg-gray-800 border border-gray-700 text-gray-400 rounded hover:bg-gray-700 hover:text-gray-200 transition-colors"
+              className="mt-2 px-4 py-1.5 text-xs bg-gray-800 border border-gray-700 text-gray-400 rounded-sm hover:bg-gray-700 hover:text-gray-200 transition-colors"
             >
               Dismiss — Load Dashboard Anyway
             </button>

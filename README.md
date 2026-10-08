@@ -58,6 +58,7 @@ A self-contained, **AI-powered** Node.js application that collects syslog from U
   - Debian / Ubuntu: `sudo apt-get install build-essential python3`
   - Windows: Visual Studio 2022 Build Tools with the "Desktop development with C++" workload
 - macOS, Linux, or Windows
+- A current browser for the dashboard — the UI is built with Tailwind CSS 4, which targets Safari 16.4+, Chrome 111+, and Firefox 128+
 
 ### Install
 
@@ -352,7 +353,7 @@ The app runs HTTPS by default with an auto-generated self-signed certificate. Be
 | Syslog spoofing | **Low** | UDP has no authentication by design — a device on your LAN could send crafted syslog to inject fake events. Mitigations available: set `SYSLOG_ALLOWED_SOURCES` to a CIDR allowlist (Phase 3B) so the listener drops packets from anywhere outside; the listener also has a per-source rate cap to limit a single misbehaving sender. Without an allowlist, any host on the broadcast domain can submit events. |
 | TLS certificate trust | **Info** | The self-signed certificate will trigger browser warnings. For production, replace `data/server.key` and `data/server.cert` with certs from a trusted CA or your own internal CA. |
 
-**Known advisories:** as of 2026-10-08 the backend tree reports **0 vulnerabilities** (`npm audit`). The frontend tree's only open findings are build-time packages pinned by Tailwind CSS 3's file-watcher chain (`braces` / `micromatch` / `chokidar` / `fast-glob` and `postcss-selector-parser`); none of them ship in the built dashboard, and they clear with the Tailwind 4 upgrade. The 2026-10 pass patched `undici`, `qs`, `body-parser`, `proxy-addr`, `dompurify`, `postcss`, `vitest` and their transitive dependencies in-range, and replaced `nodemon` (whose watcher chain carries an advisory with no patched release) with Node's built-in `--watch`. The remaining dependency majors (`recharts`, React 19 + `react-leaflet`, `express`) carry no open advisory.
+**Known advisories:** none. As of 2026-10-08, `npm audit` reports **0 vulnerabilities** in both the backend and frontend trees. The 2026-10 pass patched `undici`, `qs`, `body-parser`, `proxy-addr`, `dompurify`, `postcss`, `vitest` and their transitive dependencies in-range, replaced `nodemon` (whose watcher chain carries an advisory with no patched release) with Node's built-in `--watch`, and moved the frontend to Tailwind CSS 4 via `@tailwindcss/vite`, which removed the PostCSS/autoprefixer/chokidar build chain that held the last build-time findings. The remaining dependency majors (`recharts`, React 19 + `react-leaflet`, `express`) carry no open advisory.
 
 **Already mitigated:**
 - **API + WebSocket authentication** — bearer-token middleware on every `/api/*` route; WebSocket validates the same token via `?token=` query at upgrade time; frontend `TokenGate.jsx` login screen + global fetch wrapper. The reset-DB endpoint sits behind this same gate (Phase 3). The fetch wrapper scopes the `Authorization` header to **same-origin `/api/`** requests only, so the token is never attached to cross-origin URLs (e.g. map-tile CDNs)
