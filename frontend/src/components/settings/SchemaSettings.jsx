@@ -9,6 +9,8 @@ const CATEGORY_LABEL = {
   network: 'Network',
   storage: 'Storage',
   enrichment: 'Enrichment',
+  map: 'Live Map',
+  threathunt: 'Threat Hunt',
   performance: 'Performance',
   wardsondb: 'WardSONDB Backend',
   opensearch: 'OpenSearch Backend',
@@ -183,7 +185,9 @@ function SettingRow({ entry, onChange }) {
         const j = await res.json().catch(() => ({}));
         throw new Error(j.error || `HTTP ${res.status}`);
       }
-      setDraft(entry.type === 'boolean' ? false : '');
+      // Option entries reset to the schema default so the select never
+      // shows an empty value.
+      setDraft(entry.type === 'boolean' ? false : (entry.options ? entry.default : ''));
       setSavedAt(Date.now());
       setRevealed('');
       onChange?.();
@@ -267,6 +271,17 @@ function SettingRow({ entry, onChange }) {
               {showSecret ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
             </button>
           </div>
+        ) : Array.isArray(entry.options) && entry.options.length > 0 ? (
+          <select
+            value={draft}
+            disabled={entry.readOnly || saving}
+            onChange={(e) => setDraft(e.target.value)}
+            className="px-3 py-1.5 text-xs bg-gray-800 border border-gray-700 rounded-sm text-gray-200 focus:outline-hidden focus:border-blue-500 disabled:opacity-50"
+          >
+            {entry.options.map((opt) => (
+              <option key={opt} value={opt}>{opt}</option>
+            ))}
+          </select>
         ) : entry.type === 'number' ? (
           <input
             type="number"

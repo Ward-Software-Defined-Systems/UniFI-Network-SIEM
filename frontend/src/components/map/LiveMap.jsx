@@ -1,11 +1,24 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { MapContainer, TileLayer, CircleMarker, Polyline, Popup, useMap } from 'react-leaflet';
+import { MapContainer, TileLayer, CircleMarker, Polyline, Popup } from 'react-leaflet';
 import PeriodSelector from '../shared/PeriodSelector';
 import RefreshControls, { PausedIndicator } from '../shared/RefreshControls';
-import { getGeoEvents, getRecentGeoEvents } from '../../lib/api';
+import { getGeoEvents, getRecentGeoEvents, getMapConfig } from '../../lib/api';
 import { formatNumber, formatDateTime, countryFlag } from '../../lib/format';
 import 'leaflet/dist/leaflet.css';
 import { isPrivateIp } from '../../lib/ip-utils';
+import MaplibreLayer from './MaplibreLayer';
+
+// Used only when /api/map/config itself is unreachable. The server normally
+// supplies the same descriptor as `rasterFallback` (src/map/providers.js).
+const CLIENT_FALLBACK = {
+  provider: 'osm',
+  kind: 'raster',
+  label: 'OpenStreetMap',
+  url: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+  attribution: '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> contributors',
+  maxZoom: 19,
+  dark: false,
+};
 
 function getMarkerColor(event) {
   if (event.threats > 0 || event.abuseScore > 50) return '#ef4444'; // red
@@ -94,11 +107,60 @@ function StatsOverlay({ geoEvents, recentEvents }) {
   );
 }
 
+// Dismissible strip between the header and the map for provider warnings
+// (no CARTO key, invalid custom URL), the WebGL fallback, and stale-CSP hints.
+function MapNotice({ notice, onDismiss }) {
+  if (!notice) return null;
+  const tone = notice.level === 'error'
+    ? 'bg-red-900/30 border-red-800/50 text-red-300'
+    : 'bg-yellow-900/30 border-yellow-800/50 text-yellow-300';
+  return (
+    <div className={`mx-4 mt-2 px-3 py-2 text-xs border rounded-sm flex items-start justify-between gap-3 ${tone}`}>
+      <span>{notice.text}</span>
+      <button onClick={onDismiss} className="text-gray-400 hover:text-gray-200 leading-none" title="Dismiss">×</button>
+    </div>
+  );
+}
+
 export default function LiveMap({ period, setPeriod, refreshRate, setRefreshRate, paused, setPaused }) {
   const [geoEvents, setGeoEvents] = useState([]);
   const [recentEvents, setRecentEvents] = useState([]);
   const [loading, setLoading] = useState(false);
+  const [mapConfig, setMapConfig] = useState(null);
+  const [glFailed, setGlFailed] = useState(false);
+  const [notice, setNotice] = useState(null);
   const fetchRef = useRef(null);
+
+  // Basemap provider — resolved server-side from the map.* settings, so a
+  // Settings change shows up the next time this view mounts.
+  useEffect(() => {
+    let cancelled = false;
+    getMapConfig()
+      .then((cfg) => {
+        if (cancelled) return;
+        setMapConfig(cfg);
+        if (cfg.warning) setNotice({ level: 'warn', text: cfg.warning });
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setMapConfig(CLIENT_FALLBACK);
+        setNotice({ level: 'error', text: `Could not load the map provider settings (${err.message}); showing OpenStreetMap tiles.` });
+      });
+    return () => { cancelled = true; };
+  }, []);
+
+  // A page's CSP is fixed when it loads. If the provider's host changed after
+  // that (custom raster), the browser blocks the tiles silently — say so.
+  useEffect(() => {
+    const onViolation = (e) => {
+      const directive = e.violatedDirective || e.effectiveDirective || '';
+      if (/^(img-src|connect-src|worker-src)/.test(directive)) {
+        setNotice({ level: 'warn', text: 'The browser blocked map tiles under this page\'s security policy — the map provider changed after the page loaded. Reload the page to apply the new provider.' });
+      }
+    };
+    document.addEventListener('securitypolicyviolation', onViolation);
+    return () => document.removeEventListener('securitypolicyviolation', onViolation);
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -131,6 +193,16 @@ export default function LiveMap({ period, setPeriod, refreshRate, setRefreshRate
   const filteredEvents = geoEvents.filter(e => !isPrivateIp(e.ip));
   const hasData = filteredEvents.length > 0;
 
+  const basemap = mapConfig
+    ? (glFailed ? (mapConfig.rasterFallback || CLIENT_FALLBACK) : mapConfig)
+    : null;
+  const isVector = basemap?.kind === 'vector';
+
+  const onGlFail = (err) => {
+    setGlFailed(true);
+    setNotice({ level: 'warn', text: `Vector basemap unavailable (${err.message}); showing OpenStreetMap raster tiles instead.` });
+  };
+
   return (
     <div className="flex flex-col h-full">
       <div className="flex items-center justify-between p-4 border-b border-gray-800">
@@ -147,6 +219,8 @@ export default function LiveMap({ period, setPeriod, refreshRate, setRefreshRate
           <PeriodSelector value={period} onChange={setPeriod} />
         </div>
       </div>
+
+      <MapNotice notice={notice} onDismiss={() => setNotice(null)} />
 
       {loading && (
         <div className="px-4 py-2 space-y-1">
@@ -177,64 +251,78 @@ export default function LiveMap({ period, setPeriod, refreshRate, setRefreshRate
           </div>
         )}
 
-        <MapContainer
-          center={[25, 0]}
-          zoom={2}
-          minZoom={2}
-          maxZoom={12}
-          className="h-full w-full"
-          style={{ background: '#0f172a' }}
-          worldCopyJump={true}
-        >
-          <TileLayer
-            attribution='&copy; <a href="https://carto.com/">CARTO</a>'
-            url="https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png"
-          />
+        {basemap ? (
+          <MapContainer
+            // react-leaflet reads these options once at construction, so a
+            // different basemap (or the WebGL fallback) remounts the map.
+            key={`${basemap.provider}:${basemap.style || basemap.url}`}
+            center={[25, 0]}
+            zoom={2}
+            minZoom={2}
+            maxZoom={Math.min(12, basemap.maxZoom || 12)}
+            className="h-full w-full"
+            style={{ background: basemap.dark ? '#0f172a' : '#dbe2ea' }}
+            worldCopyJump={true}
+          >
+            {isVector ? (
+              <MaplibreLayer style={basemap.style} attribution={basemap.attribution} onFail={onGlFail} />
+            ) : (
+              <TileLayer
+                url={basemap.url}
+                attribution={basemap.attribution}
+                subdomains={basemap.subdomains || 'abc'}
+              />
+            )}
 
-          {/* Aggregated IP markers */}
-          {filteredEvents.map((event, i) => (
-            <CircleMarker
-              key={`geo-${event.ip}-${event.direction}-${i}`}
-              center={[event.lat, event.lon]}
-              radius={getMarkerRadius(event.count)}
-              pathOptions={{
-                color: getMarkerColor(event),
-                fillColor: getMarkerColor(event),
-                fillOpacity: 0.6,
-                weight: 1,
-              }}
-            >
-              <Popup>
-                <div className="text-xs space-y-1 min-w-[180px]">
-                  <div className="font-bold text-sm">{event.ip}</div>
-                  {event.city && event.country && (
-                    <div>{countryFlag(event.country)} {event.city}, {event.country}</div>
-                  )}
-                  {!event.city && event.country && <div>{countryFlag(event.country)} {event.country}</div>}
-                  <div>Events: <strong>{formatNumber(event.count)}</strong></div>
-                  {event.blocked > 0 && (
-                    <div style={{ color: '#f97316' }}>Blocked: {formatNumber(event.blocked)}</div>
-                  )}
-                  {event.threats > 0 && (
-                    <div style={{ color: '#ef4444' }}>Threats: {formatNumber(event.threats)}</div>
-                  )}
-                  {event.abuseScore != null && event.abuseScore > 0 && (
-                    <div style={{ color: event.abuseScore > 50 ? '#ef4444' : '#eab308' }}>
-                      Abuse score: {event.abuseScore}%
+            {/* Aggregated IP markers */}
+            {filteredEvents.map((event, i) => (
+              <CircleMarker
+                key={`geo-${event.ip}-${event.direction}-${i}`}
+                center={[event.lat, event.lon]}
+                radius={getMarkerRadius(event.count)}
+                pathOptions={{
+                  color: getMarkerColor(event),
+                  fillColor: getMarkerColor(event),
+                  fillOpacity: 0.6,
+                  weight: 1,
+                }}
+              >
+                <Popup>
+                  <div className="text-xs space-y-1 min-w-[180px]">
+                    <div className="font-bold text-sm">{event.ip}</div>
+                    {event.city && event.country && (
+                      <div>{countryFlag(event.country)} {event.city}, {event.country}</div>
+                    )}
+                    {!event.city && event.country && <div>{countryFlag(event.country)} {event.country}</div>}
+                    <div>Events: <strong>{formatNumber(event.count)}</strong></div>
+                    {event.blocked > 0 && (
+                      <div style={{ color: '#f97316' }}>Blocked: {formatNumber(event.blocked)}</div>
+                    )}
+                    {event.threats > 0 && (
+                      <div style={{ color: '#ef4444' }}>Threats: {formatNumber(event.threats)}</div>
+                    )}
+                    {event.abuseScore != null && event.abuseScore > 0 && (
+                      <div style={{ color: event.abuseScore > 50 ? '#ef4444' : '#eab308' }}>
+                        Abuse score: {event.abuseScore}%
+                      </div>
+                    )}
+                    <div style={{ color: '#6b7280' }}>
+                      Direction: {event.direction === 'src' ? 'Source' : 'Destination'}
                     </div>
-                  )}
-                  <div style={{ color: '#6b7280' }}>
-                    Direction: {event.direction === 'src' ? 'Source' : 'Destination'}
+                    <div style={{ color: '#6b7280' }}>Last seen: {formatDateTime(event.lastSeen)}</div>
                   </div>
-                  <div style={{ color: '#6b7280' }}>Last seen: {formatDateTime(event.lastSeen)}</div>
-                </div>
-              </Popup>
-            </CircleMarker>
-          ))}
+                </Popup>
+              </CircleMarker>
+            ))}
 
-          {/* Flow lines for recent events */}
-          <FlowLines events={recentEvents} />
-        </MapContainer>
+            {/* Flow lines for recent events */}
+            <FlowLines events={recentEvents} />
+          </MapContainer>
+        ) : (
+          <div className="absolute inset-0 flex items-center justify-center text-xs text-gray-500">
+            Loading map…
+          </div>
+        )}
 
         <MapLegend />
         <StatsOverlay geoEvents={filteredEvents} recentEvents={recentEvents} />

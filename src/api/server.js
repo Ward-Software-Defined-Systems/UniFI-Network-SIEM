@@ -11,6 +11,8 @@ const statsRouter = require('./routes/stats');
 const healthRouter = require('./routes/health');
 const settingsRouter = require('./routes/settings');
 const threatHuntRouter = require('./routes/threat-hunt');
+const mapRouter = require('./routes/map');
+const { mapImgSources } = require('../map/providers');
 const { createWebSocketServer } = require('./websocket');
 const { requireApiToken } = require('./middleware/auth');
 
@@ -55,9 +57,15 @@ function createServer() {
   // utils/query.flatStringParams() as a second layer.
   app.set('query parser', 'simple');
 
-  // Security headers — CSP allows OpenStreetMap + CartoDB tiles for the
-  // Live Map, inline styles for Tailwind, and wss: for the live event
-  // WebSocket. Adjust if you swap tile providers or add inline scripts.
+  // Security headers. The CSP's image sources follow the Live Map basemap
+  // settings per request (src/map/providers.js): the built-in CARTO + OSM
+  // raster hosts are always listed so switching between them needs no page
+  // reload, and a validated custom-raster host is added while that provider
+  // is active. Vector basemaps (MapLibre) run a same-origin worker
+  // (worker-src 'self', via setWorkerUrl in the frontend) and decode sprites
+  // through blob: images; their style/tile/glyph fetches are covered by
+  // connect-src https:. Inline styles are for Tailwind; wss: for the live
+  // event WebSocket.
   app.use(helmet({
     contentSecurityPolicy: {
       useDefaults: true,
@@ -65,14 +73,15 @@ function createServer() {
         'default-src': ["'self'"],
         'script-src': ["'self'"],
         'style-src': ["'self'", "'unsafe-inline'"],
-        'img-src': ["'self'", 'data:', 'https://*.tile.openstreetmap.org', 'https://*.basemaps.cartocdn.com'],
+        'img-src': ["'self'", 'data:', 'blob:', () => mapImgSources(config).join(' ')],
         'connect-src': ["'self'", 'wss:', 'https:'],
+        'worker-src': ["'self'"],
         'font-src': ["'self'", 'data:'],
         'object-src': ["'none'"],
         'frame-ancestors': ["'none'"],
       },
     },
-    crossOriginEmbedderPolicy: false, // would block OSM tiles
+    crossOriginEmbedderPolicy: false, // would block cross-origin tiles
   }));
 
   // Bound JSON body size — defense-in-depth against malicious payloads.
@@ -95,6 +104,7 @@ function createServer() {
   app.use('/api/health', requireApiToken, healthRouter);
   app.use('/api/settings', requireApiToken, settingsRouter);
   app.use('/api/threat-hunt', requireApiToken, threatHuntRouter);
+  app.use('/api/map', requireApiToken, mapRouter);
 
   // Serve frontend static files (no auth — needed to load the login UI).
   const frontendDist = path.join(__dirname, '../../frontend/dist');
