@@ -10,7 +10,7 @@
 # Dependabot still scans the GitHub mirror, but its PRs can't be merged on a
 # mirror, so this pipeline is the actionable signal.
 
-image: node:22   # full Debian image: python3/make/g++ for better-sqlite3's native build
+image: node:24   # full Debian image (python3/make/g++ on hand) in case a native module has no prebuilt binary; better-sqlite3 13 ships N-API prebuilds, so a normal install compiles nothing
 
 stages:
   - test
