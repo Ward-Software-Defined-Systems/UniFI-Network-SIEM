@@ -85,7 +85,13 @@ function createServer() {
   }));
 
   // Bound JSON body size — defense-in-depth against malicious payloads.
-  app.use(express.json({ limit: '64kb' }));
+  // `inflate: false` rejects Content-Encoding'd (compressed) request bodies
+  // outright (415): this middleware runs for every path before the
+  // per-router auth below, our own frontend never compresses a request
+  // body, and body-parser's decompression path has carried unauthenticated
+  // process-crash bugs (GHSA-27r3-jxmh-p828 — trailing bytes after a gzip
+  // frame). Patched in-range too, but there is no reason to keep the surface.
+  app.use(express.json({ limit: '64kb', inflate: false }));
   app.use((err, req, res, next) => {
     if (err && err.type === 'entity.too.large') {
       return res.status(413).json({ error: 'Request body too large (64 KB limit)' });

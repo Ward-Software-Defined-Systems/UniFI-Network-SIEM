@@ -3,6 +3,9 @@
   "version": "1.0.0",
   "description": "Syslog collector and dashboard for UniFi consoles and gateways",
   "main": "src/index.js",
+  "engines": {
+    "node": ">=22.12.0"
+  },
   "scripts": {
     "start": "node src/index.js",
     "dev": "node --watch src/index.js",
@@ -12,7 +15,7 @@
   },
   "dependencies": {
     "@opensearch-project/opensearch": "^3.5.1",
-    "better-sqlite3": "^11.9.1",
+    "better-sqlite3": "^13.0.3",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
     "helmet": "^8.1.0",
